@@ -1,0 +1,10 @@
+{
+  "name": "kakaku-tenka-mitsumori",
+  "version": "0.1.0",
+  "description": "価格転嫁見積ツール - 照合結果CSVから転嫁後の販売単価を計算し、見積Excelを出力する",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  }
+}

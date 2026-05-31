@@ -1,0 +1,2388 @@
+// =====================================================================
+//  価格転嫁 シミュレーション画面（ローカルサーバ・依存ゼロ）
+//  Node標準の http のみ使用。sim.bat から起動 → ブラウザで操作。
+//  ・メーカー改定額(改定後 仕入単価)を画面で上書きして試せる
+//  ・転嫁ルールを全体／行ごとに切り替えて即時再計算
+//  ・昨年の年間販売実績量(あれば実数, 無ければ推定)で年間影響額を集計
+// =====================================================================
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const { loadAndNormalize } = require('./load');
+const { calcRow } = require('./rules');
+const { loadPL } = require('./pl');
+const { writeQuote } = require('./quoteXlsx');
+const { writeXlsx } = require('./xlsx');
+const { normName } = require('./textnorm');
+const { IMPORT_PAGE } = require('./importPage');
+const { LIST_PAGE } = require('./listPage');
+const { SUPPLIERS_PAGE } = require('./suppliersPage');
+const { SELF_PAGE } = require('./selfPage');
+const { CUSTOMERS_PAGE } = require('./customersPage');
+const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile } = require('./settings');
+const { run: runShogo, resolveHanbaiSource } = require('./shogo');
+const { readXlsxBuffer } = require('./xlsxread');
+const { detectColumns: detectMakerCols, serialToDate } = require('./makerXlsx');
+const { loadCsv } = require('./csv');
+const { xlsToCsv } = require('./xls2csv');
+const { priceRowAnomaly } = require('./anomaly');
+const os = require('os');
+
+const RATE_CAUTION_PCT = 30; // 値上率がこの%以上の行は sim で黄色く注意表示（除外はしない・調整可）
+const ROOT = path.join(__dirname, '..');
+const INPUT_DIR = path.join(ROOT, 'input');
+const OUTPUT_DIR = path.join(ROOT, 'output');
+const MAKER_DIR = path.join(ROOT, 'maker_quotes');
+const PORT_START = 8765;
+
+// ---- 入力CSVの読込キャッシュ（ファイル名+更新時刻で判定） ----------
+const cache = new Map();
+function listCsv() {
+  if (!fs.existsSync(INPUT_DIR)) return [];
+  return fs.readdirSync(INPUT_DIR).filter((f) => f.toLowerCase().endsWith('.csv')).sort();
+}
+// 照合結果CSVは実行のたびに日時つきで増える。ドロップダウンには「仕入先ごとの最新1本」だけ出す。
+//  命名規則 <仕入先>_照合結果_<YYYYMMDD>_<時刻>.csv に一致するものを仕入先で集約し、日時最大を採用。
+//  規則に合わない手動配置CSV等はそのまま全て残す（利用者のファイルを隠さない）。
+function listLatestCsv() {
+  const latest = new Map(); // 仕入先 -> { file, stamp }
+  const others = [];
+  for (const f of listCsv()) {
+    const m = f.match(/^(.+?)_照合結果_(\d{8})_(\d{4,6})\.csv$/i);
+    if (!m) { others.push(f); continue; }
+    const supplier = m[1];
+    const stamp = m[2] + '_' + m[3].padEnd(6, '0'); // HHMM→HHMM00 に揃えて文字列比較できるように
+    const cur = latest.get(supplier);
+    if (!cur || cur.stamp < stamp) latest.set(supplier, { file: f, stamp });
+  }
+  const picked = [...latest.values()].map((x) => x.file).sort((a, b) => a.localeCompare(b, 'ja'));
+  return picked.concat(others.sort());
+}
+function getRecs(file) {
+  const full = path.join(INPUT_DIR, path.basename(file));
+  if (!fs.existsSync(full)) throw new Error('ファイルが見つかりません: ' + file);
+  const mtime = fs.statSync(full).mtimeMs;
+  const hit = cache.get(file);
+  if (hit && hit.mtime === mtime) return hit.recs;
+  const { recs } = loadAndNormalize(full);
+  cache.set(file, { mtime, recs });
+  return recs;
+}
+
+const fin = Number.isFinite;
+
+// アップロードファイル(base64+filename)を解析して { records, headers } を返す共通ヘルパー。
+//  .xlsx → xlsxread.readXlsxBuffer の最初の非空シートをそのまま grid → records 化
+//  .xls/.XLS → 一時ファイル経由で Excel COM 変換 (xlsToCsv) → loadCsv
+//  .csv → 一時ファイルに書き出して loadCsv（Shift_JIS/UTF-8 自動判定）
+function readUploadedTableFile(b64, filename) {
+  if (!b64) throw new Error('ファイル本体が空です');
+  const buf = Buffer.from(b64, 'base64');
+  const ext = (path.extname(String(filename || '')).toLowerCase()) || '';
+  if (ext === '.xlsx') {
+    const { sheets } = readXlsxBuffer(buf);
+    const sh = sheets.find((s) => Array.isArray(s.grid) && s.grid.some((r) => r.some((c) => String(c || '').trim() !== '')));
+    if (!sh) throw new Error('シートに有効な行がありません');
+    const grid = sh.grid;
+    const headers = (grid[0] || []).map((s) => String(s == null ? '' : s).trim());
+    const records = [];
+    for (let r = 1; r < grid.length; r++) {
+      const row = grid[r] || [];
+      const rec = {};
+      for (let i = 0; i < headers.length; i++) rec[headers[i]] = row[i] == null ? '' : row[i];
+      records.push(rec);
+    }
+    return { records, headers };
+  }
+  // .xls / .csv → temp file
+  const safeExt = ext || '.bin';
+  const tmpIn = path.join(os.tmpdir(), 'upload_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + safeExt);
+  fs.writeFileSync(tmpIn, buf);
+  try {
+    let csvPath = tmpIn;
+    if (ext === '.xls') csvPath = xlsToCsv(tmpIn);
+    const { records, headers } = loadCsv(csvPath);
+    if (csvPath !== tmpIn) { try { fs.unlinkSync(csvPath); } catch (_) {} }
+    return { records, headers };
+  } finally {
+    try { fs.unlinkSync(tmpIn); } catch (_) {}
+  }
+}
+
+// 仕入先表形式の records から suppliers マップを生成（{ 4桁コード: {name, phone, address, ... } }）
+function parseSuppliersFromRecords(records) {
+  const out = {};
+  for (const r of records) {
+    const code = String(r['仕入先コード'] || r['コード'] || '').trim();
+    if (!/^\d{1,6}$/.test(code)) continue;
+    const padded = code.padStart(4, '0'); // 標準は4桁文字列
+    const name1 = String(r['仕入先名１'] || r['仕入先名1'] || r['仕入先名'] || '').trim();
+    const name2 = String(r['仕入先名２'] || r['仕入先名2'] || '').trim();
+    out[padded] = {
+      name: (name1 + (name2 ? ' ' + name2 : '')).trim(),
+      phone: String(r['電話番号'] || '').trim(),
+      fax: String(r['FAX番号'] || '').trim(),
+      zip: String(r['郵便番号'] || '').trim(),
+      address: (String(r['住所１'] || r['住所1'] || '').trim() + ' ' + String(r['住所２'] || r['住所2'] || '').trim()).trim(),
+    };
+  }
+  return out;
+}
+
+// 自社商品名の構造化パース。
+// 例: "CF寿司容器L0.4　華紋　身 （朝日ﾋﾟｯｷﾝｸﾞ） 92988 ※50 13"
+//   → core: "CF寿司容器L0.4 華紋 身"   (商品名そのもの)
+//     freight: "朝日ﾋﾟｯｷﾝｸﾞ"           (運賃条件・どの仕入先からの仕入れか)
+//     supplierCode: "92988"             (仕入先商品コード＝メーカー品番が埋まっている)
+//     lot: "50"                          (※発注ロット)
+//     supplierId: "13"                   (末尾の仕入先コード)
+function parseSelfName(name) {
+  const s = String(name || '').trim();
+  const empty = { productCode: '', core: '', packSize: '', freight: '', note: '', supplierCode: '', lot: '', supplierId: '' };
+  if (!s) return empty;
+
+  // 1) 先頭の自社商品コード (3-7桁数字 + 空白) を切り出す。
+  //    /self プレビューが「セルの全文」を渡すケースで `07394 白楊...` を分解できるように。
+  //    hanbai.js 経由の `r.productName` はコード除去済みなので無影響。
+  let productCode = '', work = s;
+  const pcM = s.match(/^[\s　]*(\d{3,7})[\s　]+/);
+  if (pcM) { productCode = pcM[1]; work = s.slice(pcM[0].length); }
+
+  // 2) 「運賃条件」のカッコを探す。
+  //    注記カッコ (M25)/(D)/(V)/(ｴｺ)/(ﾎﾞ)/(黒) と区別するため、
+  //    中身に 和字 (CJK/Hiragana/Katakana 半角全角) が3文字以上 を必須とする。
+  //    例: 取得 → `（朝日ﾋﾟｯｷﾝｸﾞ）`(8) / `（5ｹｰｽ元払）`(5) / `（10ｹ元/未満800円）`(5)
+  //        スキップ → `(M25)`(0) / `(D)`(0) / `(ﾎﾞ)`(2) / `（黒）`(1) / `（4.2）`(0)
+  const PAREN_RE = /[（(]([^）)]*)[）)]/g;
+  let freight = '', freightStart = -1, freightEnd = -1;
+  let mm;
+  while ((mm = PAREN_RE.exec(work)) !== null) {
+    const inner = mm[1];
+    const nonAscii = (inner.match(/[^\x00-\x7F]/g) || []).length;
+    // 和字3字以上＝運賃条件、または「N円」を含む＝価格注記（関門形式 `（700円）`）も運賃扱い
+    if (nonAscii >= 3 || /\d\s*円/.test(inner)) {
+      freight = inner.trim();
+      freightStart = mm.index;
+      freightEnd = mm.index + mm[0].length;
+      break;
+    }
+  }
+  // 2b) 未閉じの運賃カッコ（大黒形式）。例: `... 100（大黒P1.5元未満800P別途300 3541548【...】 ※1200 29`
+  //    閉じ「）」が無いため上の PAREN_RE では拾えない。開きカッコを左から走査し、
+  //    「閉じ「）」が無い（＝未閉じ）」かつ「直後40字に運賃キーワードを含む」最初の1つを運賃開始とみなし、
+  //    そこから末尾までを after として後段(入数/ロット/コード/仕入先ID)抽出に回す。
+  //    ※ 全カッコを走査するので、短い注記カッコ（白）（透明）等が運賃カッコより前にあっても、
+  //       それらは閉じカッコありで素通りし、未閉じの（大黒…だけを運賃として拾える。
+  //    ※ キーワードは「未閉じカッコの中身」だけで判定する＝商品名側の ｹｰｽ/TP8 等には反応しない。
+  if (freightStart < 0) {
+    const FREIGHT_KW = /(元払|未満|ｹｰｽ|ケース|別途|送料|運賃|前払|着払|混載|大黒|ﾋﾟｯｷﾝｸﾞ|ﾋﾟｯｸ|円|[Pp]\d)/;
+    const parenRe = /[（(]/g; let pm;
+    while ((pm = parenRe.exec(work)) !== null) {
+      const tail = work.slice(pm.index + 1);
+      if (!/[）)]/.test(tail) && FREIGHT_KW.test(tail.slice(0, 40))) {
+        freight = tail.replace(/[\s　]+/g, ' ').trim();
+        freightStart = pm.index;
+        freightEnd = pm.index; // 「（」以降すべてを after に含める（ロット/コード/仕入先IDがこの中にある）
+        break;
+      }
+    }
+  }
+
+  let preF, after;
+  if (freightStart >= 0) {
+    preF = work.slice(0, freightStart).trim();
+    after = work.slice(freightEnd).trim();
+  } else {
+    preF = work.trim();
+    after = '';
+  }
+
+  // 3) 入数 (packSize) ：preF の末尾が「空白 + 1-5桁数字」なら切り出し。
+  //    例 `白楊8寸...3点 100` → core=`白楊8寸...3点`, packSize=`100`
+  //    `T-AP-F22-19 内篏合蓋A-PET` のように末尾が数字でなければ素通し（packSize='').
+  let packSize = '', core = preF.replace(/[\s　]+/g, ' ');
+  if (freightStart >= 0) {
+    const psM = core.match(/^(.+?)[\s　]+(\d{1,5})$/);
+    if (psM) { core = psM[1].trim(); packSize = psM[2]; }
+  }
+
+  // 4) 注記 (note) ：after や preF の中の 「...」 『...』 [...] 角括弧の中身を全て集める。
+  //    `「元払」` `『着払』` `[未満800円]` 等の補足情報。
+  const noteRe = /[「『\[]([^」』\]]+)[」』\]]/g;
+  const notes = [];
+  let nm;
+  while ((nm = noteRe.exec(after)) !== null) notes.push(nm[1].trim());
+  while ((nm = noteRe.exec(preF)) !== null) notes.push(nm[1].trim());
+  const note = notes.join(' / ');
+
+  // 5) 仕入先商品コード (4-7桁) ：※ロット部分は先に除外してから抽出。
+  //    `※5000` の 5000 を誤ってメーカー品番として拾わないように。
+  const afterNoLot = after.replace(/※\s*\S+/g, '');
+  const codeMatch = afterNoLot.match(/(\d{4,7})/);
+  const supplierCode = codeMatch ? codeMatch[1] : '';
+
+  // 6) ロット ：`※1000` の 1000、`※50` の 50 など。
+  const lotMatch = after.match(/※\s*(\S+)/);
+  const lot = lotMatch ? lotMatch[1] : '';
+
+  // 7) 仕入先コード (末尾1-4桁数字) ：※ロット → 4-7桁コード → 各種括弧 の順で除去し、
+  //    残った末尾の数字を拾う。
+  //    ※ /※\s*\S+/ を先に走らせる理由：先に /\d{4,7}/g で `※5000 88` の 5000 を消すと
+  //       `※ 88` が残り、その後の /※\s*\S+/ が `※ 88` を一気に消して 88 が失われるため。
+  //    例: `92988 ※50 13`→`13` / `1124803 ※1000 88`→`88` / `未満ｹｰｽ800円 ※5000 88`→`88`
+  const cleanedTail = after
+    .replace(/※\s*\S+/g, '').replace(/\d{4,7}/g, '')
+    .replace(/[（(][^）)]*[）)]/g, '').replace(/[「『\[][^」』\]]*[」』\]]/g, '').replace(/【[^】]*】/g, '')
+    .replace(/\s+/g, ' ').trim();
+  const sidMatch = cleanedTail.match(/(\d{1,4})\s*$/);
+  const supplierId = sidMatch ? sidMatch[1] : '';
+
+  return { productCode, core, packSize, freight, note, supplierCode, lot, supplierId };
+}
+
+// ---- 計算: 設定＋画面上の上書き値から全行を再計算し集計を返す --------
+function calcAll(body) {
+  const allRecs = getRecs(body.file);
+  const globalRule = body.rule || { type: 'add_increase' };
+  const rounding = body.rounding || getSettings().rounding;
+  const upliftRate = Number(body.selfUplift);
+  const selfCostUplift = { rate: Number.isFinite(upliftRate) ? upliftRate : 0 }; // 自社コスト上乗せ%
+  const over = Array.isArray(body.rows) ? body.rows : null; // 行ごとの上書き(改定額/ルール)
+  // 仕入先名（同一ファイル内は単一仕入先）— 商品紐付け辞書の引き当てに使う
+  const supplier = String((allRecs[0] && allRecs[0].makerSupplier) || '').trim();
+  const links = ((getProductLinks() || {})[supplier]) || {};
+  // 紐付けの取り合い防止：自社CDが「別メーカー品」に予約されている行は除外。
+  //  (注) 紐付け先メーカーがこのCSV内に行を持たない場合は、自社CDの全候補が消える
+  //       → 「↻ 照合を実行」で再生成すれば新しい紐付けが取り込まれる。
+  const recs = allRecs.filter((rec) => {
+    if (!rec.productCode) return true;
+    const linkedMaker = links[rec.productCode];
+    return !linkedMaker || linkedMaker === rec.makerName;
+  });
+
+  const rows = recs.map((rec, i) => {
+    const o = over && over[i] ? over[i] : {};
+    const effNewCost = fin(Number(o.newCost)) && o.newCost !== '' && o.newCost != null ? Number(o.newCost) : rec.newCost;
+    const effRule = o.rule ? { type: o.rule, factor: globalRule.factor } : globalRule;
+    const cfg = { default: effRule, overrides: [], rounding, selfCostUplift };
+    const r = calcRow({ ...rec, newCost: effNewCost }, cfg);
+    // 紐付け辞書で確定済の (自社CD ⇔ メーカー商品名) なら ステータスを 「📌 手動紐付け」 に上書き
+    const linkedSelf = r.productCode && links[r.productCode] === r.makerName;
+    const matchStatus = linkedSelf ? '📌 手動紐付け' : (r.matchStatus || '');
+    const ps = parseSelfName(r.productName); // 自社商品名を構造化
+    // 提出対象（得意先あり・一致）行だけ価格異常を判定（休眠/未一致は売単価が無くて当然なので対象外）
+    const isQuoteRow = !!r.customerName && r.customerName !== '-' && !/未一致/.test(matchStatus);
+    const priceWarning = isQuoteRow ? priceRowAnomaly(r.currentSell, r.newSell, r.ruleType) : '';
+    // 値上率が大きい行の「注意」（エラーではない＝除外しない）。メーカー値上げ幅が正しいかの確認喚起。
+    let rateWarning = '';
+    if (isQuoteRow && !priceWarning && fin(r.currentSell) && r.currentSell > 0 && fin(r.newSell)) {
+      const upPct = (r.newSell / r.currentSell - 1) * 100;
+      if (upPct >= RATE_CAUTION_PCT) rateWarning = '値上率が大きい（' + upPct.toFixed(0) + '%）。メーカーの値上げ幅が正しいか確認';
+    }
+    return {
+      customerName: r.customerName || '', customerCode: r.customerCode || '',
+      productName: r.productName || '', productCode: r.productCode || '',
+      productNameCore: ps.core, supplierCode: ps.supplierCode, freight: ps.freight, lot: ps.lot, supplierIdEmbed: ps.supplierId,
+      makerName: r.makerName || '', makerCode: rec.makerCode || '', matchStatus, priceWarning, rateWarning, costConflict: '',
+      currentCost: r.currentCost, newCost: r.newCost, costIncrease: r.costIncrease, costIncreaseRate: r.costIncreaseRate,
+      currentSell: r.currentSell, newSell: r.newSell, sellIncrease: r.sellIncrease,
+      currentMarginRate: r.currentMarginRate, newMarginRate: r.newMarginRate,
+      qty: r.qty, qtySource: r.qtySource,
+      annualCostImpact: r.annualCostImpact, annualSellImpact: r.annualSellImpact,
+      annualSellCurrent: r.annualSellCurrent, annualSellNew: r.annualSellNew,
+      ruleType: r.ruleType,
+      switchDate: rec.switchDate || '',
+      effectiveDate: (o.effectiveDate != null && String(o.effectiveDate).trim() !== '') ? String(o.effectiveDate).trim() : (rec.switchDate || ''),
+    };
+  });
+
+  // ---- 同一メーカー品で新仕入が複数ある重複の検知（メーカー見積側のデータ誤り）----
+  //  同じメーカー品（品番。無ければメーカー商品名）に新仕入が2種以上あると、見積書出力では
+  //  片方が黙って採用される（例: 大黒テープ 品番2061740 が 1280/1450）。両方が値上げだと
+  //  価格異常では拾えないので、ここで重複自体を検知して各行に印を付ける（要確認に出す）。
+  //  ※「1つの自社商品に複数の別メーカー品が名前一致した取り合い」（白がピンクに当たる等）は
+  //    別メーカー品＝別品番なのでここでは拾わない（dedup/色ガードが解決する別現象）。
+  {
+    const byMaker = new Map();
+    for (const r of rows) {
+      if (!r.customerName || r.customerName === '-' || /未一致/.test(r.matchStatus)) continue;
+      const code = r.makerCode && String(r.makerCode).trim();
+      const k = code ? ('CD:' + normName(String(r.makerCode))) : ('名:' + normName(r.makerName || ''));
+      if (k === 'CD:' || k === '名:') continue;
+      if (!byMaker.has(k)) byMaker.set(k, []);
+      byMaker.get(k).push(r);
+    }
+    for (const list of byMaker.values()) {
+      const costs = Array.from(new Set(list.map((r) => (fin(r.newCost) ? Number(r.newCost) : null)).filter((v) => v != null)));
+      if (costs.length > 1) {
+        const msg = '同一メーカー品で新仕入が複数（' + costs.join('/') + '）。メーカー見積の重複の可能性';
+        for (const r of list) r.costConflict = msg;
+      }
+    }
+  }
+
+  // ---- 集計（数量のある行のみ年間値に寄与） ----
+  let totalCostImpact = 0, totalSellImpact = 0;
+  let sumCurSales = 0, sumCurProfit = 0, sumNewSales = 0, sumNewProfit = 0;
+  let withQty = 0, estimated = 0;
+  for (const r of rows) {
+    if (fin(r.annualCostImpact)) totalCostImpact += r.annualCostImpact;
+    if (fin(r.annualSellImpact)) totalSellImpact += r.annualSellImpact;
+    if (fin(r.qty) && r.qty > 0) {
+      withQty++;
+      if (r.qtySource === 'estimated') estimated++;
+      if (fin(r.annualSellCurrent)) { sumCurSales += r.annualSellCurrent; sumCurProfit += (r.currentSell - r.currentCost) * r.qty; }
+      if (fin(r.annualSellNew)) { sumNewSales += r.annualSellNew; sumNewProfit += (r.newSell - r.newCost) * r.qty; }
+    }
+  }
+  const summary = {
+    count: rows.length, withQty, estimated,
+    totalCostImpact, totalSellImpact, net: totalSellImpact - totalCostImpact,
+    avgCurMargin: sumCurSales > 0 ? (sumCurProfit / sumCurSales) * 100 : NaN,
+    avgNewMargin: sumNewSales > 0 ? (sumNewProfit / sumNewSales) * 100 : NaN,
+    totalSellNow: sumCurSales, totalSellNew: sumNewSales,
+  };
+  // 全メーカー商品名のユニーク集合（紐付け編集UIの選択肢として返す）
+  const makerNames = Array.from(new Set(rows.map((r) => r.makerName).filter(Boolean))).sort();
+  // 仕入先マスタも返却 → 行ごとの「発注先コード→名前」解決に使う
+  const suppliers = getSuppliers();
+  return { rows, summary, supplier, productLinks: links, makerNames, suppliers };
+}
+
+// ---- 実施日カレンダー（全仕入先 横断）の集計 ---------------------------
+// input/ の各仕入先 最新CSVを calcAll で計算し、提出対象（一致）行だけを
+// {実施日, 得意先, 商品名, 仕入先} として集めて返す。価格は使わない（既定設定で計算）。
+// 併せて 販売実績ファイル と 損益.csv の最終更新日も返し、月替わりの更新喚起に使う。
+function fileFreshness(p) {
+  try {
+    const st = fs.statSync(p);
+    const d = new Date(st.mtimeMs);
+    const ym = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+    return { exists: true, name: path.basename(p), mtime: d.toISOString(), ym };
+  } catch (e) { return { exists: false, name: path.basename(p), mtime: null, ym: null }; }
+}
+function buildCalendar() {
+  const files = listLatestCsv();
+  const entries = [];
+  const suppliers = [];
+  for (const f of files) {
+    let data;
+    try { data = calcAll({ file: f }); } catch (e) { continue; }
+    const sup = (data.supplier || (String(f).split('_照合結果_')[0]) || '').trim();
+    if (sup && !suppliers.includes(sup)) suppliers.push(sup);
+    for (const r of data.rows) {
+      if (!r.customerName || r.customerName === '-' || /未一致/.test(r.matchStatus || '')) continue; // 休眠/未一致＝改定なし
+      entries.push({
+        date: r.effectiveDate || r.switchDate || '',
+        customer: r.customerName,
+        product: r.productNameCore || (r.productName && r.productName !== '-' ? r.productName : '') || r.makerName || '(商品名なし)',
+        supplier: sup,
+      });
+    }
+  }
+  // 照合エンジンが実際に使う販売実績ファイルの新しさ
+  let hanbai = { exists: false, name: null, mtime: null, ym: null };
+  try {
+    const s = getSettings();
+    const resolved = resolveHanbaiSource((s.hanbai && s.hanbai.path) || '');
+    if (resolved) hanbai = fileFreshness(resolved);
+  } catch (e) { /* ignore */ }
+  const pl = fileFreshness(path.join(ROOT, '損益.csv'));
+  return { ok: true, entries, suppliers, hanbai, pl };
+}
+
+// ---- 提出用見積書の出力（画面設定を反映して得意先ごとに1ファイル） --
+function stamp() {
+  const d = new Date(); const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+}
+function jpDate() {
+  const d = new Date();
+  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
+}
+// Excel日付シリアル(例 46133)→ ISO 'YYYY-MM-DD'。25569 = 1970-01-01 のシリアル値。
+function excelSerialToISO(serial) {
+  const n = Number(serial);
+  if (!Number.isFinite(n)) return null;
+  const d = new Date((n - 25569) * 86400 * 1000);
+  if (isNaN(d.getTime())) return null;
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+}
+// 実施日が生のExcelシリアル(4-6桁・妥当範囲)なら日付に直す。それ以外はそのまま。
+function normalizeEffDate(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (/^\d{4,6}$/.test(s)) { const n = Number(s); if (n >= 20000 && n <= 90000) { const iso = excelSerialToISO(n); if (iso) return iso; } }
+  return s;
+}
+// 実施日の入力を「どの形式でも ISO(YYYY-MM-DD)」に揃える。
+//  対応: 2026-07-01 / 2026/7/1 / 2026年7月1日 / 7月1日 / 7/1（年なしは当年）/ Excelシリアル / 全角。
+//  解釈できない文字列はそのまま返す（入力をロックしない）。
+function normDateInput(v) {
+  let s = String(v == null ? '' : v).normalize('NFKC').trim();
+  if (s === '') return '';
+  const p2 = (n) => String(n).padStart(2, '0');
+  if (/^\d{4,6}$/.test(s)) { const n = Number(s); if (n >= 20000 && n <= 90000) { const iso = excelSerialToISO(n); if (iso) return iso; } }
+  let m = s.match(/(\d{4})\D{1,3}(\d{1,2})\D{1,3}(\d{1,2})/); // 年つき
+  if (m) { const mo = Number(m[2]), da = Number(m[3]); if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) return m[1] + '-' + p2(mo) + '-' + p2(da); }
+  m = s.match(/(\d{1,2})\D{1,3}(\d{1,2})/); // 年なし → 当年
+  if (m) { const mo = Number(m[1]), da = Number(m[2]); if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) return new Date().getFullYear() + '-' + p2(mo) + '-' + p2(da); }
+  return s;
+}
+// 売価の手入力を「クリーンな数値」に揃える。¥ / 円 / カンマ / 全角 / 余分な空白を除去。
+//  数値にできなければ null（＝手入力なしとして扱い、ルール計算に戻す）。
+function parsePriceInput(v) {
+  const s = String(v == null ? '' : v).normalize('NFKC').replace(/[¥,\s円]/g, '').trim();
+  if (s === '') return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
+}
+function sanitizeName(s) {
+  return String(s || '得意先不明').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').replace(/[.\s]+$/, '').trim() || '得意先不明';
+}
+
+// 照合の信頼度スコア（大きいほど信頼できる）: 手動紐付け > CD一致 > 名前一致(%) > その他
+// ※ CD一致 = 仕入先(メーカー)商品コードでの一致。名前の類似より確実。
+// ※ 手動紐付け = 利用者が settings.productLinks で確定したもの。最優先で見積書に乗せる。
+function matchScore(status) {
+  const s = String(status || '');
+  if (/手動紐付け|📌/.test(s)) return 2000;
+  if (/CD一致|ｺｰﾄﾞ一致|コード一致/.test(s)) return 1000;
+  const m = s.match(/(\d+)\s*%/);
+  return m ? Number(m[1]) : 0;
+}
+// メーカー名の語数（2文字以上のトークン数）＝品名の具体性の目安。多いほど具体的。
+function makerTokenCount(name) {
+  return String(name || '').split(/[\s　]+/).filter((t) => t.length >= 2).length;
+}
+
+// ---- メーカー見積の保存（貼り付け取り込み画面から）------------------
+function csvCell(v) { const s = String(v == null ? '' : v); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+
+// Excel由来の数値表現を整える（浮動小数の誤差を丸めた短い文字列に）
+function cleanNum(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (s === '' || !/^-?\d/.test(s)) return s; // 文字混じりはそのまま
+  const n = parseFloat(s);
+  if (!Number.isFinite(n)) return s;
+  // toFixed(10) で誤差を吸収して Number 化（"9.5299999999999994" → "9.53"）
+  return String(Number(n.toFixed(10)));
+}
+
+// 取り込んだ表の「切替日（日付シリアル）」「現/新単価（浮動小数誤差）」を見やすい値に直す。
+// 列はメーカー見積の見出しから自動検出（makerXlsx.detectColumns）。検出できない時は素通り。
+function normalizeMakerGrid(grid) {
+  if (!Array.isArray(grid) || !grid.length) return grid;
+  const idx = detectMakerCols(grid);
+  if (!idx) return grid;
+  for (let r = idx.headerRow + 1; r < grid.length; r++) {
+    const row = grid[r]; if (!Array.isArray(row)) continue;
+    if (idx.date != null && row[idx.date] != null && row[idx.date] !== '') row[idx.date] = serialToDate(row[idx.date]);
+    if (idx.cur  != null && row[idx.cur]  != null && row[idx.cur]  !== '') row[idx.cur]  = cleanNum(row[idx.cur]);
+    if (idx.nw   != null && row[idx.nw]   != null && row[idx.nw]   !== '') row[idx.nw]   = cleanNum(row[idx.nw]);
+  }
+  return grid;
+}
+
+// 取り込み済みメーカー見積CSVの一覧と進捗（照合済み・見積書作成済み）を返す
+function sanitizeForFs(s) { return String(s || '').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').replace(/[.\s]+$/, '').trim(); }
+function extractSupplierFromMakerFile(filename) {
+  // 例: メーカー見積_朝日食品容器_20260526_1246.csv  /  エフピコ.csv
+  // stamp は YYYYMMDD_HHMM (or HHMMSS) なので時刻部分は 4 or 6 桁を許容
+  const base = filename.replace(/\.[^.]+$/, '');
+  const m = base.match(/^メーカー見積_(.+?)_\d{8}_\d{4,6}$/);
+  return m ? m[1] : base;
+}
+function countCsvDataRows(fullPath) {
+  try {
+    const txt = fs.readFileSync(fullPath, 'utf8').replace(/^﻿/, '');
+    const lines = txt.split(/\r?\n/).filter((l) => l.trim() !== '');
+    return Math.max(0, lines.length - 1); // ヘッダー1行を除く
+  } catch (e) { return 0; }
+}
+function listMakerQuotes() {
+  if (!fs.existsSync(MAKER_DIR)) return [];
+  const csvs = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f));
+  const inputFiles  = fs.existsSync(INPUT_DIR)  ? fs.readdirSync(INPUT_DIR)  : [];
+  const outputItems = fs.existsSync(OUTPUT_DIR) ? fs.readdirSync(OUTPUT_DIR) : [];
+  const makers = getMakers() || {};
+  const suppliers = getSuppliers() || {};
+
+  // 仕入先ごとにソースCSVをまとめる（paste-import で同じ仕入先が複数CSVになっても1行に集約）
+  const bySupplier = new Map();
+  for (const f of csvs) {
+    const full = path.join(MAKER_DIR, f);
+    let mtimeMs = 0; try { mtimeMs = fs.statSync(full).mtimeMs; } catch (e) {}
+    const supplier = extractSupplierFromMakerFile(f);
+    if (!bySupplier.has(supplier)) bySupplier.set(supplier, []);
+    bySupplier.get(supplier).push({ file: 'maker_quotes/' + f, mtimeMs, count: countCsvDataRows(full) });
+  }
+
+  const items = [];
+  for (const [supplier, sources] of bySupplier) {
+    sources.sort((a, b) => b.mtimeMs - a.mtimeMs);  // 新しい順
+    const sup = sanitizeForFs(supplier);
+    const matchFiles = inputFiles
+      .filter((n) => n.startsWith(sup + '_照合結果_') && /\.csv$/i.test(n))
+      .sort(); // ファイル名末尾の時刻スタンプ昇順 → 末尾が最新
+    const quoteFolders = outputItems
+      .filter((n) => n.startsWith(sup + '_照合結果_') && /_見積書_/.test(n))
+      .sort();
+    // ステータスは「最新照合に対する見積書」基準。古い見積書しか無いケースを見積書済みと誤判定しない
+    const latestMatch = matchFiles[matchFiles.length - 1] || null;
+    let status = '取り込みのみ';
+    if (latestMatch) {
+      const latestBase = latestMatch.replace(/\.csv$/i, '');
+      const hasFreshQuote = quoteFolders.some((n) => n.startsWith(latestBase + '_見積書_'));
+      status = hasFreshQuote ? '見積書作成済み' : '照合済み';
+    }
+    // 取込CSV(最新) の mtime が 最新照合 の mtime より新しい場合は「再照合が必要」。
+    // 60秒の余裕を見るのは、照合.bat が xlsx を自動展開→直後に照合する流れで mtime が
+    // ほぼ同時刻になるため。明確に「ユーザが取り込み直したのに照合してない」だけを拾う。
+    let needsRematch = false;
+    if (latestMatch) {
+      try {
+        const matchMtime = fs.statSync(path.join(INPUT_DIR, latestMatch)).mtimeMs;
+        if (sources[0].mtimeMs > matchMtime + 60_000) needsRematch = true;
+      } catch (e) {}
+    }
+    // 仕入先コード（4桁）と マスタ上の社名
+    const purchaseCode = (makers[supplier] && makers[supplier].purchaseCode) || '';
+    const purchaseName = (purchaseCode && suppliers[purchaseCode] && suppliers[purchaseCode].name) || '';
+    items.push({
+      supplier,
+      file: sources[0].file, // 代表は最新ソース
+      sources,               // 全ソースCSV（複数取り込みの可視化）
+      importedAt: sources[0].mtimeMs ? new Date(sources[0].mtimeMs).toISOString() : null,
+      count: sources.reduce((s, x) => s + (x.count || 0), 0),
+      matchFiles, quoteFolders, status, needsRematch, latestMatch,
+      purchaseCode, purchaseName,
+    });
+  }
+  items.sort((a, b) => String(b.importedAt || '').localeCompare(String(a.importedAt || '')));
+  return items;
+}
+
+// 一覧画面からの「📂 開く」用：ファイル/フォルダをOSの既定アプリで開く（ROOT配下のみ許可）
+function safeOpenPath(rel) {
+  const target = path.isAbsolute(rel) ? rel : path.join(ROOT, rel);
+  const normalized = path.normalize(target);
+  if (!normalized.startsWith(path.normalize(ROOT))) throw new Error('範囲外のパスです');
+  if (!fs.existsSync(normalized)) throw new Error('見つかりません: ' + rel);
+  if (process.platform === 'win32') exec('explorer "' + normalized + '"');
+  else if (process.platform === 'darwin') exec('open "' + normalized + '"');
+  else exec('xdg-open "' + normalized + '"');
+  return normalized;
+}
+
+function saveMakerQuote(body) {
+  const supplier = String((body && body.supplier) || '').trim() || '仕入先不明';
+  const items = Array.isArray(body && body.items) ? body.items : [];
+  if (!items.length) return { ok: false, error: 'データがありません' };
+  fs.mkdirSync(MAKER_DIR, { recursive: true });
+  const header = ['仕入先', 'メーカー品番', 'メーカー商品名', '規格', '現単価', '新単価', '切替日'];
+  const lines = [header.join(',')];
+  for (const it of items) {
+    lines.push([supplier, it.makerCode, it.makerName, it.spec, it.currentCost, it.newCost, it.switchDate].map(csvCell).join(','));
+  }
+  const fname = `メーカー見積_${sanitizeName(supplier)}_${stamp()}.csv`;
+  fs.writeFileSync(path.join(MAKER_DIR, fname), '﻿' + lines.join('\r\n'), 'utf8');
+  // 仕入先ごとの取り込みプロファイル（列マッピング等＋仕入先コード）を記憶し、次回から自動適用する
+  if (body && (body.map && Object.keys(body.map).length || body.purchaseCode != null)) {
+    try {
+      const profile = {};
+      if (body.map && Object.keys(body.map).length) {
+        profile.map = body.map;
+        profile.delim = body.delim || 'auto';
+        profile.hasHeader = body.hasHeader !== false;
+      }
+      // 仕入先コード（4桁）。空文字なら「未設定に戻す」意図。
+      if (body.purchaseCode != null) {
+        profile.purchaseCode = String(body.purchaseCode || '').trim();
+      }
+      saveMakerProfile(supplier, profile);
+    } catch (_) { /* プロファイル保存に失敗しても見積保存は成功扱い */ }
+  }
+  return { ok: true, count: items.length, file: 'maker_quotes/' + fname };
+}
+
+function exportQuotes(body) {
+  const calc = calcAll(body);
+  const { rows } = calc;
+  const supplier = calc.supplier || '';
+  // 提出先のある明細だけ（未一致・得意先なしは除外）
+  const matched = rows.filter((r) => r.customerName && r.customerName !== '-' && !/未一致/.test(r.matchStatus || ''));
+  if (!matched.length) {
+    // 例: 福助のように CSV内が休眠のみ。サーバエラーではなく「対象0件」を返す。
+    return {
+      ok: false, reason: 'no_matched', count: 0, totalRows: rows.length, supplier,
+      message: '見積書化できる行がありません（CSV内 ' + rows.length + ' 行すべてが未一致／得意先なしでした）',
+    };
+  }
+
+  // 得意先ごと → 自社商品ごとに、最も信頼できる照合1件へ絞る（誤マッチによる重複を除去）
+  const groups = new Map();
+  let dupRemoved = 0;
+  for (const r of matched) {
+    if (!groups.has(r.customerName)) groups.set(r.customerName, new Map());
+    const byProd = groups.get(r.customerName);
+    const key = (r.productCode != null && String(r.productCode).trim() !== '')
+      ? normName(r.productCode)
+      : ('名:' + normName(r.productName));
+    const prev = byProd.get(key);
+    if (!prev) { byProd.set(key, r); }
+    else {
+      dupRemoved++;
+      // 同じ得意先×自社商品に複数メーカー品が当たったら、より信頼できる1件へ。
+      //  一致度が同点なら「メーカー名のトークン数が多い＝より具体的な品」を優先
+      //  （例: 角中太口(3語) > 角中(2語) で、太口の品が角中の品に取り違えられない）。
+      const sNew = matchScore(r.matchStatus), sPrev = matchScore(prev.matchStatus);
+      if (sNew > sPrev || (sNew === sPrev && makerTokenCount(r.makerName) > makerTokenCount(prev.makerName))) byProd.set(key, r);
+    }
+  }
+
+  const base = path.basename(body.file).replace(/\.csv$/i, '');
+  const folder = path.join(OUTPUT_DIR, `${base}_見積書_${stamp()}`);
+  fs.mkdirSync(folder, { recursive: true });
+
+  const date = jpDate();
+  const s = getSettings();
+  const opt = { company: s.company, quote: s.quote, date };
+  const effectiveDate = String(body.effectiveDate || '').trim(); // 実施日（任意・空なら手書き枠）
+  const forceDate = String(body.forceEffectiveDate || '').trim(); // 全行を強制的にこの実施日へ（指定時のみ）
+  const ymd = (() => { const d2 = new Date(); const p = (n) => String(n).padStart(2, '0'); return '' + d2.getFullYear() + p(d2.getMonth() + 1) + p(d2.getDate()); })();
+  const thr = Number.isFinite(Number(s.matchThreshold)) ? Number(s.matchThreshold) : 80; // 一致度しきい値(%)
+  const r2 = (v) => fin(v) ? Math.round(v * 100) / 100 : v; // 小数2桁
+  const r1 = (v) => fin(v) ? Math.round(v * 10) / 10 : v;   // 小数1桁
+
+  const files = [];
+  const reviewRows = []; // 要確認リストへ（低一致＝誤マッチの疑い／価格異常／重複の食い違い）
+  let priceReviewCount = 0;
+  for (const [customer, byProd] of groups) {
+    const all = [...byProd.values()];
+    // 見積書から外す対象：① 価格異常（売単価0/値下げ）・② 同一商品の新仕入食い違い・③ しきい値未満の名前一致
+    //  ①②はメーカー側データの誤りの可能性→自動採用せず人に確認させる（CD一致でも外す）
+    const keep = [], review = [];
+    for (const r of all) {
+      const priceReason = r.priceWarning || r.costConflict;
+      if (priceReason) { review.push({ ...r, reviewReason: priceReason, estQty: r.qty }); priceReviewCount++; continue; }
+      if (matchScore(r.matchStatus) >= thr) keep.push(r);
+      else review.push({ ...r, reviewReason: '一致度が低い（' + (r.matchStatus || '') + '）', estQty: r.qty });
+    }
+    for (const r of review) reviewRows.push(r);
+    if (!keep.length) continue; // 全部が要確認なら見積書は作らない
+
+    keep.sort((a, b) => String(a.productCode || '').localeCompare(String(b.productCode || ''), 'ja'));
+    const qrows = keep.map((r) => ({
+      // 提出用の見積書には「コア商品名」だけを載せる（運賃条件・埋込メーカー品番・ロット・棚番を除外）。
+      //  parseSelfName で分解した core を優先。抽出に失敗して空なら生の商品名にフォールバック。
+      productCode: r.productCode || '',
+      productName: (r.productNameCore && r.productNameCore.trim()) ? r.productNameCore.trim() : r.productName,
+      currentSell: r2(r.currentSell),
+      newSell: r2(r.newSell),
+      effectiveDate: forceDate || normalizeEffDate((r.effectiveDate && String(r.effectiveDate).trim()) ? String(r.effectiveDate).trim() : effectiveDate),
+    }));
+    const fname = `見積_${sanitizeName(customer)}.xlsx`;
+    const quoteNo = ymd + '-' + String(files.length + 1).padStart(3, '0');
+    writeQuote(customer, qrows, path.join(folder, fname), Object.assign({}, opt, { quoteNo }));
+    files.push(fname);
+  }
+
+  // 要確認リスト（低一致＋価格異常＋重複の食い違い）を1ファイルにまとめて出力
+  let reviewFile = null;
+  if (reviewRows.length) {
+    reviewRows.sort((a, b) =>
+      String(a.customerName || '').localeCompare(String(b.customerName || ''), 'ja') ||
+      String(a.productCode || '').localeCompare(String(b.productCode || ''), 'ja'));
+    reviewFile = `要確認(低一致・価格異常).xlsx`;
+    writeXlsx(reviewRows, path.join(folder, reviewFile), { sheetName: '要確認' });
+  }
+
+  // 要確認.xlsx の中身を簡易サマリ化（画面で「何の品が要確認になったか」を残せるように）
+  const reviewSummary = reviewRows.slice(0, 50).map((r) => ({
+    customerName: r.customerName,
+    productCode: r.productCode,
+    productName: r.productName,
+    makerName: r.makerName,
+    matchStatus: r.matchStatus,
+  }));
+  // 顧客ごとの内訳（夜遅くにフォルダを見返さなくても画面で把握できるように）
+  const perCustomer = [];
+  for (const [customer, byProd] of groups) {
+    const all = [...byProd.values()];
+    const kept = all.filter((r) => !(r.priceWarning || r.costConflict) && matchScore(r.matchStatus) >= thr).length;
+    const review = all.length - kept;
+    if (kept > 0) perCustomer.push({ customer, kept, review });
+  }
+  perCustomer.sort((a, b) => b.kept - a.kept || String(a.customer).localeCompare(String(b.customer), 'ja'));
+  return {
+    ok: true, folder, folderName: path.basename(folder), files,
+    count: files.length, dupRemoved, reviewCount: reviewRows.length, priceReviewCount, reviewFile, threshold: thr,
+    supplier, customerCount: files.length, perCustomer, reviewSummary,
+  };
+}
+
+// 得意先ごとに「買う全商品」を横断集計する（/customers 画面用の逆引き）。
+//  input/ の全照合CSV(listCsv)を calcAll で計算し、得意先ごとにまとめる＝得意先別.bat(統合見積書)
+//  と同じ全CSVを使うので、画面と提出物の品揃えが一致する（大黒の122品/39品など複数見積も網羅）。
+//  価格は sim/見積書と同じ既定（add_increase factor / 端数 / 自社上乗せ%）で算出。
+//  重複除去：同一仕入先×同一自社商品が複数CSV(再照合等)に出たら最も信頼できる1件へ。
+//   ※複数の仕入先にまたがる同一自社商品は、統合見積書どおり仕入先ごとに別行で残す。
+//  見積書に載る行(keep)と要確認(価格異常/低一致)を分けて、keep だけを「該当商品」に集める。
+// opts（画面から指定可）: ruleType / factor / roundingUnit / roundingMode / selfUplift / forceEffectiveDate
+//  未指定の項目は settings.json の既定値にフォールバック（＝従来どおり）。
+// 共通コア：全CSVを計算し、得意先ごとに keep（見積書に載る）/ review（要確認）へ分けて返す。
+//  表示(aggregateCustomers)と出力(exportCustomerQuotes)の両方がこれを使う＝画面と提出物が必ず一致。
+function buildCustomerCandidates(opts) {
+  opts = opts || {};
+  const st = getSettings();
+  const thr = Number.isFinite(Number(st.matchThreshold)) ? Number(st.matchThreshold) : 80;
+  const dflt = st.default || {};
+  const ruleType = opts.ruleType || dflt.type || 'add_increase';
+  const factor = Number.isFinite(Number(opts.factor)) ? Number(opts.factor) : ((dflt.factor) || 1.25);
+  const rounding = {
+    unit: Number.isFinite(Number(opts.roundingUnit)) ? Number(opts.roundingUnit) : ((st.rounding && st.rounding.unit) || 0.01),
+    mode: opts.roundingMode || (st.rounding && st.rounding.mode) || 'round',
+  };
+  const selfUplift = Number.isFinite(Number(opts.selfUplift)) ? Number(opts.selfUplift) : Number((st.selfCostUplift && st.selfCostUplift.rate) || 0);
+  const forceDate = String(opts.forceEffectiveDate || '').trim(); // 実施日 一括上書き（空なら各行の切替日）
+  const baseBody = {
+    rule: { type: ruleType, factor },
+    rounding,
+    selfUplift,
+  };
+  // 仕入先ごと最新1本だけ読む（案A：照合は仕入先ごとに統合済み＝最新の取り込みが反映される）。
+  //  以前は input/ の全CSVを読んでいたため、古い照合結果が混ざって更新前の価格が残る恐れがあった。
+  const files = listLatestCsv();
+  // 得意先名 -> Map(key=仕入先商品 -> { supplier, r, score, priceReason })
+  const byCustomer = new Map();
+  const errors = [];
+  for (const file of files) {
+    let calc;
+    try { calc = calcAll(Object.assign({ file }, baseBody)); }
+    catch (e) { errors.push({ file, error: String(e && e.message || e) }); continue; }
+    const supplier = calc.supplier || file;
+    const rows = calc.rows || [];
+    const matched = rows.filter((r) => r.customerName && r.customerName !== '-' && !/未一致/.test(r.matchStatus || ''));
+    for (const r of matched) {
+      const cust = r.customerName;
+      if (!byCustomer.has(cust)) byCustomer.set(cust, new Map());
+      const m = byCustomer.get(cust);
+      const prodKey = (r.productCode != null && String(r.productCode).trim() !== '')
+        ? normName(r.productCode) : ('名:' + normName(r.productName));
+      const key = supplier + '' + prodKey; // 仕入先が違えば別行（統合見積書と同じ扱い）
+      const cand = { supplier, r, score: matchScore(r.matchStatus), priceReason: r.priceWarning || r.costConflict };
+      const prev = m.get(key);
+      if (!prev) { m.set(key, cand); }
+      else if (cand.score > prev.score ||
+        (cand.score === prev.score && makerTokenCount(r.makerName) > makerTokenCount(prev.r.makerName))) {
+        m.set(key, cand); // 同一仕入先×同一商品が複数CSVに出たら信頼できる方
+      }
+    }
+  }
+  // 行ごと転嫁ルール（得意先ページで営業が微調整）。{ rowKey: ruleType }。無ければ全体ルール。
+  const rowRules = (opts.rowRules && typeof opts.rowRules === 'object') ? opts.rowRules : {};
+  // 行ごと 改定後売価／実施日 の手入力（得意先ページで直接入力）。{ rowKey: 値 }。
+  const rowSell = (opts.rowSell && typeof opts.rowSell === 'object') ? opts.rowSell : {};
+  const rowEff = (opts.rowEff && typeof opts.rowEff === 'object') ? opts.rowEff : {};
+  // 行ごと 備考（得意先ページで直接入力 → 見積書の「備考」列に転記）。{ rowKey: 文字列 }。
+  const rowNote = (opts.rowNote && typeof opts.rowNote === 'object') ? opts.rowNote : {};
+  // 行ごと まるめ（改定後価格の端数処理）。{ rowKey: "単位|処理" 例 "1|floor" }。無ければ全体のまるめ。
+  const rowRound = (opts.rowRound && typeof opts.rowRound === 'object') ? opts.rowRound : {};
+  // keep（見積書に載る）/ review（要確認）へ振り分け（理由つき）
+  const byCustomerSplit = new Map(); // name -> { keep:[item], review:[item] }
+  for (const [name, m] of byCustomer) {
+    const keep = [], review = [];
+    for (const cand of m.values()) {
+      const r = cand.r;
+      // 行を一意に識別するキー（得意先|仕入先|商品）。画面の行ルール上書きと突き合わせる。
+      const prodKey = (r.productCode != null && String(r.productCode).trim() !== '') ? normName(String(r.productCode)) : ('名:' + normName(r.productName));
+      const rowKey = name + '' + cand.supplier + '' + prodKey;
+      let newSell = fin(r.newSell) ? r.newSell : null;
+      let ruleForRow = ruleType;
+      // 行ごとの上書き：転嫁ルール（行ルール）と まるめ（端数処理）を、それぞれ全体から差し替え可能。
+      const ov = rowRules[rowKey];
+      const effRuleType = (ov && ov !== ruleType) ? ov : ruleType;
+      // まるめの上書き "単位|処理"（例 "1|floor"）を解釈。無ければ全体の rounding。
+      let effRounding = rounding;
+      const roundOv = rowRound[rowKey];
+      const roundManual = roundOv != null && String(roundOv).trim() !== '';
+      if (roundManual) {
+        const pr = String(roundOv).split('|');
+        const u = parseFloat(pr[0]);
+        if (Number.isFinite(u) && u > 0) effRounding = { unit: u, mode: pr[1] || 'round' };
+      }
+      // ルール か まるめ のどちらかが全体と違えば、その行だけ再計算（全体と同じ calcRow 経路＝ズレない）。
+      const ruleDiffers = effRuleType !== ruleType;
+      const roundDiffers = roundManual && (effRounding.unit !== rounding.unit || effRounding.mode !== rounding.mode);
+      if (ruleDiffers || roundDiffers) {
+        const rr = calcRow(r, { default: { type: effRuleType, factor }, overrides: [], rounding: effRounding, selfCostUplift: { rate: selfUplift } });
+        if (fin(rr.newSell)) { newSell = rr.newSell; ruleForRow = effRuleType; }
+      }
+      // 改定後売価の手入力（最優先）。¥/円/カンマ/全角を除去して数値に揃える。
+      const manualSell = parsePriceInput(rowSell[rowKey]);
+      const sellManual = manualSell != null;
+      if (sellManual) { newSell = manualSell; ruleForRow = 'manual'; }
+      // 実施日：行の手入力 > 全体一括 > 各行の切替日。どの形式でも ISO に揃える。
+      const effManual = rowEff[rowKey] != null && String(rowEff[rowKey]).trim() !== '';
+      const effRaw = effManual ? String(rowEff[rowKey]) : (forceDate || ((r.effectiveDate && String(r.effectiveDate).trim()) ? String(r.effectiveDate).trim() : (r.switchDate || '')));
+      // 備考：得意先ページの手入力。空でも item に持たせて画面・見積書で同じ値を出す。
+      const note = (rowNote[rowKey] != null) ? String(rowNote[rowKey]) : '';
+      const item = {
+        supplier: cand.supplier,
+        productCode: r.productCode || '',
+        productName: (r.productNameCore && r.productNameCore.trim()) ? r.productNameCore.trim() : r.productName,
+        makerName: r.makerName || '',
+        currentSell: fin(r.currentSell) ? r.currentSell : null,
+        newSell,
+        effectiveDate: normDateInput(effRaw),
+        matchStatus: r.matchStatus || '',
+        currentCost: r.currentCost, newCost: r.newCost,
+        rowKey, ruleForRow, sellManual, effManual, note,
+      };
+      if (cand.priceReason) { review.push(Object.assign({ reason: cand.priceReason, reasonType: 'price' }, item)); continue; } // 価格異常
+      if (cand.score < thr) { review.push(Object.assign({ reason: '一致度が低い（' + (r.matchStatus || '') + '）', reasonType: 'match' }, item)); continue; } // 低一致
+      keep.push(item);
+    }
+    byCustomerSplit.set(name, { keep, review });
+  }
+  const applied = { ruleType, factor, roundingUnit: rounding.unit, roundingMode: rounding.mode, selfUplift, forceEffectiveDate: forceDate };
+  return { byCustomer: byCustomerSplit, fileCount: files.length, errors, thr, applied };
+}
+
+// /customers 画面の表示用。keep だけを「該当商品」に集め、要確認は件数のみ返す（従来互換）。
+function aggregateCustomers(opts) {
+  const { byCustomer, fileCount, errors, applied } = buildCustomerCandidates(opts);
+  const customers = [];
+  for (const [name, { keep, review }] of byCustomer) {
+    if (!keep.length) continue;
+    const suppliers = [...new Set(keep.map((p) => p.supplier))].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
+    const products = keep.slice().sort((a, b) =>
+      String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
+      String(a.productName).localeCompare(String(b.productName), 'ja'));
+    customers.push({
+      name, productCount: products.length, supplierCount: suppliers.length,
+      suppliers, reviewCount: review.length, products,
+    });
+  }
+  customers.sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
+  return { customers, fileCount, errors, applied };
+}
+
+// /customers からの見積書出力。doIssue=false=発行前チェック（要確認の一覧を返すだけ・書かない）、
+//  true=実発行（得意先ごと1枚のxlsxを書く。要確認行は本体から除外＝「発行ストップ→確認」運用の受け皿）。
+//  scope: 'all'（全得意先）/ 'one'（opts.customer の1得意先）。
+function exportCustomerQuotes(opts, doIssue) {
+  opts = opts || {};
+  const { byCustomer, applied, thr } = buildCustomerCandidates(opts);
+  let entries = [...byCustomer.entries()];
+  if (opts.scope === 'one' && opts.customer) entries = entries.filter(([n]) => n === opts.customer);
+  const reviewAll = [];
+  for (const [name, d] of entries) for (const rv of d.review) reviewAll.push(Object.assign({ customer: name }, rv));
+  const issuable = entries.filter(([, d]) => d.keep.length > 0);
+  const issuableRowCount = issuable.reduce((s, [, d]) => s + d.keep.length, 0);
+
+  if (!doIssue) {
+    // プレビュー：実際に見積書へ出力される内容（得意先ごとの明細）を、発行時と同じ並び・同じ値で返す。
+    //  得意先数・行数が多い時は上限で打ち切る（preview は確認用。発行自体は全件に対して行われる）。
+    const r2p = (v) => fin(v) ? Math.round(v * 100) / 100 : v;
+    const PV_CUST_CAP = 300, PV_ROW_CAP = 4000;
+    let rowBudget = PV_ROW_CAP;
+    const preview = [];
+    for (const [customer, d] of issuable) {
+      if (preview.length >= PV_CUST_CAP || rowBudget <= 0) break;
+      const keep = d.keep.slice().sort((a, b) =>
+        String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
+        String(a.productName).localeCompare(String(b.productName), 'ja'));
+      const rows = keep.slice(0, rowBudget).map((p) => ({
+        supplier: p.supplier, productCode: p.productCode || '', productName: p.productName,
+        currentSell: r2p(p.currentSell), newSell: r2p(p.newSell),
+        effectiveDate: p.effectiveDate, note: p.note || '',
+      }));
+      rowBudget -= rows.length;
+      preview.push({ customer, productCount: d.keep.length, rows });
+    }
+    return {
+      ok: true, action: 'check', applied, threshold: thr,
+      scope: opts.scope || 'all', customer: opts.customer || null,
+      issuableCustomerCount: issuable.length, issuableRowCount, reviewCount: reviewAll.length,
+      preview, previewTruncated: preview.length < issuable.length,
+      review: reviewAll.slice(0, 800).map((r) => ({
+        customer: r.customer, supplier: r.supplier, productCode: r.productCode,
+        productName: r.productName, makerName: r.makerName, reason: r.reason, reasonType: r.reasonType,
+        currentSell: r.currentSell, newSell: r.newSell, matchStatus: r.matchStatus,
+      })),
+    };
+  }
+
+  const r2 = (v) => fin(v) ? Math.round(v * 100) / 100 : v;
+  const folder = path.join(OUTPUT_DIR, `得意先別_見積書_${stamp()}`);
+  fs.mkdirSync(folder, { recursive: true });
+  const s = getSettings();
+  const opt = { company: s.company, quote: s.quote, date: jpDate() };
+  const ymd = (() => { const d2 = new Date(); const p = (n) => String(n).padStart(2, '0'); return '' + d2.getFullYear() + p(d2.getMonth() + 1) + p(d2.getDate()); })();
+  const files = [];
+  for (const [customer, d] of issuable) {
+    const keep = d.keep.slice().sort((a, b) =>
+      String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
+      String(a.productName).localeCompare(String(b.productName), 'ja'));
+    const qrows = keep.map((p) => ({
+      productCode: p.productCode || '', productName: p.productName, currentSell: r2(p.currentSell), newSell: r2(p.newSell), effectiveDate: p.effectiveDate, note: p.note || '',
+    }));
+    const quoteNo = ymd + '-' + String(files.length + 1).padStart(3, '0');
+    const fname = `見積_${sanitizeName(customer)}.xlsx`;
+    writeQuote(customer, qrows, path.join(folder, fname), Object.assign({}, opt, { quoteNo }));
+    files.push(fname);
+  }
+  let reviewFile = null;
+  if (reviewAll.length) {
+    const rows = reviewAll.map((r) => ({
+      customerName: r.customer, productCode: r.productCode, productName: r.productName,
+      makerName: r.makerName, currentSell: r.currentSell, newSell: r.newSell,
+      matchStatus: r.matchStatus, reviewReason: r.reason,
+    }));
+    reviewFile = `要確認(発行から除外).xlsx`;
+    writeXlsx(rows, path.join(folder, reviewFile), { sheetName: '要確認' });
+  }
+  return {
+    ok: true, action: 'issued', folder, folderName: path.basename(folder), files,
+    count: files.length, reviewCount: reviewAll.length, reviewFile, applied,
+    scope: opts.scope || 'all', customer: opts.customer || null,
+  };
+}
+
+// ---- HTTP ----------------------------------------------------------
+function sendJson(res, code, obj) {
+  const buf = Buffer.from(JSON.stringify(obj), 'utf8');
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': buf.length });
+  res.end(buf);
+}
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    // 不正/空のJSONでも reject せず空オブジェクトで解決（各APIが 200+{ok:false} を返せる＝フロントの分岐が崩れない）。
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); } catch (e) { resolve({}); } });
+    req.on('error', reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = req.url.split('?')[0];
+    if (req.method === 'GET' && url === '/') {
+      const buf = Buffer.from(PAGE, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (req.method === 'GET' && (url === '/manual' || url === '/使い方')) {
+      // 使い方手順書（HTML）。無ければ .md をテキストで、それも無ければ案内を返す。
+      const htmlPath = path.join(ROOT, '使い方手順書.html');
+      const mdPath = path.join(ROOT, '使い方手順書.md');
+      if (fs.existsSync(htmlPath)) {
+        const buf = fs.readFileSync(htmlPath);
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+        return res.end(buf);
+      }
+      if (fs.existsSync(mdPath)) {
+        const md = fs.readFileSync(mdPath, 'utf8').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const buf = Buffer.from('<!doctype html><meta charset="utf-8"><title>使い方手順書</title><pre style="font-family:メイリオ,sans-serif;white-space:pre-wrap;max-width:900px;margin:24px auto;padding:0 16px;line-height:1.7">' + md + '</pre>', 'utf8');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+        return res.end(buf);
+      }
+      const buf = Buffer.from('<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;margin:40px">使い方手順書が見つかりません（使い方手順書.html / .md）。</p>', 'utf8');
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (req.method === 'GET' && url === '/api/files') {
+      return sendJson(res, 200, { files: listLatestCsv() });
+    }
+    if (req.method === 'GET' && url === '/api/calendar') {
+      return sendJson(res, 200, buildCalendar());
+    }
+    if (req.method === 'GET' && url === '/api/pl') {
+      return sendJson(res, 200, loadPL());
+    }
+    if (req.method === 'GET' && url === '/api/settings') {
+      return sendJson(res, 200, { settings: getSettings(), configured: isConfigured() });
+    }
+    if (req.method === 'POST' && url === '/api/settings') {
+      const body = await readBody(req);
+      return sendJson(res, 200, { ok: true, settings: saveSettings(body || {}) });
+    }
+    if (req.method === 'GET' && url === '/import') {
+      const buf = Buffer.from(IMPORT_PAGE, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (req.method === 'GET' && url === '/list') {
+      const buf = Buffer.from(LIST_PAGE, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (req.method === 'GET' && url === '/suppliers') {
+      const buf = Buffer.from(SUPPLIERS_PAGE, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (req.method === 'GET' && url === '/self') {
+      const buf = Buffer.from(SELF_PAGE, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (req.method === 'GET' && url === '/customers') {
+      const buf = Buffer.from(CUSTOMERS_PAGE, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (url === '/api/customers' && (req.method === 'GET' || req.method === 'POST')) {
+      const opts = req.method === 'POST' ? (await readBody(req)) : {};
+      return sendJson(res, 200, aggregateCustomers(opts));
+    }
+    if (req.method === 'POST' && url === '/api/customers-export') {
+      const body = await readBody(req);
+      const doIssue = body && body.action === 'issue';
+      try { return sendJson(res, 200, exportCustomerQuotes(body || {}, doIssue)); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    if (req.method === 'GET' && url === '/api/suppliers') {
+      return sendJson(res, 200, { suppliers: getSuppliers() });
+    }
+    if (req.method === 'POST' && url === '/api/upload-suppliers') {
+      const body = await readBody(req);
+      try {
+        const { records } = readUploadedTableFile((body && body.b64) || '', (body && body.filename) || '');
+        const suppliers = parseSuppliersFromRecords(records);
+        return sendJson(res, 200, { ok: true, suppliers });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    if (req.method === 'POST' && url === '/api/save-suppliers') {
+      const body = await readBody(req);
+      const saved = saveSuppliers((body && body.suppliers) || {});
+      return sendJson(res, 200, { ok: true, suppliers: saved });
+    }
+    if (req.method === 'GET' && url === '/api/maker-purchase-codes') {
+      // 全メーカー（maker_quotes ベース）と、現在の purchaseCode 設定を一括返却
+      const items = listMakerQuotes();
+      const makers = getMakers();
+      const out = items.map((it) => ({
+        supplier: it.supplier,
+        purchaseCode: (makers[it.supplier] && makers[it.supplier].purchaseCode) || '',
+      }));
+      return sendJson(res, 200, { items: out });
+    }
+    if (req.method === 'POST' && url === '/api/maker-purchase-code') {
+      const body = await readBody(req);
+      const maker = String((body && body.maker) || '').trim();
+      const code = String((body && body.code) || '').trim();
+      if (!maker) return sendJson(res, 200, { ok: false, error: 'メーカー名が空です' });
+      saveMakerProfile(maker, { purchaseCode: code });
+      return sendJson(res, 200, { ok: true, maker, purchaseCode: code });
+    }
+    if (req.method === 'GET' && url === '/api/self-profile') {
+      return sendJson(res, 200, { selfProfile: getSelfProfile() });
+    }
+    if (req.method === 'GET' && url === '/api/hanbai-source') {
+      // 照合エンジンが実際に使う販売実績ファイルの情報を返す。
+      // config.hanbai.path がフォルダなら resolveHanbaiSource が最新の .xls/.xlsx/.csv を選ぶ。
+      const s = getSettings();
+      const configured = (s.hanbai && s.hanbai.path) || '';
+      let resolved = null, mtime = null, size = null, format = '', isDir = false, dirPath = '';
+      try {
+        if (configured) {
+          const st = fs.statSync(configured);
+          isDir = st.isDirectory();
+          dirPath = isDir ? configured : path.dirname(configured);
+        }
+        resolved = resolveHanbaiSource(configured);
+        if (resolved) {
+          const rst = fs.statSync(resolved);
+          mtime = new Date(rst.mtimeMs).toISOString();
+          size = rst.size;
+          const ext = (resolved.match(/\.([^.]+)$/) || ['', ''])[1].toLowerCase();
+          format = ext;
+        }
+      } catch (e) { /* ignore */ }
+      return sendJson(res, 200, {
+        configured, isDir, dirPath, resolved,
+        resolvedName: resolved ? path.basename(resolved) : null,
+        mtime, size, format,
+      });
+    }
+    if (req.method === 'POST' && url === '/api/upload-self') {
+      const body = await readBody(req);
+      try {
+        const { records, headers } = readUploadedTableFile((body && body.b64) || '', (body && body.filename) || '');
+        // 自社販売実績は階層 (得意先見出し → 商品行 → 合計行) なので、先頭〜30件を grid 形式で返す
+        const limit = 30;
+        const sample = records.slice(0, limit);
+        const grid = sample.map((r) => headers.map((h) => r[h]));
+        // 列1の中身を parseSelfName でプレビュー
+        const parsed = sample.map((r) => {
+          const cell = String((r[headers[0]] != null ? r[headers[0]] : '') || '');
+          return parseSelfName(cell);
+        });
+        return sendJson(res, 200, { ok: true, headers, grid, parsed, total: records.length });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    if (req.method === 'POST' && url === '/api/save-self-profile') {
+      const body = await readBody(req);
+      const saved = saveSelfProfile((body && body.selfProfile) || null);
+      return sendJson(res, 200, { ok: true, selfProfile: saved });
+    }
+    if (req.method === 'GET' && url === '/api/maker-list') {
+      return sendJson(res, 200, { items: listMakerQuotes() });
+    }
+    if (req.method === 'POST' && url === '/api/open') {
+      const body = await readBody(req);
+      try {
+        const p = String((body && body.path) || '');
+        if (!p) return sendJson(res, 200, { ok: false, error: 'pathが空です' });
+        const opened = safeOpenPath(p);
+        return sendJson(res, 200, { ok: true, opened });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    if (req.method === 'GET' && url === '/api/makers') {
+      return sendJson(res, 200, { makers: getMakers() });
+    }
+    if (req.method === 'GET' && url === '/api/product-links') {
+      return sendJson(res, 200, { productLinks: getProductLinks() });
+    }
+    if (req.method === 'POST' && url === '/api/product-link') {
+      const body = await readBody(req);
+      const sup = String((body && body.supplier) || '').trim();
+      const code = String((body && body.productCode) || '').trim();
+      const name = (body && body.makerName != null) ? String(body.makerName).trim() : '';
+      if (!sup || !code) return sendJson(res, 200, { ok: false, error: 'supplier と productCode は必須です' });
+      const links = saveProductLink(sup, code, name);
+      return sendJson(res, 200, { ok: true, productLinks: links });
+    }
+    if (req.method === 'POST' && url === '/api/maker-quote') {
+      const body = await readBody(req);
+      const saved = saveMakerQuote(body);
+      // 取り込んだら自動で照合（maker_quotes × 販売実績 → input/）を実行し、
+      //  利用者が「↻ 照合を実行」を押さなくても対象に出るようにする。
+      if (saved && saved.ok) {
+        try {
+          const outFiles = runShogo(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
+          saved.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)) };
+        } catch (e) {
+          saved.shogo = { ok: false, error: String(e && e.message || e) };
+        }
+      }
+      return sendJson(res, 200, saved);
+    }
+    if (req.method === 'POST' && url === '/api/read-xlsx') {
+      // 取り込み画面の「ファイルを選択」(Excel) 用：base64で受け取りシート一覧と表(grid)を返す
+      const body = await readBody(req);
+      try {
+        const b64 = String((body && body.b64) || '');
+        if (!b64) return sendJson(res, 200, { ok: false, error: 'ファイルが空です' });
+        const buf = Buffer.from(b64, 'base64');
+        const { sheets } = readXlsxBuffer(buf);
+        // 空シートは除外しつつ、日付シリアル→YYYY-MM-DD、価格列の浮動小数を整形して返す
+        const out = sheets
+          .filter((s) => Array.isArray(s.grid) && s.grid.some((r) => r.some((c) => String(c || '').trim() !== '')))
+          .map((s) => ({ name: s.name, grid: normalizeMakerGrid(s.grid) }));
+        if (!out.length) return sendJson(res, 200, { ok: false, error: '読み取れる中身がありません' });
+        return sendJson(res, 200, { ok: true, sheets: out });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    if (req.method === 'POST' && url === '/api/shogo') {
+      // メーカー見積 × 販売実績 を照合し input/ へ出力（中身は 照合.bat と同じ）
+      try {
+        const outFiles = runShogo(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
+        return sendJson(res, 200, { ok: true, files: (outFiles || []).map((f) => path.basename(f)) });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    if (req.method === 'POST' && url === '/api/calc') {
+      const body = await readBody(req);
+      return sendJson(res, 200, calcAll(body));
+    }
+    if (req.method === 'POST' && url === '/api/export') {
+      const body = await readBody(req);
+      const result = exportQuotes(body);
+      if (result.ok === false) return sendJson(res, 200, result); // 対象0件は Explorer を開かない
+      if (process.platform === 'win32') exec(`explorer "${result.folder}"`);
+      else if (process.platform === 'darwin') exec(`open "${result.folder}"`);
+      return sendJson(res, 200, result);
+    }
+    res.writeHead(404); res.end('not found');
+  } catch (e) {
+    sendJson(res, 500, { error: String(e && e.message || e) });
+  }
+});
+
+function listen(port) {
+  server.once('error', (e) => {
+    if (e.code === 'EADDRINUSE' && port < PORT_START + 20) listen(port + 1);
+    else { console.error('サーバ起動に失敗:', e.message); process.exit(1); }
+  });
+  server.listen(port, '127.0.0.1', () => {
+    const urlStr = `http://localhost:${port}`;
+    console.log('=== 価格転嫁シミュレーション ===');
+    console.log('ブラウザで開きます: ' + urlStr);
+    console.log('（終了するにはこの画面で Ctrl+C）');
+    if (process.platform === 'win32') exec(`start "" "${urlStr}"`);
+    else if (process.platform === 'darwin') exec(`open "${urlStr}"`);
+  });
+}
+
+// 直接 `node src/server.js` で起動したときだけサーバを立てる（テスト時は require のみ）
+if (require.main === module) {
+  // 想定外の例外・未処理のPromise拒否が起きても、サーバプロセスを落とさず動かし続ける。
+  //  （1回のエラーで全停止すると、以降すべての操作が「Failed to fetch」になるのを防ぐ）
+  process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e && e.stack || e); });
+  process.on('unhandledRejection', (e) => { console.error('[unhandledRejection]', e && e.stack || e); });
+  listen(PORT_START);
+}
+
+module.exports = { calcAll, exportQuotes, server };
+
+// =====================================================================
+//  画面（HTML/CSS/JS をひとまとめ。外部ファイル不要）
+// =====================================================================
+const PAGE = `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>価格転嫁シミュレーション</title>
+<style>
+  :root{ --bg:#f4f6f9; --card:#fff; --line:#e2e6ec; --ink:#1f2733; --sub:#6b7785;
+         --accent:#1f4e78; --pos:#2e7d32; --neg:#c0392b; --hi:#fff7ec; }
+  *{ box-sizing:border-box }
+  body{ margin:0; font-family:"メイリオ","Meiryo","Segoe UI",sans-serif; background:var(--bg); color:var(--ink); font-size:13px; }
+  header{ background:var(--accent); color:#fff; padding:10px 16px; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1{ font-size:16px; margin:0; font-weight:700; }
+  header .sub{ color:#cfe0f0; font-size:12px; }
+  .bar{ background:var(--card); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:18px; align-items:flex-end; flex-wrap:wrap; }
+  .field{ display:flex; flex-direction:column; gap:3px; }
+  .field label{ font-size:11px; color:var(--sub); }
+  select,input{ font:inherit; padding:5px 7px; border:1px solid #c7ced8; border-radius:6px; background:#fff; }
+  input.num{ width:90px; text-align:right; }
+  .cards{ display:flex; gap:12px; padding:12px 16px; flex-wrap:wrap; }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; min-width:150px; box-shadow:0 1px 2px rgba(0,0,0,.03); }
+  .card .k{ font-size:11px; color:var(--sub); }
+  .card .v{ font-size:20px; font-weight:700; margin-top:2px; }
+  .v.pos{ color:var(--pos) } .v.neg{ color:var(--neg) }
+  .v small{ font-size:12px; font-weight:400; color:var(--sub) }
+  /* 横に広い表を「高さ制限つきスクロール枠」に。見出し行は上端に固定。 */
+  .wrap{ margin:0 16px 24px; overflow:auto; max-height:70vh; border:1px solid var(--line); border-top:none; border-radius:0 0 8px 8px; background:var(--card); }
+  .wrap::-webkit-scrollbar{ height:14px; width:14px; }
+  .wrap::-webkit-scrollbar-thumb{ background:#b9c4d0; border-radius:7px; border:3px solid var(--card); }
+  .wrap::-webkit-scrollbar-thumb:hover{ background:#9aa9b8; }
+  /* 表のすぐ上に「常に見える」横スクロールバー。画面に貼り付き、表と左右が連動する。
+     表の下端まで行かなくても右側の列へスライドできるようにするための補助バー。 */
+  .hbar{ position:sticky; top:0; z-index:6; margin:0 16px; height:16px; overflow-x:auto; overflow-y:hidden;
+         background:#e3eaf2; border:1px solid var(--line); border-bottom:none; border-radius:8px 8px 0 0; display:none; }
+  .hbar::-webkit-scrollbar{ height:14px; }
+  .hbar::-webkit-scrollbar-thumb{ background:#8fa3b8; border-radius:7px; }
+  .hbar::-webkit-scrollbar-thumb:hover{ background:#71889f; }
+  #hbarInner{ height:1px; }
+  table{ border-collapse:separate; border-spacing:0; width:100%; min-width:1500px; background:var(--card); font-size:12px; }
+  th,td{ border-right:1px solid var(--line); border-bottom:1px solid var(--line); padding:5px 7px; white-space:nowrap; }
+  th:first-child,td:first-child{ border-left:1px solid var(--line); }
+  th{ background:#eef2f7; position:sticky; top:0; z-index:2; font-weight:700; color:#2a3a4a; }
+  td.r,th.r{ text-align:right; } td.c,th.c{ text-align:center; }
+  tr.unmatched td{ color:#9aa6b2; background:#fafbfc; }
+  /* 得意先別ページから商品名リンクで飛んできた時、該当行を黄色く強調（数秒で消える） */
+  tr.focusrow td{ background:#fff3bf !important; transition:background .8s ease; box-shadow:inset 0 0 0 9999px rgba(255,221,87,.18); }
+  td.hi{ background:var(--hi); font-weight:700; }
+  td.pricewarn{ background:#fdecea !important; color:#c0392b; font-weight:700; cursor:help; }
+  td.ratewarn{ background:#fff4d6 !important; color:#9a6a00; font-weight:700; cursor:help; }
+  #priceAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fdecea; border:1px solid #f5b7b1; color:#922b21; font-size:13px; }
+  #rateAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fff4d6; border:1px solid #f0d090; color:#7a5200; font-size:13px; }
+  .jumphint{ display:inline-block; margin-left:8px; padding:1px 8px; border-radius:10px; background:rgba(0,0,0,.08); font-weight:700; white-space:nowrap; }
+  tr.flashrow{ animation:flashrow 1.4s ease-out 1; }
+  @keyframes flashrow{ 0%{ background:#ffe08a; } 60%{ background:#fff3c4; } 100%{ background:transparent; } }
+  .badge{ font-size:10px; padding:1px 6px; border-radius:9px; }
+  .badge.act{ background:#e3f1e4; color:#2e7d32 } .badge.est{ background:#fdecea; color:#c0392b }
+  .pos{ color:var(--pos) } .neg{ color:var(--neg) }
+  .ml6{ margin-left:6px }
+  .ratetag{ display:block; font-size:11px; font-weight:700; margin-top:1px; }
+  .ratetag.pos{ color:var(--neg) } /* 値上げ＝赤で目立たせる */
+  .ratetag.neg{ color:#2a6fb0 }    /* 値下げ＝青 */
+  .ratetag.flat{ color:#9aa6b2 }
+  button.go{ background:var(--accent); color:#fff; border:none; border-radius:8px; padding:9px 16px; font-size:13px; font-weight:700; cursor:pointer; }
+  button.go:hover{ background:#163a5c }
+  .foot{ padding:8px 16px 20px; }
+  .hint{ color:var(--sub); font-size:11px; }
+  .rule-sel{ padding:3px 5px; font-size:11px; }
+  #msg{ padding:8px 16px; color:var(--neg); }
+  /* 全社損益インパクト パネル */
+  .plpanel{ margin:0 16px 14px; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; box-shadow:0 1px 2px rgba(0,0,0,.03); }
+  .plhead{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-weight:700; color:#2a3a4a; margin-bottom:10px; }
+  .plhead .hint{ font-weight:400; }
+  .plgrid{ display:flex; gap:18px; flex-wrap:wrap; align-items:flex-start; }
+  .plinputs{ display:flex; flex-direction:column; gap:6px; min-width:200px; }
+  .plinputs .row{ display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; }
+  .plinputs input.num{ width:120px; }
+  .pltbl{ flex:1; min-width:420px; }
+  .pltbl th,.pltbl td{ border:1px solid var(--line); padding:5px 9px; }
+  .pltbl th{ background:#eef2f7; }
+  .pltbl td.r{ text-align:right; } .pltbl th.r{ text-align:right; }
+  .pltbl tr.op td{ font-weight:700; background:#f7faff; }
+  .pltbl .d{ font-size:10px; margin-left:6px; }
+  /* 設定（初回登録）画面 */
+  #settingsBtn{ margin-left:8px; background:#fff; color:var(--accent); border:none; border-radius:8px; padding:7px 14px; font-weight:700; cursor:pointer; }
+  #importLink, #listLink, #suppliersLink, #selfLink{ background:#eaf1f8; color:var(--accent); border-radius:8px; padding:7px 14px; font-weight:700; text-decoration:none; font-size:13px; }
+  #manualLink{ color:#fff; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.55); border-radius:8px; padding:7px 14px; font-weight:700; text-decoration:none; font-size:13px; }
+  #manualLink:hover{ background:rgba(255,255,255,.30); }
+  #calBtn{ color:#fff; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.55); border-radius:8px; padding:7px 14px; font-weight:700; cursor:pointer; font-size:13px; }
+  #calBtn:hover{ background:rgba(255,255,255,.30); }
+  /* 実施日カレンダー */
+  #calModal{ background:#fff; border-radius:14px; max-width:980px; width:100%; box-shadow:0 18px 50px rgba(0,0,0,.3); }
+  #calModal .chead{ display:flex; align-items:center; gap:12px; padding:16px 20px; border-bottom:1px solid #e6ecf2; }
+  #calModal .chead h2{ margin:0; font-size:18px; color:var(--accent); }
+  #calModal .cnav{ display:flex; align-items:center; gap:8px; margin-left:6px; }
+  #calModal .cnav button{ background:#eaf1f8; color:var(--accent); border:none; border-radius:8px; padding:6px 12px; font-weight:700; cursor:pointer; font-size:15px; }
+  #calModal .cnav button:hover{ background:#dbe8f5; }
+  #calModal .cnav .cmonth{ font-weight:800; font-size:16px; min-width:128px; text-align:center; }
+  #calModal .cclose{ margin-left:auto; background:#fff; border:1px solid #cdd7e1; border-radius:8px; padding:6px 14px; font-weight:700; cursor:pointer; color:#5a6b7a; }
+  #calChips{ display:flex; flex-wrap:wrap; gap:8px; padding:12px 20px 0; }
+  #calChips .chip{ background:#f3f7fb; border:1px solid #d6e1ec; border-radius:999px; padding:5px 12px; font-size:13px; cursor:pointer; color:#33485c; font-weight:600; }
+  #calChips .chip:hover{ background:#e4eef7; }
+  #calChips .chip b{ color:var(--accent); }
+  #calChips .chip.empty{ color:#9aa6b2; }
+  .calgrid{ display:grid; grid-template-columns:repeat(7,1fr); gap:4px; padding:12px 20px; }
+  .calgrid .dow{ text-align:center; font-size:12px; font-weight:700; color:#7a8794; padding:4px 0; }
+  .calgrid .dow.sun{ color:#c0392b; } .calgrid .dow.sat{ color:#2a6fb0; }
+  .calcell{ min-height:64px; border:1px solid #eef1f5; border-radius:8px; padding:4px 6px; background:#fcfdff; cursor:default; }
+  .calcell.blank{ background:transparent; border:none; }
+  .calcell .dn{ font-size:12px; color:#8a96a3; }
+  .calcell.sun .dn{ color:#c0392b; } .calcell.sat .dn{ color:#2a6fb0; }
+  .calcell.has{ background:#fff4e6; border-color:#f0c896; cursor:pointer; }
+  .calcell.has:hover{ background:#ffe9cf; }
+  .calcell.sel{ background:#ffe0b8; border-color:#e0922c; box-shadow:0 0 0 2px #e0922c inset; }
+  .calcell.today .dn{ background:var(--accent); color:#fff; border-radius:50%; padding:0 5px; }
+  .calcell .cnt{ display:inline-block; margin-top:3px; background:#e0922c; color:#fff; border-radius:999px; font-size:11px; font-weight:700; padding:1px 7px; }
+  /* 実施日が「本日」のセル＝赤で強調（当日に価格改定が発効） */
+  .calcell.has.today{ background:#fdecea; border-color:#e0392c; box-shadow:0 0 0 2px #e0392c inset; }
+  .calcell.has.today .dn{ background:#e0392c; }
+  .calcell.has.today .cnt{ background:#e0392c; }
+  .calcell.has.today.sel{ box-shadow:0 0 0 3px #b5231a inset; }
+  #calTodayBanner .tbnr{ margin:12px 20px 0; background:#fdecea; border:1px solid #f3b4ad; color:#a01b10; border-radius:10px; padding:9px 14px; font-size:13px; font-weight:700; }
+  #calReminder .rbnr{ margin:12px 20px 0; border-radius:10px; padding:9px 14px; font-size:12.5px; display:flex; flex-wrap:wrap; gap:14px; align-items:center; }
+  #calReminder .rbnr.warn{ background:#fff7e6; border:1px solid #f0c879; color:#7a5300; }
+  #calReminder .rbnr.ok{ background:#eef7ef; border:1px solid #bfe0c4; color:#2e6b35; }
+  #calReminder .ritem b{ font-weight:800; }
+  #calReminder .rtag{ display:inline-block; border-radius:999px; padding:1px 8px; font-size:11px; font-weight:700; margin-right:5px; }
+  #calReminder .rtag.w{ background:#f0a800; color:#fff; } #calReminder .rtag.g{ background:#3a9a4a; color:#fff; } #calReminder .rtag.x{ background:#b0b8c0; color:#fff; }
+  #calReminder .rgo{ background:#fff; border:1px solid #d8c089; color:#7a5300; border-radius:7px; padding:3px 10px; font-size:11.5px; font-weight:700; cursor:pointer; text-decoration:none; }
+  #calDetail{ border-top:1px solid #e6ecf2; padding:14px 20px 20px; max-height:46vh; overflow:auto; }
+  #calDetail h3{ margin:0 0 8px; font-size:14px; color:#33485c; }
+  #calDetail table{ width:100%; border-collapse:collapse; font-size:12.5px; }
+  #calDetail th{ text-align:left; color:#7a8794; font-weight:700; border-bottom:1px solid #e6ecf2; padding:5px 8px; }
+  #calDetail td{ border-bottom:1px solid #f1f4f7; padding:5px 8px; vertical-align:top; }
+  #calDetail tr:hover td{ background:#f8fafc; }
+  #calDetail .empty{ color:#9aa6b2; padding:8px 0; }
+  #importLink{ margin-left:auto; }
+  #importLink:hover, #listLink:hover, #suppliersLink:hover, #selfLink:hover{ background:#dbe8f5; }
+  #settingsBtn:hover{ background:#eaf1f8; }
+  .overlay{ position:fixed; inset:0; background:rgba(15,25,40,.45); display:none; align-items:flex-start; justify-content:center; z-index:50; overflow:auto; padding:24px 12px; }
+  .overlay.show{ display:flex; }
+  .modal{ background:#fff; border-radius:12px; width:min(680px,100%); box-shadow:0 12px 40px rgba(0,0,0,.25); }
+  .modal .mhead{ background:var(--accent); color:#fff; padding:14px 18px; border-radius:12px 12px 0 0; }
+  .modal .mhead h2{ margin:0; font-size:16px; }
+  .modal .mhead .sub{ color:#cfe0f0; font-size:12px; margin-top:2px; }
+  .modal .mbody{ padding:16px 18px; }
+  .modal .sec{ font-weight:700; color:#2a3a4a; margin:16px 0 8px; border-left:4px solid var(--accent); padding-left:8px; }
+  .modal .sec:first-of-type{ margin-top:0; }
+  .frow{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
+  .fcol{ display:flex; flex-direction:column; gap:3px; flex:1; min-width:150px; }
+  .fcol label{ font-size:11px; color:var(--sub); }
+  .fcol input,.fcol select,.fcol textarea{ font:inherit; padding:6px 8px; border:1px solid #c7ced8; border-radius:6px; }
+  .fcol textarea{ resize:vertical; min-height:54px; }
+  .modal .mfoot{ padding:14px 18px; border-top:1px solid var(--line); display:flex; gap:10px; justify-content:flex-end; align-items:center; }
+  .modal .mfoot .note{ margin-right:auto; color:var(--sub); font-size:11px; }
+  button.ghost{ background:#fff; color:var(--sub); border:1px solid #c7ced8; border-radius:8px; padding:9px 16px; font-size:13px; cursor:pointer; }
+  .welcome{ background:#fff7ec; border:1px solid #f0d9a8; color:#8a5a12; padding:9px 12px; border-radius:8px; margin:0 0 12px; font-size:12px; line-height:1.6; display:none; }
+  .welcome.show{ display:block; }
+</style></head>
+<body>
+<header>
+  <h1>価格転嫁シミュレーション</h1>
+  <span class="sub">メーカー改定額を入れて、転嫁後の単価・粗利・年間影響を試算</span>
+  <button id="calBtn" style="margin-left:auto" title="読み込み中のデータの実施日を月カレンダーで一覧表示します">📅 実施日カレンダー</button>
+  <a href="/manual" id="manualLink" target="_blank" style="margin-left:0" title="このツールの使い方手順書を新しいタブで開きます">📖 使い方</a>
+  <a href="/list" id="listLink" style="margin-left:0">📊 一覧・進捗</a>
+  <a href="/import" id="importLink" style="margin-left:0">＋ メーカー見積取込</a>
+  <a href="/suppliers" id="suppliersLink" style="margin-left:0">📒 仕入先マスタ</a>
+  <a href="/self" id="selfLink" style="margin-left:0">⚙ 自社データ設定</a>
+  <button id="settingsBtn">⚙ 設定</button>
+</header>
+
+<div class="overlay" id="calOverlay">
+  <div id="calModal">
+    <div class="chead">
+      <h2>📅 実施日カレンダー</h2>
+      <div class="cnav">
+        <button id="calPrev" title="前の月">◀</button>
+        <span class="cmonth" id="calMonth"></span>
+        <button id="calNext" title="次の月">▶</button>
+        <button id="calToday" title="今月へ" style="font-size:12px;padding:6px 10px">今月</button>
+      </div>
+      <button class="cclose" id="calClose">閉じる</button>
+    </div>
+    <div id="calReminder"></div>
+    <div id="calTodayBanner"></div>
+    <div id="calChips"></div>
+    <div class="calgrid" id="calGrid"></div>
+    <div id="calDetail"></div>
+  </div>
+</div>
+
+<div class="overlay" id="settingsOverlay">
+  <div class="modal">
+    <div class="mhead">
+      <h2>⚙ 設定（初回登録）</h2>
+      <div class="sub">自社の情報を登録します。ここで保存した内容が見積書に反映されます。</div>
+    </div>
+    <div class="mbody">
+      <div class="welcome" id="welcomeMsg">はじめまして。まず自社の会社情報を入力して「保存する」を押してください。見積書の差出人として使われます（あとから「⚙ 設定」でいつでも変更できます）。</div>
+
+      <div class="sec">会社情報（見積書に表示されます）</div>
+      <div class="frow">
+        <div class="fcol" style="flex:2"><label>会社名 *</label><input id="cName" placeholder="例: 日野折箱店"></div>
+        <div class="fcol"><label>郵便番号</label><input id="cPostal" placeholder="〒000-0000"></div>
+      </div>
+      <div class="frow">
+        <div class="fcol" style="min-width:100%"><label>住所</label><input id="cAddr" placeholder="○○県○○市○○ 0-0-0"></div>
+      </div>
+      <div class="frow">
+        <div class="fcol"><label>電話</label><input id="cTel" placeholder="TEL: 000-000-0000"></div>
+        <div class="fcol"><label>FAX（任意）</label><input id="cFax" placeholder="FAX: 000-000-0001"></div>
+      </div>
+
+      <div class="sec">見積書の文言</div>
+      <div class="frow"><div class="fcol" style="min-width:100%"><label>タイトル</label><input id="qTitle" placeholder="御 見 積 書"></div></div>
+      <div class="frow"><div class="fcol" style="min-width:100%"><label>あいさつ文</label><textarea id="qGreeting"></textarea></div></div>
+      <div class="frow"><div class="fcol" style="min-width:100%"><label>脚注（注意書き）</label><textarea id="qFooter"></textarea></div></div>
+
+      <div class="sec">計算の既定値（画面上部の初期値になります）</div>
+      <div class="frow">
+        <div class="fcol"><label>既定の転嫁ルール</label>
+          <select id="sRule">
+            <option value="add_increase">値上げ分を上乗せ（利益額キープ）</option>
+            <option value="keep_margin_rate">現在の粗利率を維持</option>
+            <option value="markup">現売価 × 掛率</option>
+            <option value="sell_cost_rate">現売価 × 仕入改定%（仕入と同率で値上げ＝粗利率維持と同結果）</option>
+            <option value="keep_sell">据え置き（値上げしない）</option>
+          </select></div>
+        <div class="fcol" id="sFactorBox" style="display:none"><label>掛率</label><input id="sFactor" type="number" step="0.01" value="1.25"></div>
+        <div class="fcol"><label>端数 単位</label>
+          <select id="sUnit"><option value="1">1円</option><option value="0.1">0.1円</option><option value="0.01">0.01円（銭）</option></select></div>
+        <div class="fcol"><label>端数 処理</label>
+          <select id="sMode"><option value="round">四捨五入</option><option value="ceil">切上げ</option><option value="floor">切捨て</option></select></div>
+        <div class="fcol"><label>自社コスト上乗せ%</label><input id="sUplift" type="number" step="0.1" value="0"></div>
+        <div class="fcol"><label>一致度しきい値%<br><span style="font-size:10px;color:#9aa6b2">未満は要確認へ</span></label><input id="sThreshold" type="number" step="1" value="80"></div>
+      </div>
+    </div>
+    <div class="mfoot">
+      <span class="note" id="setMsg">* 会社名は必須です</span>
+      <button class="ghost" id="setCancel">閉じる</button>
+      <button class="go" id="setSave">保存する</button>
+    </div>
+  </div>
+</div>
+
+<div class="bar">
+  <div class="field"><label>対象（照合結果CSV）</label>
+    <div style="display:flex;gap:6px;align-items:center">
+      <select id="file"></select>
+      <button id="shogoBtn" class="ghost" style="white-space:nowrap" title="maker_quotes に取り込んだメーカー見積を販売実績と照合し、新しい照合結果CSVを作ります（販売実績が旧Excelなら自動変換）">↻ 照合を実行</button>
+    </div>
+    <span id="shogoMsg" style="font-size:11px;color:#6b7785"></span></div>
+  <div class="field"><label>転嫁ルール（全体方針）<br><span class="hint">保存すると得意先別へ引継ぎ</span></label>
+    <select id="rule">
+      <option value="add_increase">値上げ分を上乗せ（利益額キープ）</option>
+      <option value="keep_margin_rate">現在の粗利率を維持</option>
+      <option value="markup">現売価 × 掛率</option>
+      <option value="sell_cost_rate">現売価 × 仕入改定%（仕入と同率で値上げ＝粗利率維持と同結果）</option>
+      <option value="keep_sell">据え置き（値上げしない）</option>
+    </select></div>
+  <div class="field" id="factorBox" style="display:none"><label>掛率</label>
+    <input id="factor" class="num" type="number" step="0.01" value="1.25"></div>
+  <div class="field"><label>端数 単位</label>
+    <select id="unit">
+      <option value="1">1円</option>
+      <option value="0.1">0.1円</option>
+      <option value="0.01" selected>0.01円（銭）</option>
+    </select></div>
+  <div class="field"><label>端数 処理</label>
+    <select id="mode">
+      <option value="round" selected>四捨五入</option>
+      <option value="ceil">切上げ</option>
+      <option value="floor">切捨て</option>
+    </select></div>
+  <div class="field"><label>自社コスト上乗せ%<br><span class="hint">労務費・最賃</span></label>
+    <input id="selfUplift" class="num" type="number" step="0.1" value="0"></div>
+  <div class="field"><label>&nbsp;<br><span class="hint">この方針を会社全体の既定に</span></label>
+    <button class="go" id="savePolicyBtn" style="background:#5b6b8b" title="今の転嫁ルール・端数・自社上乗せ%を『全体方針』として保存します。得意先別ページの初期値に引き継がれます（損益シミュレーションの前提もこれになります）">💾 全体方針を保存</button></div>
+</div>
+
+<!-- 見積書作成への導線（メインは照合確認用 → 見積書は得意先別ページで）。独立バナーで目立たせる。 -->
+<div style="margin:0 16px 12px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:#eaf6ee;border:1px solid #bfe0c4;border-left:6px solid #1b6b3a;border-radius:10px;padding:12px 16px">
+  <span style="font-size:20px">🧾</span>
+  <div style="flex:1;min-width:200px">
+    <div style="font-weight:700;color:#1b5e34;font-size:14px">見積書の作成は「得意先別ページ」で行います</div>
+    <div style="color:#3c6b4a;font-size:12px;margin-top:2px">このメイン画面は照合の確認・全体方針の決定用です。価格を確認したら、得意先別ページで見積書を出力してください。</div>
+  </div>
+  <a id="toCustomersBtn" href="/customers" style="background:#1b6b3a;color:#fff;text-decoration:none;display:inline-block;text-align:center;padding:11px 20px;border-radius:8px;font-size:14px;font-weight:700;white-space:nowrap" onmouseover="this.style.background='#15532c'" onmouseout="this.style.background='#1b6b3a'">👥 得意先別ページで見積書を作成 →</a>
+</div>
+
+<div id="msg"></div>
+
+<div id="exportSummary" style="display:none;margin:0 16px 12px;border:1px solid #cfe1d3;background:#f3f9f4;border-radius:10px;padding:10px 14px;font-size:12px;color:#1f2733">
+  <!-- 見積書出力後のサマリ。フォルダを開いたりタブを切替えても残るよう、ここに表示し続ける。 -->
+</div>
+
+<div class="cards" id="cards"></div>
+
+<div class="plpanel">
+  <div class="plhead">
+    全社 損益インパクト（選択中メーカーの値上げ分・変動損益ベース）
+    <span style="font-weight:400">単位</span>
+    <select id="plUnit">
+      <option value="1">円</option>
+      <option value="1000" selected>千円</option>
+      <option value="1000000">百万円</option>
+    </select>
+    <span id="plSrc" class="hint"></span>
+  </div>
+  <div class="plgrid">
+    <div class="plinputs">
+      <div class="row"><span>純売上高</span><input id="plSales" class="num" type="number" step="any"></div>
+      <div class="row"><span>変動費合計</span><input id="plVar" class="num" type="number" step="any"></div>
+      <div class="row"><span>固定費合計</span><input id="plFixed" class="num" type="number" step="any"></div>
+      <div class="row"><span>自社コスト増/年(固定費)</span><input id="plSelfCost" class="num" type="number" step="any" value="0"></div>
+      <div class="hint">数値は選択中の「単位」で扱います。損益.csv を直下に置くと自動読込。<br>「自社コスト増」は転嫁有無に関わらず固定費に加算します。</div>
+    </div>
+    <table class="pltbl">
+      <thead><tr><th>項目</th><th class="r">現状</th><th class="r">転嫁しない</th><th class="r">転嫁する（現設定）</th></tr></thead>
+      <tbody id="plBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="priceAlert"></div>
+<div id="rateAlert"></div>
+<div class="hbar" id="hbar"><div id="hbarInner"></div></div>
+<div class="wrap" id="wrap"><table id="tbl">
+  <thead><tr>
+    <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th>商品名</th>
+    <th class="r">現仕入</th><th class="c">改定後 仕入単価<br><span class="hint">(編集可)</span></th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
+    <th class="r">現売単価</th><th class="r">転嫁後 売単価</th><th class="r">値上額<br><span class="hint">(改定%)</span></th>
+    <th class="r">現粗利</th><th class="r">転嫁後 粗利</th>
+    <th class="c">年間数量</th><th class="r">仕入 年影響</th><th class="r">増収 年影響</th>
+    <th class="c">行ルール</th>
+    <th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+</table></div>
+
+<div class="foot hint">
+  ※ 「改定後 仕入単価」を直接書き換えると、その行だけ即時に再計算します（“もしこの額なら”の試算）。<br>
+  ※ 年間数量は、CSVに「年間数量」列があれば<span class="badge act">実</span>その値、無ければ<span class="badge est">推</span>「年間金額÷現売単価」で推定します。<br>
+  ※ 「行ルール」は空欄なら全体ルールに従います。得意先・商品ごとに個別ルールを試せます。
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const RULE_LABEL = { add_increase:'上乗せ', keep_margin_rate:'粗利維持', markup:'掛率', sell_cost_rate:'売価×仕入率', keep_sell:'据置' };
+let baseRows = [];      // 画面の行構造（ファイル読込時に確定）
+let lastSummary = null; // 直近の集計（損益パネルが ΔC/ΔS に使用）
+let currentSupplier = ''; // 現在表示中の照合結果CSVの仕入先名（productLinks 引き当てに使用）
+let currentLinks = {};    // 現在の仕入先の productLinks（{自社CD: メーカー商品名}）
+let allMakerNames = [];   // 編集モーダルのドロップダウン候補
+let currentSuppliers = {}; // 仕入先マスタ {コード: {name, ...}} ：発注先名の解決に使用
+
+const yen = (v) => Number.isFinite(v) ? '¥' + Math.round(v).toLocaleString('ja-JP') : '—';
+const num = (v,d=2) => Number.isFinite(v) ? v.toLocaleString('ja-JP',{minimumFractionDigits:d,maximumFractionDigits:d}) : '—';
+const pct = (v) => Number.isFinite(v) ? v.toFixed(1)+'%' : '—';
+const signCls = (v) => Number.isFinite(v) ? (v>0?'pos':(v<0?'neg':'')) : '';
+
+function settings(){
+  const type = $('#rule').value;
+  return {
+    rule: { type, factor: parseFloat($('#factor').value)||1 },
+    rounding: { unit: parseFloat($('#unit').value)||0.01, mode: $('#mode').value },
+    selfUplift: parseFloat($('#selfUplift').value)||0,
+  };
+}
+function isUnmatched(r){ return !r.customerName || r.customerName==='-' || /未一致/.test(r.matchStatus||''); }
+
+// 一致度セル: matchStatus(「✓ CD一致」「✓ 名前一致(80%)」「📌 手動紐付け」) から % を取り出して大きく表示。
+//  得意先と商品名の間に独立カラムとして置き、自社↔仕入の照合の確かさを一目で分かるようにする。
+function matchPctCell(r){
+  const st = r.matchStatus || '';
+  if (isUnmatched(r)) return '<span style="color:#bbb" title="販売実績なし／商品名不一致">休眠</span>';
+  let pctNum = null, label = '';
+  if (/手動紐付け/.test(st)) { pctNum = 100; label = '📌 手動'; }
+  else if (/CD一致/.test(st)) { pctNum = 100; label = 'CD一致'; }
+  else { const m = st.match(/(\\d+)\\s*%/); if (m){ pctNum = Number(m[1]); label = '名前一致'; } }
+  if (pctNum === null) return '<span style="color:#bbb">—</span>';
+  const color = pctNum >= 80 ? '#2e7d32' : (pctNum >= 60 ? '#b8860b' : '#c0392b');
+  const price = /\\+価格/.test(st) ? '<div style="font-size:10px;color:#2e7d32">+価格一致</div>' : '';
+  return '<div style="font-weight:700;font-size:15px;color:'+color+'">'+pctNum+'%</div>'+
+         '<div style="font-size:10px;color:#888">'+label+'</div>'+price;
+}
+
+// 商品名セルのHTML。自社とメーカーの紐付けを2行で並べ、違いを視覚化。
+// 発注先（仕入先コード末尾"13"等）が分かれば、その名前(朝日食品容器等)も併記。
+function buildProdNameHtml(r){
+  const selfCode = r.productCode ? ('<span style="color:#1976d2;font-weight:600">['+esc(r.productCode)+']</span> ') : '';
+  const selfName = r.productNameCore ? esc(r.productNameCore) : (r.productName && r.productName!=='-' ? esc(r.productName) : '');
+  const supCode = r.supplierCode ? ' <span style="color:#888;font-size:11px">#'+esc(r.supplierCode)+'</span>' : '';
+  const mkCode = r.makerCode ? '['+esc(r.makerCode)+'] ' : '';
+  const mkName = r.makerName ? esc(r.makerName) : '';
+  const status = r.matchStatus ? ' <span style="color:#888;font-size:11px">'+esc(r.matchStatus)+'</span>' : '';
+  // 発注先(末尾コード) → 仕入先マスタで名前解決
+  let purchaseBadge = '';
+  if (r.supplierIdEmbed) {
+    const code4 = String(r.supplierIdEmbed).padStart(4, '0');
+    const sup = currentSuppliers[code4];
+    const labelName = sup && sup.name ? sup.name : '';
+    purchaseBadge = ' <span style="color:#7a5a00;background:#fff4d6;padding:1px 6px;border-radius:999px;font-size:11px" title="自社販売実績の末尾コード＝発注先">🏢 '+esc(code4)+(labelName?' '+esc(labelName):'')+'</span>';
+  }
+  if (isUnmatched(r)) {
+    return '<span style="color:#aa6">［メーカー品］</span>'+mkCode+mkName+status;
+  }
+  const line1 = selfCode + selfName + supCode + purchaseBadge;
+  const line2 = mkName
+    ? '<div style="color:#5a6975;font-size:12px;margin-top:2px">└メーカー: '+mkCode+mkName+'</div>'
+    : '';
+  return line1 + line2;
+}
+
+async function loadFiles(selectFile){
+  const r = await fetch('/api/files').then(x=>x.json());
+  const sel = $('#file'); sel.innerHTML='';
+  (r.files||[]).forEach(f=>{ const o=document.createElement('option'); o.value=f; o.textContent=f; sel.appendChild(o); });
+  if(!r.files || !r.files.length){ $('#msg').textContent='input フォルダに照合結果CSVがありません。「↻ 照合を実行」でメーカー見積から作れます。'; return; }
+  if(selectFile && r.files.indexOf(selectFile)>=0) sel.value=selectFile;
+  await loadFile();
+}
+// メーカー見積×販売実績を照合し、新しい照合結果CSVを作って読み込む
+async function runShogo(){
+  const btn=$('#shogoBtn'); btn.disabled=true;
+  $('#shogoMsg').style.color='#6b7785'; $('#shogoMsg').textContent='照合中…（販売実績の変換に時間がかかる場合があります）';
+  try{
+    const res=await fetch('/api/shogo',{method:'POST'}).then(x=>x.json());
+    if(res.ok){
+      const newest=(res.files&&res.files.length)?res.files[res.files.length-1]:null;
+      $('#shogoMsg').style.color='#2e7d32'; $('#shogoMsg').textContent='✓ 照合完了（'+(res.files?res.files.length:0)+'件のCSVを作成）';
+      await loadFiles(newest);
+    } else {
+      $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent='照合できません: '+(res.error||'');
+    }
+  }catch(e){ $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent='照合に失敗: '+e; }
+  finally{ btn.disabled=false; }
+}
+
+// ファイルを読み込み、表の“構造”を作る（入力欄やルール選択を配置）
+async function loadFile(){
+  $('#msg').textContent='';
+  const s = settings();
+  const res = await fetch('/api/calc',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ file:$('#file').value, rule:s.rule, rounding:s.rounding, selfUplift:s.selfUplift })}).then(x=>x.json());
+  if(res.error){ $('#msg').textContent='エラー: '+res.error; return; }
+  baseRows = res.rows;
+  currentSupplier = res.supplier || '';
+  currentLinks = res.productLinks || {};
+  allMakerNames = res.makerNames || [];
+  currentSuppliers = res.suppliers || {};
+  const tb = $('#tbody'); tb.innerHTML='';
+  baseRows.forEach((r,i)=>{
+    const tr = document.createElement('tr');
+    tr.id='row'+i;
+    if(isUnmatched(r)) tr.className='unmatched';
+    // 商品名セル: 2行表示で「自社」と「メーカー」の対応を一目で確認できるようにする。
+    //  [自社CD] 自社商品名(コア) #仕入先商品コード
+    //    └メーカー: [メーカーCD] メーカー商品名 [一致率]
+    const prodName = buildProdNameHtml(r);
+    tr.innerHTML =
+      '<td>'+esc(r.customerName||'—')+'</td>'+
+      '<td class="c">'+matchPctCell(r)+'</td>'+
+      '<td>'+prodName+'</td>'+
+      '<td class="r">'+num(r.currentCost)+'</td>'+
+      '<td class="r"><input class="num newcost" data-i="'+i+'" type="number" step="0.01" value="'+(Number.isFinite(r.newCost)?r.newCost:'')+'"></td>'+
+      '<td class="r" id="ci'+i+'"></td>'+
+      '<td class="r">'+num(r.currentSell)+'</td>'+
+      '<td class="r hi" id="ns'+i+'"></td>'+
+      '<td class="r" id="si'+i+'"></td>'+
+      '<td class="r">'+pct(r.currentMarginRate)+'</td>'+
+      '<td class="r" id="nm'+i+'"></td>'+
+      '<td class="c" id="qt'+i+'"></td>'+
+      '<td class="r" id="aci'+i+'"></td>'+
+      '<td class="r" id="asi'+i+'"></td>'+
+      '<td class="c"><select class="rule-sel rowrule" data-i="'+i+'">'+
+        '<option value="">（全体）</option>'+
+        '<option value="add_increase">上乗せ</option>'+
+        '<option value="keep_margin_rate">粗利維持</option>'+
+        '<option value="markup">掛率</option>'+
+        '<option value="sell_cost_rate">売価×仕入率</option>'+
+        '<option value="keep_sell">据置</option>'+
+      '</select></td>'+
+      '<td class="c">'+linkCellHtml(r, i)+'</td>';
+    tb.appendChild(tr);
+  });
+  // 入力イベント
+  tb.querySelectorAll('.newcost').forEach(el=> el.addEventListener('input', debounce(recalc,200)));
+  tb.querySelectorAll('.rowrule').forEach(el=> el.addEventListener('change', recalc));
+  tb.querySelectorAll('.linkBtn').forEach(el=> el.addEventListener('click', (e)=> openLinkModal(Number(e.currentTarget.dataset.i))));
+  updateView(res.rows, res.summary);
+  syncHScroll();
+}
+
+// 表の上の補助スクロールバーを表の実幅に合わせ、横スクロールが必要なときだけ表示する。
+function syncHScroll(){
+  const wrap=$('#wrap'), hbar=$('#hbar'), inner=$('#hbarInner'), tbl=$('#tbl');
+  if(!wrap||!hbar||!inner||!tbl) return;
+  const sw = tbl.scrollWidth;
+  inner.style.width = sw + 'px';
+  // 表が枠より広い（＝右が見切れる）ときだけ補助バーを出す
+  hbar.style.display = (sw > wrap.clientWidth + 2) ? 'block' : 'none';
+}
+
+// 紐付けセルのHTML。確定済(📌)はラベル＋編集ボタン、未確定は淡色の「✏編集」のみ。
+function linkCellHtml(r, i){
+  const code = r.productCode || '';
+  const linked = code && currentLinks[code] === r.makerName;
+  if (linked) return '<span style="color:#1e7e34;font-weight:600">📌 確定</span> <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
+  if (!code) return '<span class="hint">—</span>';
+  return '<button class="linkBtn" data-i="'+i+'" style="font-size:11px;color:#6b7785">✏ 紐付け</button>';
+}
+
+// 紐付けモーダルの類似度判定（クライアント側で軽量に計算）
+function linkTokenize(s){
+  return String(s||'').toLowerCase()
+    .replace(/[（）()\\[\\]【】「」、，。．,\\.;:!?※#＊]/g,' ')
+    .split(/[\\s\\-_\\/×・]+/)
+    .filter((t) => t.length>=1);
+}
+function linkSim(a, b){
+  const ta = linkTokenize(a), tb = linkTokenize(b);
+  if (!ta.length || !tb.length) return 0;
+  const sa = new Set(ta), sb = new Set(tb);
+  let inter = 0; for (const t of sa) if (sb.has(t)) inter++;
+  return inter / Math.max(sa.size, sb.size);
+}
+// 「決定的」な語＝単一漢字(蓋/身/大/中/小/特/丸/角…) または 数字を含むトークン(0.4/28/11号…)、
+// あるいは部位語(本体/内嵌合蓋/巻き蓋/防曇蓋/内嵌合/嵌合蓋/内外蓋/高蓋/中皿)。
+// 取り違えが致命的になる語。両側で揃っていないと「品が違う」可能性が高い。
+// ※ src/match.js:PART_TOKENS と同じ語彙。更新するときは両方を合わせる。
+const LINK_PART_TOKENS = new Set(['本体','内嵌合蓋','内嵌合','巻き蓋','防曇蓋','嵌合蓋','内外蓋','高蓋','中皿','部分内嵌合蓋','部分内嵌合']);
+function linkDecisiveTokens(s){
+  return linkTokenize(s).filter((t) => /^[\\u4e00-\\u9fff]$/.test(t) || /\\d/.test(t) || LINK_PART_TOKENS.has(t));
+}
+function linkDecisiveDiff(selfCore, maker){
+  const sd = new Set(linkDecisiveTokens(selfCore));
+  const md = new Set(linkDecisiveTokens(maker));
+  const onlyMaker = [...md].filter((t) => !sd.has(t));
+  const onlySelf  = [...sd].filter((t) => !md.has(t));
+  return { onlyMaker, onlySelf, hasDiff: onlyMaker.length>0 || onlySelf.length>0 };
+}
+
+// 編集モーダル: 自社CD ⇔ メーカー商品 を選び直す or 解除する
+// 検索/類似度順/決定的トークン警告つきで、007485 のような誤紐付けを防ぐ
+function openLinkModal(idx){
+  const r = baseRows[idx]; if(!r) return;
+  if (!currentSupplier){ alert('仕入先が確定できないファイルです（紐付けは保存できません）'); return; }
+  if (!r.productCode){ alert('自社商品コードが空のため紐付けできません（販売実績側で先に紐付けるか、要確認.xlsx を確認してください）'); return; }
+  const cur = currentLinks[r.productCode] || '';
+  const selfCore = r.productNameCore || r.productName || '';
+  // 候補を類似度でスコアリング・降順ソート
+  const scored = allMakerNames.map((n) => ({ name:n, score:linkSim(selfCore, n) }))
+    .sort((a,b) => b.score - a.score);
+
+  const wrap = document.createElement('div');
+  wrap.innerHTML =
+    '<div id="linkBack" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9000"></div>'+
+    '<div id="linkDlg" style="position:fixed;top:6%;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;padding:18px;width:640px;max-width:95%;z-index:9001;box-shadow:0 10px 40px rgba(0,0,0,.2)">'+
+      '<h3 style="margin:0 0 12px">📌 商品紐付けの編集</h3>'+
+      '<div style="margin-bottom:6px"><b>仕入先:</b> '+esc(currentSupplier)+'</div>'+
+      '<div style="margin-bottom:6px"><b>自社商品:</b> '+esc(r.productCode||'')+' <span style="color:#1f4e78">'+esc(selfCore)+'</span></div>'+
+      '<div style="margin-bottom:10px;font-size:12px;color:#6b7785"><b>現在の照合:</b> '+esc(r.matchStatus||'')+' / '+esc(r.makerName||'(未マッチ)')+'</div>'+
+      '<div style="margin-bottom:4px"><b>確定するメーカー商品</b> <span style="font-size:11px;color:#6b7785">（自社商品との類似度順。✓=80%以上）</span></div>'+
+      '<input id="linkSearch" placeholder="🔍 商品名で絞り込み（部分一致）" style="width:100%;padding:6px;margin-bottom:4px;border:1px solid #c7ced8;border-radius:4px;font:inherit;box-sizing:border-box">'+
+      '<select id="linkPick" size="8" style="width:100%;padding:4px;font:inherit;border:1px solid #c7ced8;border-radius:4px;box-sizing:border-box"></select>'+
+      '<div id="linkWarn" style="margin-top:8px;padding:8px;background:#fdecea;border:1px solid #f3c0c0;border-radius:4px;font-size:12px;color:#8a3a3a;display:none"></div>'+
+      '<div style="margin-top:10px;background:#fff8e1;border:1px solid #ffe082;padding:8px;border-radius:4px;font-size:11px;color:#5a4a1a">'+
+        '⚠ 保存すると、その自社商品はこのメーカー品に固定されます。次回の照合(↻ボタン)から優先適用されます。先頭の「— 解除」を選ぶと自動マッチに戻ります。'+
+      '</div>'+
+      '<div style="text-align:right;margin-top:12px">'+
+        '<button id="linkCancel" style="margin-right:8px;padding:6px 14px">キャンセル</button>'+
+        '<button id="linkSave" style="padding:6px 14px;background:#1976d2;color:#fff;border:none;border-radius:4px;cursor:pointer">保存</button>'+
+      '</div>'+
+    '</div>';
+  document.body.appendChild(wrap);
+  const sel = $('#linkPick'), search = $('#linkSearch'), warn = $('#linkWarn');
+
+  function renderOptions(filter){
+    const flt = String(filter||'').toLowerCase();
+    const head = '<option value="">— （自動マッチに任せる／紐付け解除）</option>';
+    const opts = scored
+      .filter((x) => !flt || x.name.toLowerCase().includes(flt))
+      .map((x) => {
+        const pct = Math.round(x.score*100);
+        const mark = x.score >= 0.8 ? '✓' : (x.score >= 0.5 ? '·' : ' ');
+        const selAttr = x.name === sel.value ? ' selected' : '';
+        const padPct = (pct<10?'  ':(pct<100?' ':''))+pct;
+        return '<option value="'+esc(x.name)+'"'+selAttr+'>'+mark+' ['+padPct+'%] '+esc(x.name)+'</option>';
+      }).join('');
+    const prev = sel.value;
+    sel.innerHTML = head + opts;
+    if (prev != null) sel.value = prev;
+  }
+  function updateWarning(){
+    const v = sel.value;
+    if (!v){ warn.style.display='none'; return; }
+    const d = linkDecisiveDiff(selfCore, v);
+    if (!d.hasDiff){ warn.style.display='none'; return; }
+    const lines = [];
+    if (d.onlyMaker.length) lines.push('メーカー側にだけ含まれる語: <b>'+d.onlyMaker.map(esc).join(' / ')+'</b>');
+    if (d.onlySelf.length)  lines.push('自社側にだけ含まれる語: <b>'+d.onlySelf.map(esc).join(' / ')+'</b>');
+    warn.innerHTML = '⚠ 自社商品と決定的な語（蓋・身・サイズ等）が違います。別の品の可能性があります。<br>'+lines.join('<br>');
+    warn.style.display = 'block';
+  }
+
+  // 初期表示: 候補リスト → 既存の紐付け or トップ候補を選択
+  sel.value = cur || (scored[0] && scored[0].name) || '';
+  renderOptions('');
+  sel.value = cur || (scored[0] && scored[0].name) || '';
+  updateWarning();
+
+  search.addEventListener('input', () => { renderOptions(search.value); updateWarning(); });
+  sel.addEventListener('change', updateWarning);
+  setTimeout(() => search.focus(), 30);
+
+  const close = () => wrap.remove();
+  $('#linkBack').addEventListener('click', close);
+  $('#linkCancel').addEventListener('click', close);
+  $('#linkSave').addEventListener('click', async () => {
+    const v = sel.value;
+    try {
+      const res = await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ supplier: currentSupplier, productCode: r.productCode, makerName: v })}).then(x=>x.json());
+      if (!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
+      close();
+      await loadFile();
+    } catch (e) { alert('保存に失敗: '+e); }
+  });
+}
+
+// 現在の画面値を集めてサーバへ → 計算結果のセルだけ更新
+async function recalc(){
+  const s = settings();
+  const rows = baseRows.map((_,i)=>({
+    newCost: $('.newcost[data-i="'+i+'"]').value,
+    rule: $('.rowrule[data-i="'+i+'"]').value,
+  }));
+  const res = await fetch('/api/calc',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ file:$('#file').value, rule:s.rule, rounding:s.rounding, selfUplift:s.selfUplift, rows })}).then(x=>x.json());
+  if(res.error){ $('#msg').textContent='エラー: '+res.error; return; }
+  updateView(res.rows, res.summary);
+}
+
+function updateView(rows, sm){
+  let warnN=0, rateN=0;
+  const warnIdx=[], rateIdx=[];
+  rows.forEach((r,i)=>{
+    setAmtRate('ci'+i, r.costIncrease, rateOf(r.currentCost, r.newCost)); // 仕入値上額＋改定%
+    setCell('ns'+i, num(r.newSell));
+    // 改定単価セルの色分け：赤＝価格異常/メーカー重複（出力時に除外）、黄＝値上率が大きい（注意のみ）
+    const nsEl=$('#ns'+i);
+    if(nsEl){
+      const red=r.priceWarning||r.costConflict||'';
+      nsEl.classList.remove('pricewarn','ratewarn');
+      if(red){ nsEl.classList.add('pricewarn'); nsEl.title='⚠ '+red; nsEl.innerHTML='⚠ '+nsEl.textContent; warnN++; warnIdx.push(i); }
+      else if(r.rateWarning){ nsEl.classList.add('ratewarn'); nsEl.title='注意: '+r.rateWarning; nsEl.innerHTML='▲ '+nsEl.textContent; rateN++; rateIdx.push(i); }
+      else { nsEl.title=''; }
+    }
+    setAmtRate('si'+i, r.sellIncrease, rateOf(r.currentSell, r.newSell)); // 値上額＋改定%
+    setCell('nm'+i, pct(r.newMarginRate));
+    const q = $('#qt'+i);
+    if(q){
+      if(Number.isFinite(r.qty) && r.qty>0){
+        const b = r.qtySource==='actual' ? '<span class="badge act">実</span>' : '<span class="badge est">推</span>';
+        q.innerHTML = Math.round(r.qty).toLocaleString('ja-JP') + ' <span class="ml6">'+b+'</span>';
+      } else q.textContent='—';
+    }
+    setCell('aci'+i, yen(r.annualCostImpact), signCls(r.annualCostImpact));
+    setCell('asi'+i, yen(r.annualSellImpact), signCls(r.annualSellImpact));
+  });
+  const pa=$('#priceAlert');
+  if(pa){
+    if(warnN>0){ pa.style.display='block'; pa.innerHTML='⚠ メーカー側データが疑わしい行が '+warnN+' 件あります（赤い改定単価セル＝売単価0/値下げ/同一商品で新仕入が食い違い）。見積書出力時は自動で「要確認」に分離されます。<span class="jumphint">▶ クリックで該当行へ</span>'; bindJump(pa, warnIdx); }
+    else pa.style.display='none';
+  }
+  const ra=$('#rateAlert');
+  if(ra){
+    if(rateN>0){ ra.style.display='block'; ra.innerHTML='▲ 値上率が大きい行が '+rateN+' 件あります（黄色い改定単価セル）。メーカーの値上げ幅が正しいか確認してください。※これは注意のみで、見積書には通常どおり載ります。<span class="jumphint">▶ クリックで該当行へ</span>'; bindJump(ra, rateIdx); }
+    else ra.style.display='none';
+  }
+  renderCards(sm);
+  lastSummary = sm;
+  renderPL();
+}
+function setCell(id, text, cls){ const el=$('#'+id); if(!el) return; el.textContent=text; el.className = el.className.replace(/\\b(pos|neg)\\b/g,'').trim(); if(cls) el.classList.add(cls); }
+// 現→改定の改定率(%)。現単価>0 のときだけ算出（0や未設定は—）。
+function rateOf(cur, neu){ return (Number.isFinite(cur) && cur>0 && Number.isFinite(neu)) ? (neu/cur-1)*100 : NaN; }
+// 値上額(amt)＋その下に改定%(rate) を1セルに表示。値上げ=赤/値下げ=青。
+function setAmtRate(id, amt, rate){
+  const el=$('#'+id); if(!el) return;
+  el.className = el.className.replace(/\\b(pos|neg)\\b/g,'').trim();
+  let html = '<span class="'+signCls(amt)+'">'+num(amt)+'</span>';
+  if(Number.isFinite(rate)){
+    const rc = rate>0.05 ? 'pos' : (rate<-0.05 ? 'neg' : 'flat');
+    html += '<span class="ratetag '+rc+'">'+(rate>0?'+':'')+rate.toFixed(1)+'%</span>';
+  }
+  el.innerHTML = html;
+}
+// バナーをクリックすると該当行へ順番にスクロール＆点滅ハイライトする
+function bindJump(banner, idxArr){
+  banner._idx = idxArr; banner._pos = 0;
+  banner.style.cursor = idxArr.length ? 'pointer' : 'default';
+  banner.onclick = function(){
+    const arr = banner._idx || [];
+    if(!arr.length) return;
+    const i = arr[banner._pos % arr.length];
+    banner._pos++;
+    const tr = $('#row'+i);
+    if(!tr) return;
+    tr.scrollIntoView({behavior:'smooth', block:'center'});
+    tr.classList.remove('flashrow');
+    void tr.offsetWidth; // reflow を強制して再アニメーション
+    tr.classList.add('flashrow');
+  };
+}
+
+function renderCards(sm){
+  const net = sm.net;
+  $('#cards').innerHTML =
+    card('対象明細', sm.count+'件', '<small>数量あり '+sm.withQty+'件'+(sm.estimated?'（推定 '+sm.estimated+'）':'')+'</small>')+
+    card('年間 仕入増（メーカーへ）', yen(sm.totalCostImpact), '', 'neg')+
+    card('年間 増収（得意先から）', yen(sm.totalSellImpact), '', 'pos')+
+    card('差引 粗利インパクト', yen(net), '<small>増収 − 仕入増</small>', net>=0?'pos':'neg')+
+    card('平均 粗利率', pct(sm.avgCurMargin)+' → '+pct(sm.avgNewMargin), '');
+}
+function card(k,v,sub,cls){ return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+(sub||'')+'</div></div>'; }
+
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
+
+// ---- 全社損益インパクト（変動損益）-------------------------------------
+const fmtU = (v) => Number.isFinite(v) ? v.toLocaleString('ja-JP',{maximumFractionDigits:1}) : '—';
+
+async function fetchPL(){
+  const r = await fetch('/api/pl').then(x=>x.json()).catch(()=>({source:'error'}));
+  const src = $('#plSrc');
+  if(r.source==='file'){
+    if(Number.isFinite(r.sales))    $('#plSales').value = r.sales;
+    if(Number.isFinite(r.variable)) $('#plVar').value   = r.variable;
+    if(Number.isFinite(r.fixed))    $('#plFixed').value = r.fixed;
+    src.textContent = '損益.csv から読込しました（金額は右の「単位」で扱います）';
+  } else if(r.source==='none'){
+    src.textContent = '損益.csv は未配置です。数値を手入力するか、プロジェクト直下に 損益.csv を置いてください。';
+  } else {
+    src.textContent = '損益.csv の読込に失敗: ' + (r.error||'');
+  }
+  renderPL();
+}
+
+function renderPL(){
+  const f = parseFloat($('#plUnit').value)||1;
+  const toYen = (id)=>{ const v=parseFloat($(id).value); return (Number.isFinite(v)?v:0)*f; };
+  const S=toYen('#plSales'), V=toYen('#plVar'), F=toYen('#plFixed'), Fadd=toYen('#plSelfCost');
+  const dC = lastSummary && Number.isFinite(lastSummary.totalCostImpact) ? lastSummary.totalCostImpact : 0; // 年間 仕入増
+  const dS = lastSummary && Number.isFinite(lastSummary.totalSellImpact) ? lastSummary.totalSellImpact : 0; // 年間 増収
+
+  // 自社コスト増(固定費)は転嫁有無に関わらず増える → 転嫁しない/転嫁する の両方に加算
+  const scen = (s,v,fx,fadd)=>{ const fixed=fx+(fadd||0); const cm=s-v; return { s, v, cm, fx:fixed, op:cm-fixed }; };
+  const cols = [ scen(S,V,F,0), scen(S,V+dC,F,Fadd), scen(S+dS,V+dC,F,Fadd) ]; // 現状 / 転嫁しない / 転嫁する
+  const now = cols[0];
+
+  const dv = (yen)=> fmtU(yen/f);
+  const rate = (part,s)=> s>0 ? part/s*100 : NaN;
+  const dlt = (val,base)=>{ const d=val-base; if(Math.abs(d)<1e-9) return ' <span class="d hint">±0</span>'; return ' <span class="d '+(d>0?"pos":"neg")+'">('+(d>0?"+":"")+fmtU(d/f)+')</span>'; };
+
+  const valRow = (label,key,withDelta,op)=>{
+    const cells = cols.map((c,i)=>'<td class="r">'+dv(c[key])+((withDelta&&i>0)?dlt(c[key],now[key]):'')+'</td>').join('');
+    return '<tr'+(op?' class="op"':'')+'><td>'+label+'</td>'+cells+'</tr>';
+  };
+  const rateRow = (label,key)=>{
+    const cells = cols.map(c=>{ const v=rate(c[key],c.s); return '<td class="r">'+(Number.isFinite(v)?v.toFixed(1)+'%':'—')+'</td>'; }).join('');
+    return '<tr><td>'+label+'</td>'+cells+'</tr>';
+  };
+  $('#plBody').innerHTML =
+    valRow('純売上高','s',true,false)+
+    valRow('変動費合計','v',true,false)+
+    valRow('限界利益','cm',true,false)+
+    rateRow('限界利益率','cm')+
+    valRow('固定費合計','fx',true,false)+
+    valRow('営業利益','op',true,true)+
+    rateRow('営業利益率','op');
+}
+
+$('#file').addEventListener('change', loadFile);
+$('#shogoBtn').addEventListener('click', runShogo);
+$('#rule').addEventListener('change', ()=>{ $('#factorBox').style.display = $('#rule').value==='markup'?'flex':'none'; recalc(); });
+$('#factor').addEventListener('input', debounce(recalc,200));
+$('#unit').addEventListener('change', recalc);
+$('#mode').addEventListener('change', recalc);
+$('#selfUplift').addEventListener('input', debounce(recalc,200));
+// 見積書の作成はメイン画面では行わない（得意先別ページに集約）。#toCustomersBtn は /customers への通常リンク。
+// 「全体方針を保存」：今のメイン上部の転嫁ルール・端数・自社上乗せ%を settings.json の既定に保存。
+//  得意先別ページはこの既定を初期値として読むので、メイン＝全体方針の決定／損益確認 という役割が明確になる。
+$('#savePolicyBtn').addEventListener('click', async ()=>{
+  const s=settings();
+  const patch={ default:{ type:s.rule.type, factor:s.rule.factor }, rounding:{ unit:s.rounding.unit, mode:s.rounding.mode }, selfCostUplift:{ rate:s.selfUplift } };
+  const btn=$('#savePolicyBtn'); btn.disabled=true;
+  $('#msg').style.color='#1f4e78'; $('#msg').textContent='全体方針を保存中…';
+  try{
+    const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(x=>x.json());
+    if(res&&res.ok){ $('#msg').style.color='#2e7d32'; $('#msg').textContent='✓ 全体方針を保存しました（'+(RULE_LABEL[s.rule.type]||s.rule.type)+(s.rule.type==='markup'?' '+s.rule.factor:'')+' ／ 端数 '+s.rounding.unit+'円 ／ 自社+'+s.selfUplift+'%）。得意先別ページの初期値に引き継がれます。'; }
+    else { $('#msg').style.color='#c0392b'; $('#msg').textContent='保存に失敗しました'; }
+  }catch(e){ $('#msg').style.color='#c0392b'; $('#msg').textContent='保存に失敗: '+e; }
+  finally{ btn.disabled=false; }
+});
+// 補助スクロールバー（上）と表本体（下）の左右位置を連動させる
+(function(){
+  const hbar=$('#hbar'), wrap=$('#wrap');
+  if(!hbar||!wrap) return;
+  let lock=false;
+  hbar.addEventListener('scroll', ()=>{ if(lock) return; lock=true; wrap.scrollLeft=hbar.scrollLeft; lock=false; });
+  wrap.addEventListener('scroll', ()=>{ if(lock) return; lock=true; hbar.scrollLeft=wrap.scrollLeft; lock=false; });
+  window.addEventListener('resize', ()=> syncHScroll());
+})();
+
+// 見積書出力後のサマリ表示。フォルダ/要確認.xlsx を画面から直接開けるボタン付き。
+function renderExportSummary(res){
+  const el = $('#exportSummary'); if(!el) return;
+  const sup = res.supplier ? '<span style="color:#1f4e78;font-weight:700">'+esc(res.supplier)+'</span>' : '<span class="hint">仕入先不明</span>';
+  const stats = '見積書 <b>'+res.count+'</b> 件'
+    + (res.dupRemoved ? ' / 重複整理 <b>'+res.dupRemoved+'</b> 件' : '')
+    + (res.reviewCount ? ' / 要確認 <b style="color:#8a5a12">'+res.reviewCount+'</b> 件（しきい値 '+res.threshold+'%未満）' : ' / 要確認なし');
+  const btnStyle = "background:#eaf1f8;color:#1f4e78;border:1px solid #c7d6e4;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;margin-right:6px";
+  const folderBtn = '<button style="'+btnStyle+'" onclick="openFolderPath(\\''+esc('output/'+res.folderName)+'\\')">📁 見積書フォルダを開く</button>';
+  const reviewBtn = res.reviewCount ? '<button style="'+btnStyle+'" onclick="openFolderPath(\\''+esc('output/'+res.folderName+'/'+res.reviewFile)+'\\')">📄 要確認.xlsx を開く</button>' : '';
+  // 顧客別の内訳（多い順 上位、長すぎたら畳む）
+  const pc = Array.isArray(res.perCustomer) ? res.perCustomer : [];
+  const top = pc.slice(0, 8);
+  const more = pc.length - top.length;
+  const list = top.map(p => '<span style="display:inline-block;background:#fff;border:1px solid #cfe1d3;border-radius:999px;padding:2px 8px;margin:2px 4px 0 0">'
+    + esc(p.customer) + ' <b>'+p.kept+'</b>' + (p.review?'<span style="color:#8a5a12;margin-left:4px">+要'+p.review+'</span>':'') + '</span>').join('');
+  // 要確認の中身プレビュー（最大5件）
+  const rs = Array.isArray(res.reviewSummary) ? res.reviewSummary.slice(0, 5) : [];
+  const rsHtml = rs.length ? '<div style="margin-top:6px;color:#8a5a12"><b>要確認プレビュー:</b><ul style="margin:4px 0 0 18px;padding:0">'
+    + rs.map(r => '<li>'+esc(r.customerName||'')+'：[' + esc(r.productCode||'') + '] ' + esc(r.productName||'') + ' ↔ ' + esc(r.makerName||'') + ' <span class="hint">('+esc(r.matchStatus||'')+')</span></li>').join('')
+    + '</ul>' + (res.reviewCount > rs.length ? '<div class="hint" style="margin-top:2px">…ほか '+(res.reviewCount - rs.length)+' 件 (要確認.xlsx を開いてください)</div>' : '') + '</div>' : '';
+  const closeBtn = '<button style="'+btnStyle+';float:right;margin-right:0" onclick="document.getElementById(\\'exportSummary\\').style.display=\\'none\\'">× 閉じる</button>';
+  el.innerHTML = closeBtn
+    + '<div style="font-weight:700;margin-bottom:4px">✓ '+sup+' の見積書を出力しました</div>'
+    + '<div>'+stats+'</div>'
+    + '<div style="margin-top:6px">'+folderBtn+reviewBtn+'</div>'
+    + (list ? '<div style="margin-top:8px"><span class="hint">得意先別の採用件数:</span><br>'+list+(more>0?' <span class="hint">…ほか '+more+' 社</span>':'')+'</div>' : '')
+    + rsHtml;
+  el.style.display = 'block';
+}
+async function openFolderPath(p){
+  try{
+    const r = await fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p})}).then(x=>x.json());
+    if(!r.ok) alert('開けませんでした: '+(r.error||''));
+  }catch(e){ alert('開けませんでした: '+e); }
+}
+$('#plUnit').addEventListener('change', renderPL);
+['#plSales','#plVar','#plFixed','#plSelfCost'].forEach(s=> $(s).addEventListener('input', debounce(renderPL,150)));
+
+// ---- 設定（初回登録）----------------------------------------------------
+const setEl = (id)=>document.getElementById(id);
+function fillSettings(s){
+  const c=s.company||{}, q=s.quote||{}, rd=s.rounding||{}, df=s.default||{}, su=s.selfCostUplift||{};
+  setEl('cName').value=c.name||''; setEl('cPostal').value=c.postal||''; setEl('cAddr').value=c.address||'';
+  setEl('cTel').value=c.tel||''; setEl('cFax').value=c.fax||'';
+  setEl('qTitle').value=q.title||''; setEl('qGreeting').value=q.greeting||''; setEl('qFooter').value=q.footer||'';
+  setEl('sRule').value=df.type||'add_increase'; setEl('sFactor').value=df.factor||1.25;
+  setEl('sUnit').value=String(rd.unit||0.01); setEl('sMode').value=rd.mode||'round';
+  setEl('sUplift').value=Number(su.rate)||0;
+  setEl('sThreshold').value=(s.matchThreshold!=null?s.matchThreshold:80);
+  setEl('sFactorBox').style.display = setEl('sRule').value==='markup'?'flex':'none';
+}
+function collectSettings(){
+  return {
+    company:{ name:setEl('cName').value.trim(), postal:setEl('cPostal').value.trim(), address:setEl('cAddr').value.trim(), tel:setEl('cTel').value.trim(), fax:setEl('cFax').value.trim() },
+    quote:{ title:setEl('qTitle').value, greeting:setEl('qGreeting').value, footer:setEl('qFooter').value },
+    default:{ type:setEl('sRule').value, factor:parseFloat(setEl('sFactor').value)||1 },
+    rounding:{ unit:parseFloat(setEl('sUnit').value)||0.01, mode:setEl('sMode').value },
+    selfCostUplift:{ rate:parseFloat(setEl('sUplift').value)||0 },
+    matchThreshold:(parseFloat(setEl('sThreshold').value)>=0 ? parseFloat(setEl('sThreshold').value) : 80),
+  };
+}
+// 画面上部のバーの初期値を、保存済み設定に合わせる
+function applyToBar(s){
+  const df=s.default||{}, rd=s.rounding||{}, su=s.selfCostUplift||{};
+  $('#rule').value=df.type||'add_increase';
+  $('#factor').value=df.factor||1.25;
+  $('#factorBox').style.display = $('#rule').value==='markup'?'flex':'none';
+  $('#unit').value=String(rd.unit||0.01);
+  $('#mode').value=rd.mode||'round';
+  $('#selfUplift').value=Number(su.rate)||0;
+}
+function openSettings(){ setEl('settingsOverlay').classList.add('show'); }
+function closeSettings(){ setEl('settingsOverlay').classList.remove('show'); }
+
+async function initSettings(){
+  const r = await fetch('/api/settings').then(x=>x.json()).catch(()=>null);
+  if(!r) return;
+  fillSettings(r.settings);
+  applyToBar(r.settings);
+  if(!r.configured){ setEl('welcomeMsg').classList.add('show'); openSettings(); }
+}
+setEl('settingsBtn').addEventListener('click', async ()=>{
+  const r = await fetch('/api/settings').then(x=>x.json()).catch(()=>null);
+  if(r) fillSettings(r.settings);
+  setEl('welcomeMsg').classList.remove('show');
+  openSettings();
+});
+setEl('setCancel').addEventListener('click', closeSettings);
+setEl('sRule').addEventListener('change', ()=>{ setEl('sFactorBox').style.display = setEl('sRule').value==='markup'?'flex':'none'; });
+setEl('setSave').addEventListener('click', async ()=>{
+  const patch = collectSettings();
+  if(!patch.company.name){ setEl('setMsg').style.color='#c0392b'; setEl('setMsg').textContent='会社名を入力してください'; return; }
+  const btn=setEl('setSave'); btn.disabled=true; setEl('setMsg').style.color='#6b7785'; setEl('setMsg').textContent='保存中…';
+  try{
+    const res = await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(x=>x.json());
+    if(res && res.ok){
+      applyToBar(res.settings);
+      setEl('setMsg').style.color='#2e7d32'; setEl('setMsg').textContent='✓ 保存しました';
+      setTimeout(()=>{ closeSettings(); if(baseRows.length) recalc(); }, 600);
+    } else { setEl('setMsg').style.color='#c0392b'; setEl('setMsg').textContent='保存に失敗しました'; }
+  }catch(e){ setEl('setMsg').style.color='#c0392b'; setEl('setMsg').textContent='保存に失敗: '+e; }
+  finally{ btn.disabled=false; }
+});
+
+// ===== 実施日カレンダー（全仕入先 横断）===================================
+// /api/calendar が input/ の全仕入先CSVを集計して返す明細を、実施日ごとに
+// 月カレンダーで一覧する。本日が実施日の日は赤強調。月替わりにデータ更新も促す。
+const calState = { year: 0, month: 0, selKey: '' }; // month は 0始まり
+let calData = { entries: [], suppliers: [], hanbai: {}, pl: {} }; // /api/calendar の結果
+
+// Excelシリアル(日数) → {y,m,d}。基準は 1899-12-30（Excelの仕様）。
+function excelSerialToYMD(n){
+  const ms = Date.UTC(1899,11,30) + n*86400000;
+  const d = new Date(ms);
+  return { y:d.getUTCFullYear(), m:d.getUTCMonth()+1, d:d.getUTCDate() };
+}
+// 実施日テキスト（"2026-06-01" / "2026年7月1日" / "7月1日～" / Excelシリアル"46133"）を {y,m,d} に。
+function parseEffDate(raw){
+  const s = String(raw==null?'':raw).trim();
+  if(!s) return null;
+  // Excelシリアル（数字のみ・妥当範囲）
+  if(/^\\d{4,6}$/.test(s)){ const n=Number(s); if(n>=20000 && n<=90000) return excelSerialToYMD(n); }
+  // 年つき（2026-06-01 / 2026/6/1 / 2026年6月1日）
+  let m = s.match(/(\\d{4})\\D+(\\d{1,2})\\D+(\\d{1,2})/);
+  if(m) return { y:Number(m[1]), m:Number(m[2]), d:Number(m[3]) };
+  // 年なし（6月1日 / 6/1）→ 今年を補う
+  m = s.match(/(\\d{1,2})\\D+(\\d{1,2})\\s*日?/) || s.match(/(\\d{1,2})月(\\d{1,2})/);
+  if(m){ const y=new Date().getFullYear(); const mo=Number(m[1]), da=Number(m[2]); if(mo>=1&&mo<=12&&da>=1&&da<=31) return { y, m:mo, d:da }; }
+  return null;
+}
+const pad2 = (n)=> String(n).padStart(2,'0');
+const ymdKey = (o)=> o ? (o.y+'-'+pad2(o.m)+'-'+pad2(o.d)) : '';
+const todayKeyStr = ()=>{ const n=new Date(); return n.getFullYear()+'-'+pad2(n.getMonth()+1)+'-'+pad2(n.getDate()); };
+
+// 全仕入先 横断の明細(calData.entries) から「実施日キー → 明細[]」を作る。
+// 日付が読めない/空の行は noDate にまとめる（実施日 未設定＝要入力の気づき）。
+function buildEffIndex(){
+  const byKey = new Map();   // 'YYYY-MM-DD' -> [{customer, name, supplier}]
+  const noDate = [];
+  (calData.entries||[]).forEach(e=>{
+    const item = { customer: e.customer||'—', name: e.product||'(商品名なし)', supplier: e.supplier||'' };
+    const o = parseEffDate(e.date);
+    if(!o){ noDate.push(item); return; }
+    const k = ymdKey(o);
+    if(!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(item);
+  });
+  return { byKey, noDate };
+}
+
+async function openCalendar(){
+  const btn=$('#calBtn'); btn.disabled=true; const orig=btn.textContent; btn.textContent='📅 集計中…';
+  try{
+    const res = await fetch('/api/calendar').then(x=>x.json());
+    calData = (res && res.ok) ? res : { entries:[], suppliers:[], hanbai:{}, pl:{} };
+  }catch(e){ calData = { entries:[], suppliers:[], hanbai:{}, pl:{} }; }
+  finally{ btn.disabled=false; btn.textContent=orig; }
+  const idx = buildEffIndex();
+  const keys = Array.from(idx.byKey.keys()).sort();
+  const tk = todayKeyStr();
+  // 既定の表示月＝本日に実施日があればその月。無ければ最も早い実施月。それも無ければ今月。
+  let y, mo, sel;
+  if(idx.byKey.has(tk)){ const p=tk.split('-'); y=Number(p[0]); mo=Number(p[1])-1; sel=tk; }
+  else if(keys.length){ const p=keys[0].split('-'); y=Number(p[0]); mo=Number(p[1])-1; sel=keys[0]; }
+  else { const now=new Date(); y=now.getFullYear(); mo=now.getMonth(); sel=''; }
+  calState.year=y; calState.month=mo; calState.selKey=sel;
+  renderCalendar();
+  $('#calOverlay').classList.add('show');
+}
+function closeCalendar(){ $('#calOverlay').classList.remove('show'); }
+function calShift(delta){
+  let m = calState.month + delta, y = calState.year;
+  while(m<0){ m+=12; y--; } while(m>11){ m-=12; y++; }
+  calState.year=y; calState.month=m; renderCalendar();
+}
+
+// 月替わりの更新喚起バナー：販売実績ファイル・損益.csv が「今月」のものか確認を促す。
+function renderReminder(){
+  const box=$('#calReminder'); const now=new Date();
+  const curYm = now.getFullYear()+'-'+pad2(now.getMonth()+1);
+  function part(label, info, hint){
+    if(!info || !info.exists) return { warn:true, html:'<span class="ritem"><span class="rtag x">未配置</span><b>'+label+'</b>：'+hint+'</span>' };
+    const fresh = info.ym === curYm; // 今月更新済みか
+    const md = info.mtime ? info.mtime.slice(0,10) : '';
+    const tag = fresh ? '<span class="rtag g">今月更新済</span>' : '<span class="rtag w">要更新</span>';
+    const msg = fresh ? '' : '（先月以前のままです。今月の最新に更新しましょう）';
+    return { warn:!fresh, html:'<span class="ritem">'+tag+'<b>'+label+'</b>：最終更新 '+esc(md)+esc(msg)+'</span>' };
+  }
+  const a = part('販売実績ファイル', calData.hanbai, '「⚙ 自社データ設定」で場所を指定してください。');
+  const b = part('損益.csv', calData.pl, 'プロジェクト直下に置いてください。');
+  const anyWarn = a.warn || b.warn;
+  box.innerHTML = '<div class="rbnr '+(anyWarn?'warn':'ok')+'">'+
+    '<span style="font-weight:800">'+(anyWarn?'🔔 月替わり時はデータ更新の確認を':'✓ 今月のデータは最新です')+'</span>'+
+    a.html + b.html +
+    (anyWarn?'<a class="rgo" href="/self" target="_blank">自社データ設定を開く</a>':'')+'</div>';
+}
+
+function renderCalendar(){
+  const idx = buildEffIndex();
+  const y=calState.year, mo=calState.month;
+  const MON=['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+  $('#calMonth').textContent = y+'年 '+MON[mo];
+  renderReminder();
+
+  const todayKey = todayKeyStr();
+  // 本日が実施日かのバナー
+  const todayList = idx.byKey.get(todayKey);
+  const tb=$('#calTodayBanner');
+  if(todayList && todayList.length){
+    const p=todayKey.split('-');
+    tb.innerHTML='<div class="tbnr">🔔 本日 '+Number(p[1])+'/'+Number(p[2])+' が実施日の商品が '+todayList.length+'件 あります（カレンダーで赤く表示）。</div>';
+  } else tb.innerHTML='';
+
+  // 実施日チップ（全期間・件数つき）＝よく使う 06/01 等にワンタップ移動。本日は🔔赤で強調
+  const keys = Array.from(idx.byKey.keys()).sort();
+  let chips = keys.map(k=>{
+    const p=k.split('-'); const n=idx.byKey.get(k).length;
+    const isT = (k===todayKey) ? ' style="border-color:#e0392c;color:#a01b10;font-weight:800"' : '';
+    return '<span class="chip" data-key="'+k+'"'+isT+'>'+(k===todayKey?'🔔 ':'')+Number(p[1])+'/'+Number(p[2])+' <b>'+n+'件</b></span>';
+  }).join('');
+  if(idx.noDate.length) chips += '<span class="chip empty" data-key="__none">実施日 未設定 '+idx.noDate.length+'件</span>';
+  $('#calChips').innerHTML = chips || '<span class="chip empty">価格改定行がありません（input/ に照合結果CSVがありません）</span>';
+
+  // 月グリッド
+  const DOW=['日','月','火','水','木','金','土'];
+  const first=new Date(y,mo,1).getDay();
+  const days=new Date(y,mo+1,0).getDate();
+  let html='';
+  DOW.forEach((d,i)=> html+='<div class="dow'+(i===0?' sun':(i===6?' sat':''))+'">'+d+'</div>');
+  for(let b=0;b<first;b++) html+='<div class="calcell blank"></div>';
+  for(let day=1;day<=days;day++){
+    const k=y+'-'+pad2(mo+1)+'-'+pad2(day);
+    const list=idx.byKey.get(k);
+    const dow=new Date(y,mo,day).getDay();
+    const cls=['calcell'];
+    if(dow===0) cls.push('sun'); if(dow===6) cls.push('sat');
+    if(list) cls.push('has'); if(k===calState.selKey) cls.push('sel'); if(k===todayKey) cls.push('today');
+    html+='<div class="'+cls.join(' ')+'" data-key="'+k+'">'+
+      '<div class="dn">'+day+'</div>'+
+      (list?'<span class="cnt">'+list.length+'件</span>':'')+'</div>';
+  }
+  $('#calGrid').innerHTML=html;
+  // グリッドのクリック（実施日のある日だけ）
+  $('#calGrid').querySelectorAll('.calcell.has').forEach(el=>
+    el.addEventListener('click', ()=>{ calState.selKey=el.dataset.key; renderCalendar(); }));
+  renderCalDetail(idx);
+}
+
+function renderCalDetail(idx){
+  const k=calState.selKey;
+  const box=$('#calDetail');
+  const tk=todayKeyStr();
+  let list = k==='__none' ? idx.noDate : (idx.byKey.get(k)||[]);
+  let title;
+  if(k==='__none') title='実施日 未設定（'+idx.noDate.length+'件）— メーカー見積に実施日が無い行です';
+  else if(k){ const p=k.split('-'); title=(k===tk?'🔔 本日 ':'')+Number(p[0])+'年'+Number(p[1])+'月'+Number(p[2])+'日 の実施予定（'+list.length+'件）'; }
+  else title='日付（色つきの日）をクリックすると、その日の明細が出ます';
+  if(!list.length){ box.innerHTML='<h3>'+esc(title)+'</h3><div class="empty">明細はありません。</div>'; return; }
+  // 仕入先→得意先→商品名の順で見やすく
+  const sorted=list.slice().sort((a,b)=> (a.supplier+a.customer+a.name).localeCompare(b.supplier+b.customer+b.name,'ja'));
+  let rows=sorted.map(it=> '<tr><td>'+esc(it.supplier||'—')+'</td><td>'+esc(it.customer)+'</td><td>'+esc(it.name)+'</td></tr>').join('');
+  const supN = (calData.suppliers && calData.suppliers.length) || 0;
+  box.innerHTML='<h3>'+esc(title)+'　<span style="color:#9aa6b2;font-weight:400">全'+supN+'仕入先 横断</span></h3>'+
+    '<table><thead><tr><th style="width:20%">仕入先</th><th style="width:30%">得意先</th><th>商品名</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+
+// カレンダーの操作配線
+$('#calBtn').addEventListener('click', openCalendar);
+$('#calClose').addEventListener('click', closeCalendar);
+$('#calOverlay').addEventListener('click', (e)=>{ if(e.target===$('#calOverlay')) closeCalendar(); });
+$('#calPrev').addEventListener('click', ()=> calShift(-1));
+$('#calNext').addEventListener('click', ()=> calShift(1));
+$('#calToday').addEventListener('click', ()=>{ const n=new Date(); calState.year=n.getFullYear(); calState.month=n.getMonth(); renderCalendar(); });
+$('#calChips').addEventListener('click', (e)=>{
+  const chip=e.target.closest('.chip'); if(!chip||!chip.dataset.key) return;
+  const k=chip.dataset.key; calState.selKey=k;
+  if(k!=='__none'){ const p=k.split('-'); calState.year=Number(p[0]); calState.month=Number(p[1])-1; }
+  renderCalendar();
+});
+document.addEventListener('keydown', (e)=>{ if(e.key==='Escape' && $('#calOverlay').classList.contains('show')) closeCalendar(); });
+
+// 得意先別ページから「商品名リンク」で開かれた時：その仕入先の照合結果を選んで該当行へジャンプ＋強調。
+//  URL例 /?focusSupplier=エフピコ&focusCustomer=島田&focusCode=007486&focusName=...
+function focusKey(s){ return String(s==null?'':s).normalize('NFKC').toLowerCase().replace(/[\\s　]/g,''); }
+function focusRow(customer, code, name){
+  if(!baseRows || !baseRows.length) return;
+  const ncust=focusKey(customer), ncode=String(code||'').trim(), nname=focusKey(name);
+  const matchCust=(r)=> !ncust || focusKey(r.customerName)===ncust;
+  let idx=-1;
+  // ① 得意先＋自社CD（最も確実）→ ② 得意先＋商品名 → ③ 自社CDのみ → ④ 商品名のみ
+  for(let i=0;i<baseRows.length;i++){ const r=baseRows[i]; if(matchCust(r) && ncode && String(r.productCode||'').trim()===ncode){ idx=i; break; } }
+  if(idx<0 && nname) for(let i=0;i<baseRows.length;i++){ const r=baseRows[i]; if(matchCust(r) && (focusKey(r.productNameCore)===nname || focusKey(r.productName)===nname)){ idx=i; break; } }
+  if(idx<0 && ncode) for(let i=0;i<baseRows.length;i++){ if(String(baseRows[i].productCode||'').trim()===ncode){ idx=i; break; } }
+  if(idx<0 && nname) for(let i=0;i<baseRows.length;i++){ const r=baseRows[i]; if(focusKey(r.productNameCore)===nname || focusKey(r.productName)===nname){ idx=i; break; } }
+  if(idx<0){ $('#msg').style.color='#9a6a00'; $('#msg').textContent='指定された商品が見つかりませんでした（別の照合結果かもしれません）。'; return; }
+  const tr=document.getElementById('row'+idx);
+  if(!tr) return;
+  tr.scrollIntoView({behavior:'smooth', block:'center'});
+  tr.classList.add('focusrow');
+  setTimeout(()=>{ tr.classList.remove('focusrow'); }, 6000);
+}
+(async ()=>{
+  await initSettings(); fetchPL();
+  const params=new URLSearchParams(location.search);
+  const fSup=params.get('focusSupplier');
+  if(fSup){
+    // その仕入先の最新照合結果ファイルを選んで開く（ファイル名は <仕入先>_照合結果_<日時>.csv）
+    const r=await fetch('/api/files').then(x=>x.json()).catch(()=>null);
+    const files=(r&&r.files)||[];
+    const target=files.find(f=> f.indexOf(fSup+'_照合結果')===0) || files.find(f=> f.indexOf(fSup)===0) || files[0];
+    await loadFiles(target);
+    focusRow(params.get('focusCustomer')||'', params.get('focusCode')||'', params.get('focusName')||'');
+  } else {
+    loadFiles();
+  }
+})();
+</script>
+</body></html>`;

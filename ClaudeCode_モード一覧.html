@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Claude Code モード・機能一覧</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Yu Gothic", "Meiryo", "MS Gothic", sans-serif;
+    color: #1a1a1a;
+    line-height: 1.7;
+    font-size: 11pt;
+  }
+  h1 {
+    font-size: 20pt;
+    color: #b5481b;
+    border-bottom: 3px solid #b5481b;
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+  }
+  .sub { color: #666; font-size: 9.5pt; margin-bottom: 22px; }
+  h2 {
+    font-size: 14pt;
+    color: #b5481b;
+    margin-top: 26px;
+    margin-bottom: 8px;
+    padding-left: 10px;
+    border-left: 6px solid #e08a5a;
+  }
+  h3 {
+    font-size: 11.5pt;
+    margin-top: 16px;
+    margin-bottom: 6px;
+    color: #333;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 8px 0 14px;
+    font-size: 10pt;
+  }
+  th {
+    background: #b5481b;
+    color: #fff;
+    text-align: left;
+    padding: 7px 10px;
+    border: 1px solid #b5481b;
+  }
+  td {
+    padding: 7px 10px;
+    border: 1px solid #ddd;
+    vertical-align: top;
+  }
+  tr:nth-child(even) td { background: #faf3ef; }
+  code {
+    background: #f0f0f0;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: "Consolas", "MS Gothic", monospace;
+    font-size: 9.5pt;
+    color: #b5481b;
+  }
+  .tip {
+    background: #fff7ee;
+    border: 1px solid #e0b48a;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-top: 14px;
+  }
+  .tip b { color: #b5481b; }
+  ul { margin: 6px 0; padding-left: 22px; }
+  li { margin: 3px 0; }
+  .foot { margin-top: 28px; color: #999; font-size: 8.5pt; text-align: right; border-top: 1px solid #eee; padding-top: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Claude Code モード・機能 一覧</h1>
+<div class="sub">価格転嫁見積ツール 作業メモ ／ 2026-05-30 時点 ／ 使用モデル：Claude Opus 4.8（1M コンテキスト・最新）</div>
+
+<h2>1. パーミッション（権限）モード ― <code>Shift + Tab</code> で切替</h2>
+<p>作業の進め方を変えるモードです。今どのモードかは画面下のステータスバーに表示されます。</p>
+<table>
+  <tr><th style="width:24%">モード</th><th>内容</th><th style="width:30%">向いている場面</th></tr>
+  <tr><td><b>通常モード</b></td><td>ファイル編集やコマンド実行のたびに「やっていい？」と確認する</td><td>普段使い（安全）</td></tr>
+  <tr><td><b>自動承認モード</b><br>(auto-accept edits)</td><td>ファイル編集をいちいち確認せず自動で進める</td><td>安心して任せられる作業を速く回したいとき</td></tr>
+  <tr><td><b>プランモード</b><br>(Plan mode)</td><td>実際には変更せず、まず計画だけ立てて見せる。OKしたら実行</td><td>大きな変更の前に方針を確認したいとき</td></tr>
+</table>
+
+<h2>2. ファストモード ― <code>/fast</code></h2>
+<p>Opus の賢さはそのままで、出力（返答）を速くするモードです。</p>
+<ul>
+  <li><b>賢さは落ちません。</b>小さいモデルに切り替わるのではなく、Opus のまま速くなります。</li>
+  <li>対応モデル：Opus 4.8 / 4.7 / 4.6</li>
+  <li><code>/fast</code> と打つとオン／オフ切替</li>
+</ul>
+
+<h2>3. 拡張思考（じっくり考える）</h2>
+<p>むずかしい問題のとき、Claude が内部で深く考えてから答えます。複雑な照合ロジックの修正などで自動的に働きます。</p>
+
+<h2>モード以外の便利機能</h2>
+<table>
+  <tr><th style="width:26%">機能</th><th style="width:28%">使い方</th><th>何ができる</th></tr>
+  <tr><td><b>スラッシュコマンド</b></td><td><code>/</code> を打つと一覧</td><td><code>/code-review</code>（コードの問題チェック）、<code>/security-review</code>、<code>/config</code>（設定）など</td></tr>
+  <tr><td><b>「!」で直接コマンド実行</b></td><td><code>! コマンド</code></td><td>ログインなど、自分でターミナル操作したいとき</td></tr>
+  <tr><td><b>メモリ（記憶）</b></td><td>「これ覚えておいて」</td><td>あなたの好みや方針を覚えて次回以降に反映</td></tr>
+  <tr><td><b>CLAUDE.md</b></td><td>自動で読み込み</td><td>このツールの引き継ぎメモ（毎回起動時に読む）</td></tr>
+  <tr><td><b>使えるアプリ</b></td><td>―</td><td>ターミナル ／ デスクトップアプリ(Mac・Win) ／ Web(claude.ai/code) ／ VS Code・JetBrains 拡張</td></tr>
+</table>
+
+<div class="tip">
+<b>💡 あなたの場合のおすすめ</b>
+<ul>
+  <li><b>大きな変更前</b> → <code>Shift+Tab</code> でプランモードにして方針を確認 → OKなら実行</li>
+  <li><b>細かい修正をテンポよく</b> → <code>/fast</code>（賢さ落ちないので常時ONでも可）</li>
+  <li><b>コードの不具合チェック</b> → <code>/code-review</code></li>
+</ul>
+</div>
+
+<div class="foot">価格転嫁見積ツール ／ Claude Code 使い方メモ ／ Opus 4.8</div>
+
+</body>
+</html>
