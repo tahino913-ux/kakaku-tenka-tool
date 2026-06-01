@@ -55,6 +55,13 @@
 7. **メーカー見積 取り込み画面（/import）**：PDF/Excelの表を貼り付け→自動で列分解→列対応を指定・ズレ修正→`maker_quotes/`にCSV保存。
 8. **メーカー見積 .xlsx 直読みインポータ（2026-05-26 追加・動作確認済み）**：`src/xlsxread.js`（Node標準zlibのみでxlsx解凍・解析＝**ゼロ依存/Excel不要**）＋`src/makerXlsx.js`（見出し列を自動検出、シート名＝メーカー名で**1ブック複数シート→メーカー別CSV**）。`maker_quotes/` に置いた .xlsx は **照合.bat 実行時に自動展開**。単発変換は `取込.bat` にドロップ。中東(問屋)の `日野折箱店様（容器メーカー）.xlsx`（3シート: エフピコ122/中央化学64/福助1）で検証済み。
 
+### 🆕 得意先別：見積書の「提出済み」が一目で分かる仕組み（2026-06-01・動作確認済み）
+
+- **依頼**：得意先ページで見積を提出（発行）したとき、何か分かる仕組みが欲しい。
+- **記録（`src/server.js`）**：`exportCustomerQuotes` の実発行時に **`output/発行履歴.json`**（gitignore・Drive同期で両PC共有）へ得意先ごとに `{lastIssuedAt, count, quoteNo, itemCount, folder}` を upsert（`recordIssuance`）。発行レスポンスに `issuedCustomers[]` を追加。API：`GET /api/issue-log`（一覧）／`POST /api/issue-log-reset`（body.customer=1件取消／空=全リセット）。価格・照合には一切無影響＝表示専用。
+- **表示（`src/customersPage.js`）**：左一覧に **「✅ 提出済 M/D（×回数）」バッジ**＋行を薄緑（`.done`）。選択時ヘッダーに提出状況（最終提出日・見積No・品数・回数＋「提出済みを取消」ボタン）／未提出は灰バナー。ツールバーに「提出済 N/全」表示＋**「提出履歴をリセット」**（新サイクル開始用・確認あり・ファイルは消さない）。発行成功時に `issuedCustomers` で即バッジ反映＋`/api/issue-log` で正確化。`🔄最新の状態`でも履歴を取り直す（他PC発行も反映）。
+- **検証**：構文OK＋配信JS OK。実API：bib を scope:one 発行→履歴に `{count:1,quoteNo:20260601-001,itemCount:4}` 記録→取消で消去を確認（テスト出力・履歴は後始末済み）。⚠ **要 sim.bat 再起動**。
+
 ## ★販売大臣DB 直結（2026-06-01 実装完了・実機検証済み）★
 
 ユーザ要望「毎回のエクスポートをやめてDB直結したい（**見るだけ・書き込み無し**を厳守）」。会社PCを実機調査→**実装＆検証完了**。⚠ **読み取り専用(SELECTのみ)を厳守。会計DBへINSERT/UPDATE/DELETE/DDLは絶対禁止。**

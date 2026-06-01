@@ -95,6 +95,12 @@ const CUSTOMERS_PAGE = `<!doctype html>
   /* 低マージン（改定後粗利率がしきい値未満）の強調 */
   td.lowmargin{background:#fdeccb !important;color:#9a5b00;font-weight:700}
   .cust .lowm{color:#b8860b;font-size:11px;font-weight:700;margin-left:6px}
+  /* 提出済みバッジ（得意先一覧・ヘッダー） */
+  .cust .issued{display:inline-block;background:#e1f3df;color:#1f6b35;border:1px solid #bfe0c4;border-radius:999px;font-size:10px;font-weight:700;padding:0 6px;margin-left:6px}
+  .cust.done{background:#f5fbf6}
+  .issuednote{margin:8px 16px;padding:8px 12px;border-radius:8px;background:#eef7ef;border:1px solid #bfe0c4;color:#1f6b35;font-size:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .issuednote .un{background:#fff;border:1px solid #9fcbab;color:#1f6b35;border-radius:7px;padding:2px 9px;font-weight:700;cursor:pointer;font-size:11px}
+  .notyet{margin:8px 16px;padding:6px 12px;border-radius:8px;background:#f4f6f9;border:1px solid #e2e6ec;color:#6b7785;font-size:12px}
   .lowmnote{margin:8px 16px;padding:8px 12px;border-radius:8px;background:#fff4d6;border:1px solid #f0d49a;color:#8a5a12;font-size:12px}
   .detail-head{padding:12px 16px 4px}
   .detail-head h2{margin:0;font-size:18px;color:#1f4e78}
@@ -124,6 +130,9 @@ const CUSTOMERS_PAGE = `<!doctype html>
   <button class="go" id="reloadBtn">🔄 最新の状態を読み込む</button>
   <input id="search" type="text" placeholder="得意先を検索…">
   <span id="msg" class="muted"></span>
+  <span class="spacer" style="margin-left:auto"></span>
+  <span id="issuedStat" class="muted" title="見積書を提出（発行）済みの得意先数">提出済 0</span>
+  <button class="go" id="resetIssuedBtn" style="background:#8a6d3b" title="提出済みマークをすべて消します（新しい改定サイクルの開始時に使用）。見積書ファイルは消えません">提出履歴をリセット</button>
 </div>
 
 <div class="calcbar">
@@ -232,6 +241,7 @@ function pctChg(cur,neu){
 let DATA=[];      // 得意先配列
 let filtered=[];  // 検索後
 let selName=null; // 選択中の得意先名
+let ISSUED={};    // 提出（発行）履歴 { 得意先名: {lastIssuedAt,count,quoteNo,itemCount,folder} }
 let rowRules={};  // 行ごと転嫁ルールの上書き { rowKey: ruleType }（空=全体ルール）
 let rowSell={};   // 行ごと 改定後売価 の手入力 { rowKey: 入力文字列 }
 let rowEff={};    // 行ごと 実施日 の手入力 { rowKey: 入力文字列 }
@@ -322,12 +332,51 @@ async function load(){
   $('#msg').textContent='得意先 '+DATA.length+' 件 ／ 仕入先ファイル '+(res.fileCount||0)+' 本'+(errN?'（読み取り失敗 '+errN+' 本）':'');
   showApplied(res.applied);
   applyFilter();
+  updateIssuedToolbar();
   if(selName && DATA.find(x=>x.name===selName)) selectCust(selName); // 再計算後も選択中の得意先を保持
 }
 function applyFilter(){
   const q=($('#search').value||'').trim();
   filtered = q ? DATA.filter(c=>c.name.indexOf(q)>=0) : DATA.slice();
   renderList();
+}
+// 提出（発行）履歴をサーバから取得
+async function loadIssueLog(){
+  try{ const r=await fetch('/api/issue-log').then(x=>x.json()); ISSUED=(r&&r.log)||{}; }
+  catch(e){ ISSUED={}; }
+}
+// ISO日時 → "M/D" 表示
+function issuedShort(iso){
+  if(!iso) return '';
+  const d=new Date(iso); if(isNaN(d)) return '';
+  return (d.getMonth()+1)+'/'+d.getDate();
+}
+function issuedCountN(){ return Object.keys(ISSUED||{}).length; }
+// 1得意先の「提出済み」を取り消す
+async function unmarkIssued(name){
+  if(!confirm('「'+name+'」の提出済みマークを取り消します。よろしいですか？\\n（見積書ファイル自体は消えません。表示の記録だけ消します）')) return;
+  try{
+    const r=await fetch('/api/issue-log-reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name})}).then(x=>x.json());
+    ISSUED=(r&&r.log)||{};
+  }catch(e){ delete ISSUED[name]; }
+  renderList(); if(selName) selectCust(selName); updateIssuedToolbar();
+}
+// 提出履歴を全消去（新しい改定サイクルの開始時に使う）
+async function resetAllIssued(){
+  const n=issuedCountN();
+  if(!n){ alert('提出済みの記録はありません。'); return; }
+  if(!confirm('提出履歴をすべてリセットします（'+n+'得意先）。\\n新しい改定サイクルを始めるときに使います。\\n※見積書ファイル自体は消えません。表示の「✅提出済」マークだけ消します。よろしいですか？')) return;
+  try{
+    const r=await fetch('/api/issue-log-reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})}).then(x=>x.json());
+    ISSUED=(r&&r.log)||{};
+  }catch(e){ ISSUED={}; }
+  renderList(); if(selName) selectCust(selName); updateIssuedToolbar();
+}
+// ツールバーの「提出 N/全」表示を更新
+function updateIssuedToolbar(){
+  const el=$('#issuedStat'); if(!el) return;
+  const n=issuedCountN(), total=DATA.length;
+  el.textContent = n ? ('✅ 提出済 '+n+(total?'/'+total:'')+' 得意先') : '提出済 0';
 }
 function renderList(){
   if(!filtered.length){ $('#listCol').innerHTML='<div class="empty">該当する得意先がありません。<br>照合結果がない場合は「↻ 照合を実行」してください。</div>'; return; }
@@ -337,9 +386,11 @@ function renderList(){
     const rev = c.reviewCount ? '<span class="rev">要確認'+c.reviewCount+'</span>' : '';
     const lowN = lowMarginCount(c);
     const low = lowN ? '<span class="lowm">薄利'+lowN+'</span>' : '';
-    html+='<div class="cust'+sel+'" data-name="'+esc(c.name)+'" onclick="selectCust(this.getAttribute(\\'data-name\\'))">'
+    const iss = ISSUED[c.name];
+    const issBadge = iss ? '<span class="issued" title="最終提出 '+esc(iss.lastIssuedAt||'')+(iss.count>1?' / 提出'+iss.count+'回':'')+'">✅ 提出済 '+issuedShort(iss.lastIssuedAt)+(iss.count>1?'×'+iss.count:'')+'</span>' : '';
+    html+='<div class="cust'+sel+(iss?' done':'')+'" data-name="'+esc(c.name)+'" onclick="selectCust(this.getAttribute(\\'data-name\\'))">'
       +'<div style="min-width:0"><div class="nm">'+esc(c.name)+'</div>'
-      +'<div class="meta">仕入先 '+c.supplierCount+' 社'+rev+low+'</div></div>'
+      +'<div class="meta">仕入先 '+c.supplierCount+' 社'+rev+low+issBadge+'</div></div>'
       +'<span class="cnt">'+c.productCount+'</span>'
       +'</div>';
   }
@@ -355,6 +406,15 @@ function selectCust(name){
   const supChips=c.suppliers.map(s=>'<span class="sup-badge">'+esc(s)+'</span>').join(' ');
   let html='<div class="detail-head"><h2>'+esc(c.name)+'</h2>'
     +'<div class="sum">該当商品 <b>'+c.productCount+'</b> 品／仕入先 <b>'+c.supplierCount+'</b> 社　'+supChips+'</div></div>';
+  // 提出（発行）状況
+  const iss=ISSUED[c.name];
+  if(iss){
+    html+='<div class="issuednote">✅ <b>提出済み</b>　最終提出 '+esc(issuedShort(iss.lastIssuedAt))
+      +(iss.quoteNo?'（見積No. '+esc(iss.quoteNo)+'）':'')+(iss.itemCount?' '+iss.itemCount+'品':'')+(iss.count>1?'　／　提出 '+iss.count+' 回':'')
+      +'<button class="un" data-name="'+esc(c.name)+'" onclick="unmarkIssued(this.getAttribute(\\'data-name\\'))">提出済みを取消</button></div>';
+  } else {
+    html+='<div class="notyet">未提出（この得意先はまだ見積書を発行していません）</div>';
+  }
   if(c.reviewCount){
     html+='<div class="revnote">⚠ この得意先には「要確認」が '+c.reviewCount+' 件あります（価格異常・低一致で見積書から自動で外れる行）。'
       +'シミュレーション画面で内容を確認してください。</div>';
@@ -512,6 +572,13 @@ function doIssue(opts){
     .then(x=>x.json()).then(res=>{
       setExpBusy(false); showExportMsg(''); closeGate();
       if(!res.ok){ showExportMsg('発行に失敗: '+(res.error||''),true); return; }
+      // 提出履歴を更新（今回提出した得意先に「✅ 提出済」を付ける）
+      if(res.issuedCustomers && res.issuedCustomers.length){
+        const now=new Date().toISOString();
+        for(const nm of res.issuedCustomers){ const prev=ISSUED[nm]||{}; ISSUED[nm]={lastIssuedAt:now,count:(prev.count||0)+1,quoteNo:prev.quoteNo||'',itemCount:prev.itemCount||0,folder:res.folderName||''}; }
+        renderList(); if(selName) selectCust(selName);
+      }
+      loadIssueLog().then(()=>{ renderList(); if(selName&&DATA.find(x=>x.name===selName)) selectCust(selName); }); // サーバの正確な記録で上書き
       showResult(res);
     }).catch(e=>{ setExpBusy(false); showExportMsg('発行に失敗: '+(e&&e.message||e),true); });
 }
@@ -544,7 +611,7 @@ async function initControls(){
   toggleFactor();
 }
 
-$('#reloadBtn').addEventListener('click',load);
+$('#reloadBtn').addEventListener('click',async()=>{ await loadIssueLog(); load(); });
 $('#recalcBtn').addEventListener('click',load);
 // 左の得意先一覧の開閉（右の明細を広く使う）
 $('#toggleListBtn').addEventListener('click',()=>{
@@ -559,6 +626,7 @@ $('#cLowMargin').addEventListener('input',()=>{
 });
 $('#reloadPolicyBtn').addEventListener('click', async ()=>{ await initControls(); load(); }); // メインの全体方針を取り込み直す
 $('#search').addEventListener('input',applyFilter);
+$('#resetIssuedBtn').addEventListener('click',resetAllIssued);
 $('#exportAllBtn').addEventListener('click',()=>exportFlow('all'));
 $('#exportOneBtn').addEventListener('click',()=>exportFlow('one'));
 $('#gateClose').addEventListener('click',closeGate);
@@ -574,7 +642,7 @@ $('#cRound').addEventListener('change',load);
   el.addEventListener('change',load);
   el.addEventListener('keydown',e=>{ if(e.key==='Enter') load(); });
 });
-(async()=>{ await initControls(); load(); })();
+(async()=>{ await initControls(); await loadIssueLog(); load(); })();
 </script>
 </body></html>`;
 

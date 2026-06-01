@@ -34,7 +34,36 @@ const ROOT = path.join(__dirname, '..');
 const INPUT_DIR = path.join(ROOT, 'input');
 const OUTPUT_DIR = path.join(ROOT, 'output');
 const MAKER_DIR = path.join(ROOT, 'maker_quotes');
+const ISSUE_LOG_PATH = path.join(OUTPUT_DIR, '発行履歴.json'); // 得意先別 見積書の提出履歴（output/=Drive同期で両PC共有）
 const PORT_START = 8765;
+
+// ---- 見積書の提出（発行）履歴 -------------------------------------
+//  { 得意先名: { lastIssuedAt(ISO), count, quoteNo, itemCount, folder } }
+//  得意先ページで「提出済みが一目で分かる」ための記録。価格や照合には一切影響しない表示専用データ。
+function readIssueLog() {
+  try { return JSON.parse(fs.readFileSync(ISSUE_LOG_PATH, 'utf8') || '{}') || {}; }
+  catch (e) { return {}; }
+}
+function writeIssueLog(log) {
+  try { fs.mkdirSync(OUTPUT_DIR, { recursive: true }); fs.writeFileSync(ISSUE_LOG_PATH, JSON.stringify(log, null, 2), 'utf8'); }
+  catch (e) { /* 記録失敗は発行自体を妨げない */ }
+}
+// 発行した得意先ぶんを履歴へ反映（同じ得意先は最終提出で更新＋回数を加算）。
+function recordIssuance(issued, folderName, atIso) {
+  if (!issued || !issued.length) return;
+  const log = readIssueLog();
+  for (const it of issued) {
+    const prev = log[it.customer] || {};
+    log[it.customer] = {
+      lastIssuedAt: atIso,
+      count: (Number(prev.count) || 0) + 1,
+      quoteNo: it.quoteNo || '',
+      itemCount: it.itemCount || 0,
+      folder: folderName || '',
+    };
+  }
+  writeIssueLog(log);
+}
 
 // ---- 入力CSVの読込キャッシュ（ファイル名+更新時刻で判定） ----------
 const cache = new Map();
@@ -926,6 +955,7 @@ function exportCustomerQuotes(opts, doIssue) {
   const opt = { company: s.company, quote: s.quote, date: jpDate() };
   const ymd = (() => { const d2 = new Date(); const p = (n) => String(n).padStart(2, '0'); return '' + d2.getFullYear() + p(d2.getMonth() + 1) + p(d2.getDate()); })();
   const files = [];
+  const issued = []; // 提出履歴用（得意先・見積No・品数）
   for (const [customer, d] of issuable) {
     const keep = d.keep.slice().sort((a, b) =>
       String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
@@ -937,7 +967,10 @@ function exportCustomerQuotes(opts, doIssue) {
     const fname = `見積_${sanitizeName(customer)}.xlsx`;
     writeQuote(customer, qrows, path.join(folder, fname), Object.assign({}, opt, { quoteNo }));
     files.push(fname);
+    issued.push({ customer, quoteNo, itemCount: keep.length });
   }
+  // 提出履歴を記録（得意先ページで「提出済み」を表示するため）。価格・照合には無影響。
+  recordIssuance(issued, path.basename(folder), new Date().toISOString());
   let reviewFile = null;
   if (reviewAll.length) {
     const rows = reviewAll.map((r) => ({
@@ -952,6 +985,7 @@ function exportCustomerQuotes(opts, doIssue) {
     ok: true, action: 'issued', folder, folderName: path.basename(folder), files,
     count: files.length, reviewCount: reviewAll.length, reviewFile, applied,
     scope: opts.scope || 'all', customer: opts.customer || null,
+    issuedCustomers: issued.map((i) => i.customer), // 今回提出した得意先（クライアントが即バッジ表示）
   };
 }
 
@@ -1048,6 +1082,17 @@ const server = http.createServer(async (req, res) => {
       const doIssue = body && body.action === 'issue';
       try { return sendJson(res, 200, exportCustomerQuotes(body || {}, doIssue)); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    // 見積書の提出（発行）履歴：得意先ページで「提出済み」を表示する。
+    if (req.method === 'GET' && url === '/api/issue-log') {
+      return sendJson(res, 200, { ok: true, log: readIssueLog() });
+    }
+    if (req.method === 'POST' && url === '/api/issue-log-reset') {
+      const body = await readBody(req);
+      const cust = body && body.customer;
+      if (cust) { const log = readIssueLog(); delete log[cust]; writeIssueLog(log); } // 1得意先だけ取消
+      else { writeIssueLog({}); }                                                     // 全リセット（新サイクル用）
+      return sendJson(res, 200, { ok: true, log: readIssueLog() });
     }
     if (req.method === 'GET' && url === '/api/suppliers') {
       return sendJson(res, 200, { suppliers: getSuppliers() });
