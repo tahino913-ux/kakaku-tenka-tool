@@ -133,18 +133,36 @@ function run(argv) {
     makerArg = args[0]; hanbaiArg = null;
   }
 
-  // 販売実績の決定
-  const hanbaiSrc = resolveHanbaiSource(hanbaiArg || (s.hanbai && s.hanbai.path));
-  if (!hanbaiSrc) {
-    throw new Error('販売実績が見つかりません。config.js の hanbai.path を確認してください（指定: ' + ((s.hanbai && s.hanbai.path) || '未設定') + '）');
+  // 販売実績の取得元。'db'=販売大臣SQL Server直結(読み取り専用) / 'auto'=DBが繋がれば直結・ダメならファイル
+  //  / 'file'(既定)=従来どおりファイル(CSV/XLS)。引数で販売実績ファイルを明示した時は常にファイルを優先。
+  //  ※ 'auto' は会社PC(DBあり)=直結／自宅PC(DBなし・Drive同期)=ファイル を1設定で両立させるため。
+  const mode = (!hanbaiArg && s.hanbai && s.hanbai.source) || 'file';
+  let hanbai = null;
+  if (mode === 'db' || mode === 'auto') {
+    try {
+      console.log('販売実績を 販売大臣DB から直接取得中…（読み取り専用・書き込みなし）');
+      const { loadHanbaiFromDb } = require('./db_hanbai');
+      hanbai = loadHanbaiFromDb((s.hanbai && s.hanbai.db) || {});
+      console.log('販売実績レコード: ' + hanbai.length + ' 件（DB: ' + ((s.hanbai.db && s.hanbai.db.database) || '') + '）');
+    } catch (e) {
+      if (mode === 'db') throw e; // 'db'(厳格)は失敗＝中断（古いファイルで黙って続行しない）
+      console.log('⚠ DB直結に失敗→販売実績ファイルにフォールバックします: ' + String(e && e.message || e).split('\n')[0]);
+      hanbai = null;
+    }
   }
-  let hanbaiCsv = hanbaiSrc;
-  if (isXls(hanbaiSrc)) {
-    console.log('販売実績(.XLS)をCSVへ変換中… ' + path.basename(hanbaiSrc));
-    hanbaiCsv = xlsToCsv(hanbaiSrc);
+  if (hanbai === null) {
+    const hanbaiSrc = resolveHanbaiSource(hanbaiArg || (s.hanbai && s.hanbai.path));
+    if (!hanbaiSrc) {
+      throw new Error('販売実績が見つかりません。config.js の hanbai.path を確認してください（指定: ' + ((s.hanbai && s.hanbai.path) || '未設定') + '）');
+    }
+    let hanbaiCsv = hanbaiSrc;
+    if (isXls(hanbaiSrc)) {
+      console.log('販売実績(.XLS)をCSVへ変換中… ' + path.basename(hanbaiSrc));
+      hanbaiCsv = xlsToCsv(hanbaiSrc);
+    }
+    hanbai = loadHanbai(hanbaiCsv);
+    console.log('販売実績レコード: ' + hanbai.length + ' 件（' + path.basename(hanbaiSrc) + '）');
   }
-  const hanbai = loadHanbai(hanbaiCsv);
-  console.log('販売実績レコード: ' + hanbai.length + ' 件（' + path.basename(hanbaiSrc) + '）');
 
   // .xlsx のメーカー見積を maker_quotes/ のCSVへ展開（ドロップ→照合.bat だけで使える）
   const expandXlsx = (file) => {

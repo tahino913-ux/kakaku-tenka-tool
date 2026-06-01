@@ -55,9 +55,22 @@
 7. **メーカー見積 取り込み画面（/import）**：PDF/Excelの表を貼り付け→自動で列分解→列対応を指定・ズレ修正→`maker_quotes/`にCSV保存。
 8. **メーカー見積 .xlsx 直読みインポータ（2026-05-26 追加・動作確認済み）**：`src/xlsxread.js`（Node標準zlibのみでxlsx解凍・解析＝**ゼロ依存/Excel不要**）＋`src/makerXlsx.js`（見出し列を自動検出、シート名＝メーカー名で**1ブック複数シート→メーカー別CSV**）。`maker_quotes/` に置いた .xlsx は **照合.bat 実行時に自動展開**。単発変換は `取込.bat` にドロップ。中東(問屋)の `日野折箱店様（容器メーカー）.xlsx`（3シート: エフピコ122/中央化学64/福助1）で検証済み。
 
-## ★販売大臣DB 直結（2026-06-01 調査完了・実装は未着手）★
+## ★販売大臣DB 直結（2026-06-01 実装完了・実機検証済み）★
 
-ユーザ要望「毎回のエクスポートをやめてDB直結したい（**見るだけ・書き込み無し**を厳守）」。会社PCを実機調査し、**直結が現実的**と判明。⚠ **読み取り専用(SELECTのみ)を厳守。会計DBへINSERT/UPDATE/DELETE/DDLは絶対禁止。**
+ユーザ要望「毎回のエクスポートをやめてDB直結したい（**見るだけ・書き込み無し**を厳守）」。会社PCを実機調査→**実装＆検証完了**。⚠ **読み取り専用(SELECTのみ)を厳守。会計DBへINSERT/UPDATE/DELETE/DDLは絶対禁止。**
+
+### ✅ 実装したもの（2026-06-01）
+- **`src/db_hanbai.js`（新規）**：販売大臣SQL Serverから販売実績を直接取得する**読み取り専用**ローダ。PowerShell(.NET SqlClient)を介し、`hanbai.js:parseHanbai` と同じレコード形を返す（下流 match.js/server は無改造）。SQLは得意先×商品(自社CD)で集計：現売単価=最新DENDATE行のTANK/10000、年間金額=期間内SUM(KG)、TOKSHI→TOKUI/SHO→SHOHIN/SHIIRE→SHIIRE をICODE結合。諸口(0000)・自社CD空は除外。
+- **`src/shogo.js`**：`hanbai.source` で分岐＝`'file'`(既定)/`'db'`(厳格・失敗で中断)/`'auto'`(DB繋がれば直結・ダメればファイルへ自動フォールバック)。販売実績ファイルを引数で明示した時は常にファイル優先。
+- **`config.js`**：`hanbai.source:'file'`（汎用既定）＋ `hanbai.db:{server:'localhost\\OHKEN', database:'HBDATA0001_001C', start:null, end:null, scale:10000}`。
+- **`settings.json`（日野・gitignored）**：`hanbai.source:'auto'` ＝ **会社PC(DBあり)=直結／自宅PC(DBなし・Drive同期)=ファイル** を1設定で両立。
+- **他社販売対応**：コードは汎用のまま。config既定が`'file'`なので**他社はDBを使わず従来どおり**（DB部分は未使用＝隔離）。会社固有差分は settings.json と config.hanbai.db のみ。汎用版は git タグ `v1.0-generic-base` で固定済み。
+
+### 使い方・検証・OFF方法
+- **使い方**：これまでどおり `照合.bat` を実行するだけ。`source:'auto'` なら自動でDB最新を読む（コンソールに「販売大臣DBから直接取得中」と出る）。**手動エクスポート不要**。
+- **検証実績**：現行エクスポート(`2025-05_2026-05_年間販売実績.csv.XLS`)とDB集計を突合＝**ペア網羅100%(欠落0)・現売単価97.0%一致**。不一致3%は同日に複数伝票種(51売上/59別区分)があり現行レポートが別の行を「最新単価」に採る販売大臣内部のクセ／DB側が最新の実取引価格。照合の一致数も従来とほぼ同値(朝日189・中央化学100・大黒213)を実機確認。
+- **OFFにしたい時**：`settings.json` の `"hanbai":{"source":"auto"}` を `"file"` に変える（または source 行を消す）→ 従来のファイル方式に戻る。
+- **データモデル詳細**は下記「データモデルの実測」を参照（×10000スケーリング・DSHU種別・NAME連結 等）。
 
 ### 接続情報（このPCで確認済み）
 - 販売大臣 **Super EX**＝**Microsoft SQL Server** バックエンド（Pervasiveではない）。インストール先 `C:\Program Files (x86)\OHKEN`。
@@ -83,8 +96,19 @@ $cn.Close()
 ```
 Node標準だけではSQL Server に繋げない（ドライバ非搭載）ため、**DB読取はPowerShell(.NET SqlClient)経由**にするのが無依存で確実（このPC実証済み）。クラウドSaaS化時はこの経路は使わず、各社がエクスポートしたCSVを渡す従来方式に戻す（DB直結はオンプレ運用専用）。
 
-### 実装プラン（未着手・次回ここから）
-- **狙い**：`照合.bat` の前段で、SQLから「現在の販売実績」を読み出し、`hanbai.js` が食えるCSV(または新ローダ用のフラットCSV)を自動生成 → 手動エクスポート全廃。**照合中核(match.js/hanbai.js)は触らない**方針を維持。
+### データモデルの実測（2026-06-01・価格を1円もズラさないための要点）
+- **⚠ 内部スケーリング ×10000**：`URIMEI.SUU`(数量)・`TANK`(売単価)・`BTANK`(原単価) は **10000倍の整数**で格納。実値＝`/10000`。例：SUU 10000000＝1000個、TANK 120000＝12.0円。`KG`(金額)は**素の円**（スケーリング無し）。検算「ROUND(SUU/1e4 * TANK/1e4)=KG」が売上(DSHU=51)の**92.5%(14022/15156)で一致**＝式は正。残り不一致は運賃・値引・セット親・手入力金額など通常ケース。
+- ※ `TANKSHOKETA`/`SUUSHOKETA` は**表示小数桁**(2/0/3)であって内部スケーリングとは別物（混同しない）。
+- **伝票種類 `DSHU`**：`51`=売上(15,156件・主) / `52`=値引等(1,111) / `59`=別区分売上(376・単価あり) / `81`=無償・本体のみ(59・単価0)。**「年間販売実績」に何を含めるかは現行エクスポートCSVと突合して確定**（おそらく51中心＋52で値引調整）。
+- **商品名は連結**：`NAME`(主)＋`NAME2`(入数/運賃メモ例「100（大黒P1.5元未満800P別途300」)＋`NAME3`(埋込メーカー品番例「3485134」)。parseHanbai の body 相当はこの連結。
+- **現売単価＝「バラ最新単価」**＝得意先×商品で**最新DENDATEのTANK**。年間金額＝期間内 `SUM(KG)`。原単価(BTANK)は0が多い（ツールは売単価を主使用＝問題なし）。
+- **現行エクスポート元**：`config.hanbai.path` = `G:\マイドライブ\価格改定\価格改定AI\販売大臣CSV\2025-05_2026-05_年間販売実績.csv.XLS`（**2025-05〜2026-05 の1年**を得意先×商品で集計した.XLS）。これが再現の正解＝**変換して突合**する。
+- **マスタ結合**：URIMEI.TOKSHI→TOKUI.ICODE(得意先)、URIMEI.SHO→SHOHIN.ICODE(自社CD=SHOHIN.CODE)、URIMEI.SHIIRE→SHIIRE.ICODE(仕入先CD=SHIIRE.CODE・4桁=purchaseCode)。
+
+### 実装の振り返り（採用＝案B相当：構造化列から直接レコード化）
+- **採用**：SQLの構造化列(TOKUI.NM1/SHOHIN.CODE/URIMEI.TANK/BTANK/SHIIRE.CODE)から parseHanbai形のレコードを直接組む `db_hanbai.js`。crammed-string解析を経由しないので堅牢。**照合中核(match.js/hanbai.js)は無改造**。
+- **残課題/精緻化の余地**：①現売単価の3%差（同日複数伝票時の「最新単価」選択を販売大臣の挙動に完全一致させるなら、DSHU優先順位や51限定の調整が必要）。②年間金額(SUM KG)は現行レポートと76〜85%一致＝集計対象DSHU/期間の差。損益の規模感用途なので当面許容、必要なら現行レポート定義に合わせ込む。③期間は既定で約13か月ローリング（config.hanbai.db.start/end で固定可）。④原単価(BTANK)は0が多く未使用でOK。
+- 旧プラン（参考・未採用）：案A＝SQL→現行CSV同形を生成して無改造で流す。CSVの階層フォーマット再現が脆いため案B採用。
 - **2案**：
   - **案A（低リスク推奨の第一歩）**：SQL→**現行の販売実績CSVと同等のCSV**を生成し、`config.hanbai.path` に置くだけ。既存パイプライン無改造。※現行エクスポートCSVの実列構成を `hanbai.js` で確認してから列を合わせる必要あり。
   - **案B（堅牢・将来）**：SQLの構造化列(TOKUI.NM1/SHOHIN.CODE/URIMEI.TANK/BTANK/SHIIRE.CODE)から、match.jsが要するレコード形(normName/custName/currentSell/origCost/annualAmount/purchaseCode…)を**直接**組む新ローダ。crammed-string解析の脆さを回避できるが、hanbaiの出力形を正確に再現する要あり。

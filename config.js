@@ -53,6 +53,18 @@ module.exports = {
   hanbai: {
     path: 'G:\\マイドライブ\\価格改定\\価格改定AI\\販売大臣CSV',
     nameFloor: 60, // 名前一致がこれ未満は「休眠」として見積から外す
+
+    // 販売実績の取得元：'file'（既定＝エクスポートしたCSV/XLSを読む）/ 'db'（販売大臣SQL Server直結・読み取り専用）。
+    //  ※ 他社版・クラウド版は 'file' のまま（DBは使わない）。日野は settings.json で 'db' に上書きして直結。
+    source: 'file',
+    // source='db' のときの接続先（販売大臣 Super EX = SQL Server）。⚠ SELECTのみ・書き込みは一切しない。
+    db: {
+      server: 'localhost\\OHKEN',     // SQL Server インスタンス（サービス MSSQL$OHKEN）
+      database: 'HBDATA0001_001C',    // 現用の売上台帳（会社0001）
+      start: null,                    // 集計開始日(YYYY-MM-DD)。null=自動（約13か月前の月初）
+      end: null,                      // 集計終了日(未満)。null=自動（明日＝今日を含む）
+      scale: 10000,                   // 単価・数量の内部スケーリング（×10000格納）
+    },
   },
 
   // --- 提出用 見積書の自社情報（得意先に見せる） ---------------------
