@@ -107,12 +107,13 @@ async function load(){
     const relateHtml = relate.length ? relate.join(' / ') : '<span class="muted">—</span>';
     const ops=[];
     // 取込CSVを開く: 複数あれば最新を開く
-    ops.push('<button class="mini" onclick="openPath(\\''+esc(sources[0].file)+'\\')">📂 取込CSVを開く</button>');
+    // ※ ファイル名は onclick の文字列に直接埋めず data 属性に入れる（' を含むと壊れるため）。
+    ops.push('<button class="mini act-open" data-path="'+esc(sources[0].file)+'">📂 取込CSVを開く</button>');
     if(it.matchFiles && it.matchFiles.length){
-      ops.push('<button class="mini" onclick="openInSim(\\''+esc(it.matchFiles[it.matchFiles.length-1])+'\\')">▶ シミュレーション</button>');
+      ops.push('<button class="mini act-sim" data-file="'+esc(it.matchFiles[it.matchFiles.length-1])+'">▶ シミュレーション</button>');
     }
     if(it.quoteFolders && it.quoteFolders.length){
-      ops.push('<button class="mini" onclick="openPath(\\''+esc('output/'+it.quoteFolders[it.quoteFolders.length-1])+'\\')">📁 見積書フォルダ</button>');
+      ops.push('<button class="mini act-open" data-path="'+esc('output/'+it.quoteFolders[it.quoteFolders.length-1])+'">📁 見積書フォルダ</button>');
     }
     const staleBadge = it.needsRematch ? '<span class="status s-stale">⚠ 再照合が必要</span>' : '';
     // 仕入先コード: 設定済みなら 0029 大黒... のように表示、未設定なら ⚠ 注意
@@ -131,6 +132,9 @@ async function load(){
   }
   html+='</tbody></table>';
   $('#tableArea').innerHTML=html;
+  // data 属性方式の操作ボタンを配線（ファイル名に ' 等が含まれても安全）
+  $('#tableArea').querySelectorAll('button.act-open').forEach(b=>b.addEventListener('click',()=>openPath(b.getAttribute('data-path'))));
+  $('#tableArea').querySelectorAll('button.act-sim').forEach(b=>b.addEventListener('click',()=>openInSim(b.getAttribute('data-file'))));
 }
 async function openPath(p){
   try{

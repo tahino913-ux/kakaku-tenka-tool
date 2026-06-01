@@ -71,17 +71,44 @@ function readQuote(file) {
     const c = r && r[0];
     if (typeof c === 'string' && /御中\s*$/.test(c)) { customer = c.replace(/[\s　]*御中[\s　]*$/, '').trim(); break; }
   }
-  // 表ヘッダ（No / 商品名 / 現行単価 / 改定単価 / 実施日）の次行から明細
-  const hi = grid.findIndex((r) => r && r[0] === 'No' && r[1] === '商品名');
+  // 表ヘッダを「商品名」「改定単価」を含む行として探し、列はヘッダ名から動的に引く。
+  //  ※ 見積書レイアウトは旧[No/商品名/現行単価/改定単価/実施日]→新[商品コード/商品名/現行単価/改定単価/実施日/備考]
+  //    と変わったため、列位置を決め打ちせずヘッダ名で対応づける（新旧どちらも読める）。
+  const findCol = (head, ...names) => head.findIndex((c) => { const s = String(c == null ? '' : c).trim(); return names.some((n) => s === n); });
+  let hi = -1, col = null;
+  for (let i = 0; i < grid.length; i++) {
+    const head = grid[i] || [];
+    const cName = findCol(head, '商品名');
+    const cNew = findCol(head, '改定単価', '改定後単価');
+    if (cName >= 0 && cNew >= 0) {
+      hi = i;
+      col = {
+        code: findCol(head, '商品コード', '自社CD', 'コード'),
+        name: cName,
+        cur: findCol(head, '現行単価', '現単価'),
+        nw: cNew,
+        date: findCol(head, '実施日', '切替日'),
+        note: findCol(head, '備考'),
+      };
+      break;
+    }
+  }
   const items = [];
   if (hi >= 0) {
     for (let i = hi + 1; i < grid.length; i++) {
       const r = grid[i] || [];
-      const label = String(r[0] == null ? '' : r[0]);
-      if (label.startsWith('品目数') || String(r[1] == null ? '' : r[1]).startsWith('品目数')) break;
-      const name = r[1] == null ? '' : String(r[1]).trim();
+      const flat = r.map((c) => String(c == null ? '' : c));
+      if (flat.some((c) => c.startsWith('品目数'))) break;
+      const name = col.name >= 0 && r[col.name] != null ? String(r[col.name]).trim() : '';
       if (!name) continue;
-      items.push({ productName: name, currentSell: num(r[2]), newSell: num(r[3]), effectiveDate: normalizeEffectiveDate(r[4]) });
+      items.push({
+        productCode: col.code >= 0 ? String(r[col.code] == null ? '' : r[col.code]).trim() : '',
+        productName: name,
+        currentSell: col.cur >= 0 ? num(r[col.cur]) : '',
+        newSell: col.nw >= 0 ? num(r[col.nw]) : '',
+        effectiveDate: normalizeEffectiveDate(col.date >= 0 ? r[col.date] : ''),
+        note: col.note >= 0 ? String(r[col.note] == null ? '' : r[col.note]).trim() : '',
+      });
     }
   }
   return { customer, items };

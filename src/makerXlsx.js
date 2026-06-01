@@ -45,6 +45,21 @@ function serialToDate(v) {
   const p = (x) => String(x).padStart(2, '0');
   return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate());
 }
+// 切替日(実施日)を「どの形式でも ISO(YYYY-MM-DD)」に揃える。serialToDate より広く対応。
+//  対応: Excelシリアル / 2026-07-01 / 2026/7/1 / 2026年7月1日 / 7月1日～ / 7/1（年なしは当年）/ 全角。
+//  ※ 年なしは「当年」に固定（過ぎた月日でも翌年に飛ばさない）＝取り込みの年推定バグの根治。
+//  解釈できない文字列（「未定」等）はそのまま返す。
+function normDate(v) {
+  let s = String(v == null ? '' : v).normalize('NFKC').trim();
+  if (s === '') return '';
+  const p2 = (n) => String(n).padStart(2, '0');
+  if (/^\d{4,6}(\.\d+)?$/.test(s)) { const n = Number(s); if (n >= 20000 && n <= 80000) { const iso = serialToDate(n); if (/^\d{4}-/.test(iso)) return iso; } }
+  let m = s.match(/(\d{4})\D{1,3}(\d{1,2})\D{1,3}(\d{1,2})/); // 年つき
+  if (m) { const mo = Number(m[2]), da = Number(m[3]); if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) return m[1] + '-' + p2(mo) + '-' + p2(da); }
+  m = s.match(/(\d{1,2})\D{1,3}(\d{1,2})/); // 年なし → 当年
+  if (m) { const mo = Number(m[1]), da = Number(m[2]); if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) return new Date().getFullYear() + '-' + p2(mo) + '-' + p2(da); }
+  return s;
+}
 function sanitize(s) {
   return String(s || 'メーカー不明').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').replace(/[.\s]+$/, '').trim() || 'メーカー不明';
 }
@@ -78,7 +93,7 @@ function convert(xlsxPath, outDir) {
       if (!bySupplier.has(sup)) bySupplier.set(sup, []);
       bySupplier.get(sup).push({
         メーカー商品CD: code, 商品名: name, 現単価: String(cur).trim(), 新単価: String(nw).trim(),
-        切替日: idx.date != null ? serialToDate(row[idx.date]) : '',
+        切替日: idx.date != null ? normDate(row[idx.date]) : '',
       });
     }
   }
@@ -114,4 +129,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { convert, detectColumns, serialToDate };
+module.exports = { convert, detectColumns, serialToDate, normDate };

@@ -55,7 +55,55 @@
 7. **メーカー見積 取り込み画面（/import）**：PDF/Excelの表を貼り付け→自動で列分解→列対応を指定・ズレ修正→`maker_quotes/`にCSV保存。
 8. **メーカー見積 .xlsx 直読みインポータ（2026-05-26 追加・動作確認済み）**：`src/xlsxread.js`（Node標準zlibのみでxlsx解凍・解析＝**ゼロ依存/Excel不要**）＋`src/makerXlsx.js`（見出し列を自動検出、シート名＝メーカー名で**1ブック複数シート→メーカー別CSV**）。`maker_quotes/` に置いた .xlsx は **照合.bat 実行時に自動展開**。単発変換は `取込.bat` にドロップ。中東(問屋)の `日野折箱店様（容器メーカー）.xlsx`（3シート: エフピコ122/中央化学64/福助1）で検証済み。
 
+## ★販売大臣DB 直結（2026-06-01 調査完了・実装は未着手）★
+
+ユーザ要望「毎回のエクスポートをやめてDB直結したい（**見るだけ・書き込み無し**を厳守）」。会社PCを実機調査し、**直結が現実的**と判明。⚠ **読み取り専用(SELECTのみ)を厳守。会計DBへINSERT/UPDATE/DELETE/DDLは絶対禁止。**
+
+### 接続情報（このPCで確認済み）
+- 販売大臣 **Super EX**＝**Microsoft SQL Server** バックエンド（Pervasiveではない）。インストール先 `C:\Program Files (x86)\OHKEN`。
+- SQL Server インスタンス **`localhost\OHKEN`**（サービス `MSSQL$OHKEN` 稼働）。**Windows認証(Integrated Security)で接続可**。
+- 既設のODBC DSN：`HBODDS *`（応研公式の販売大臣ODBCデータソース）、`HBWIN *`。ドライバ `ODBC Driver 17 for SQL Server`。※ツールからはODBCを使わず .NET SqlClient(PowerShell) 直結でも可。
+- DB一覧：`HBCOMSTD`(共通マスタ) / `OHDIC`(辞書) / **`HBDATA0001_001C`(現用の売上台帳＝本体データ)** / `HBDATA0001_002C`(作成済み・空の次期ブック)。
+
+### 本体データ＝`HBDATA0001_001C`（会社0001・現用ブック）
+- **`URIMEI`（売上明細・170,696行）＝販売実績の本体**。得意先524・商品5,299・仕入先95。重要列：
+  - `DENDATE`売上日 / `TOKSHI`得意先ICODE(→TOKUI.ICODE) / `SHO`商品ICODE(→SHOHIN.ICODE) / `NAME`(char50)商品名(明細直書き＝自社CD・メーカー品番が詰まる列) / `SUU`数量 / `TANI`単位 / **`TANK`売単価(現売単価)** / `KG`金額 / `HONTAI`本体価格 / **`BTANK`原単価(現仕入)** / `BKG`原価金額 / `SHIIRE`仕入先ICODE(→SHIIRE.ICODE) / `BIKOU`(char20)備考 / `ZEIRITU`税率。
+- **`SHOHIN`（商品マスタ・7,984）**：`ICODE`(PK) / `CODE`(char15)自社商品コード / `NM1`商品名 / `KCODE`分類 / **`BARATANK`バラ売価 / `CASETANK`ケース売価**（現売単価）/ **`GENBARATANK`バラ原価 / `GENCASETANK`ケース原価**（現仕入）/ `BAIKA1..5BARATANK`得意先ランク別売価 / `LASTSHITANK`/`LASTSHIDATE`最終仕入 / `IRISUU`入数 / `TEK`摘要 / `SHIIRE`仕入先ICODE。
+- **`TOKUI`（得意先・664）**：`ICODE`(PK)/`CODE`/`NM1`名/`ADD1`+`ADD2`住所/`TEL`/`FAX`/`TAN`担当。
+- **`SHIIRE`（仕入先・116）**：`ICODE`(PK)/`CODE`/`NM1`名/住所/TEL＝ツールが取り込む仕入先マスタそのもの。
+- ※ICODE=内部数値キー（結合用）、CODE=表示用コード。明細→マスタは ICODE で結合。
+
+### 読み取りの実証コマンド（PowerShell・標準.NETのみ＝追加インストール不要）
+```powershell
+$cs="Server=localhost\OHKEN;Database=HBDATA0001_001C;Integrated Security=SSPI;TrustServerCertificate=True;Encrypt=False"
+$cn=New-Object System.Data.SqlClient.SqlConnection $cs; $cn.Open()
+$cmd=$cn.CreateCommand(); $cmd.CommandText="SELECT ... FROM dbo.URIMEI ..."  # SELECTのみ
+# SqlDataAdapter.Fill で DataTable に取得 → CSV化
+$cn.Close()
+```
+Node標準だけではSQL Server に繋げない（ドライバ非搭載）ため、**DB読取はPowerShell(.NET SqlClient)経由**にするのが無依存で確実（このPC実証済み）。クラウドSaaS化時はこの経路は使わず、各社がエクスポートしたCSVを渡す従来方式に戻す（DB直結はオンプレ運用専用）。
+
+### 実装プラン（未着手・次回ここから）
+- **狙い**：`照合.bat` の前段で、SQLから「現在の販売実績」を読み出し、`hanbai.js` が食えるCSV(または新ローダ用のフラットCSV)を自動生成 → 手動エクスポート全廃。**照合中核(match.js/hanbai.js)は触らない**方針を維持。
+- **2案**：
+  - **案A（低リスク推奨の第一歩）**：SQL→**現行の販売実績CSVと同等のCSV**を生成し、`config.hanbai.path` に置くだけ。既存パイプライン無改造。※現行エクスポートCSVの実列構成を `hanbai.js` で確認してから列を合わせる必要あり。
+  - **案B（堅牢・将来）**：SQLの構造化列(TOKUI.NM1/SHOHIN.CODE/URIMEI.TANK/BTANK/SHIIRE.CODE)から、match.jsが要するレコード形(normName/custName/currentSell/origCost/annualAmount/purchaseCode…)を**直接**組む新ローダ。crammed-string解析の脆さを回避できるが、hanbaiの出力形を正確に再現する要あり。
+- **未確認(次回やる)**：①現行エクスポートCSV(`config.hanbai.path`)の実フォーマットと URIMEI 列の対応づけ ②「年間」の期間定義（DENDATEの範囲で絞るか、得意先×商品で最新単価をとるか）③ `BTANK`(原単価)が信頼できるか（旧メモ「原単価0が多い」は古い可能性。実データで要確認）。
+- ⚠ 必ず**読み取り専用アカウント**で運用するのが理想（SQL権限でdb_datareaderのみ付与）。当面はWindows認証で読むが、書き込みクエリは一切発行しない。
+
 ## ★次にやる作業（ここから再開）★
+
+### 🆕 4件まとめ作業：手順書確認＋日付正規化の根治＋コードレビュー修正3件（2026-06-01・動作確認済み）
+
+ユーザ依頼「①手順書にCSV削除手順を追加 ②取り込みの日付正規化バグ修正 ③コード全体の点検・改善 ④現状整理」を順に実施。**照合エンジン中核(match.js/hanbai.js)は今回も未修正**（正解CSV未復元のためリスク回避・報告のみ）。⚠ **要 sim.bat 再起動**（server.js/listPage.js を変更）。
+
+- **(1) 手順書のCSV削除手順＝既に対応済みだった**：`使い方手順書.md`/`.html` の両方に「## 11. 対象（照合結果CSV）を一覧から消したいとき（手動）」が既に存在（input/ を開く→`<仕入先>_照合結果_<日時>.csv` を削除 or `input/_old` へ移動→sim再起動）。CLAUDE.md の「未着手」メモが古かっただけ＝**新規作業なし**。
+- **(2) 取り込みの日本語日付→ISO年推定バグを根治（`src/makerXlsx.js`）**：従来 `serialToDate` は Excelシリアルしか変換せず、「7月1日～」等の日本語日付が**素通り**していた（カレンダーで過去月に出る等の根本原因）。新たに `normDate(v)` を追加＝Excelシリアル／`2026-07-01`／`2026/7/1`／`2026年7月1日`／`7月1日～`／`7/1`（**年なしは当年固定**＝過ぎた月日でも翌年に飛ばさない）／全角に対応、解釈不能（「未定」等）は素通り。`convert()` の切替日出力を `serialToDate`→`normDate` に。旧 `serialToDate` は server.js の貼り付けプレビュー(normalizeMakerGrid)でも使うため**挙動を変えず残置**（後方互換）。importPage.js の `jpDateToISO` は既に当年固定（5/31修正済）＝**両取り込み経路で当年固定に統一**。検証：normDate 11/11形式パス＋実xlsx(中東3シート)で 2026-06-01/07-01 に正規化を確認。
+- **(3-a) 🔴重要バグ修正：`得意先別.bat` の統合見積書が空になる問題（`src/merge_quotes.js`）**：見積書レイアウトが 5/30 に「No列廃止→商品コード列」へ変わったのに、`readQuote` のヘッダー検出が旧 `r[0]==='No' && r[1]==='商品名'` のままで**永久に一致せず明細0件→全得意先スキップ→統合見積書が空**になっていた（手順書は今も④で `得意先別.bat` を案内＝実害大）。ヘッダーを**列名から動的に引く方式**（「商品名」「改定単価」を含む行を探し、商品コード/現行単価/改定単価/実施日/備考の各列を名前で対応づけ）に変更＝**新旧レイアウト両対応**＋統合見積書にも商品コード・備考が載るように。検証：実データで `node src/merge_quotes.js`→**86得意先・336明細**（正の成果物 `_1824` と同数）、新形式の見積書を生成→商品コード・備考とも正しく読めることを確認。
+- **(3-b) listPage.js の操作ボタンのエスケープ漏れ修正**：`onclick="openPath('...')"` にファイル名を文字列連結していたが、`esc()` はシングルクオート `'` を escape しないため、仕入先名/ファイル名に `'` が混ざると壊れる潜在バグ。`unlink` と同じ **data属性＋委譲リスナ方式**（`.act-open[data-path]`/`.act-sim[data-file]`）に変更。配信スクリプト構文OK確認済。
+- **(3-c) `safeOpenPath` の堅牢化（`src/server.js`）**：①ROOT封じ込めチェックを末尾セパレータ込み（`=== root || startsWith(root+sep)`）にし兄弟ディレクトリ取りこぼしを防止 ②`exec('explorer "..."'）`の文字列連結を **`execFile('explorer',[path])`**（引数配列＝シェル展開なし）に変更し、パスに `"` が混じってもコマンドが壊れない。/api/export のフォルダオープンも execFile 化。ローカル単一利用なので悪用リスクは低いが防御として実施。
+- **報告のみ（今回は未修正）**：①`merge_quotes` の `priceRowAnomaly` に ruleType 未渡し＝据置(keep_sell)行が統合段で誤って要確認に落ちる（xlsxから ruleType を復元できないため。据置を統合経路に乗せない前提）。②`parseSelfName` の packSize 抜き取りが、運賃カッコありの行で商品名末尾の数字を入数と誤認し得る（要確認・実データ次第）。③行ごと上書き(rowRules/rowRound/manual)後に `priceReason`(価格異常)を再判定しない既知の限界。④match.js 集約キーの区切り無し連結・hanbai.js 末尾数字の仕入先コード誤認＝**照合精度に直結、正解CSV未復元のため触らない**。
+- **(4) 現状整理（確認のみ・ファイルは消していない）**：input/ は計73本だが sim/得意先別は「仕入先ごと最新1本」を読む。最新は全6仕入先(ハウスホールドジャパン/中央化学/大黒工業/旭創業/朝日食品容器/福助)とも **2026-05-31 12:30 のクリーンな照合バッチ**で揃っている。旧67本は最新選択に無影響だがフォルダが混雑＝必要なら `input/_old` 退避を提案（ユーザ承認待ち）。最新の得意先別成果物＝`output/得意先別_見積書_20260531_1118`。settings＝`makerChannel:{エフピコ→朝日食品容器}`・新仕入先 旭創業 登録済み。
 
 ### 🆕 取り込み運用の再設計：仕入先ごと統合＋上書き更新＋メーカー寄せ替え＋商品コード（2026-05-31 夜・動作確認済み）
 

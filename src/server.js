@@ -8,7 +8,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const { loadAndNormalize } = require('./load');
 const { calcRow } = require('./rules');
 const { loadPL } = require('./pl');
@@ -568,11 +568,14 @@ function listMakerQuotes() {
 function safeOpenPath(rel) {
   const target = path.isAbsolute(rel) ? rel : path.join(ROOT, rel);
   const normalized = path.normalize(target);
-  if (!normalized.startsWith(path.normalize(ROOT))) throw new Error('範囲外のパスです');
+  // ROOT配下のみ許可。末尾セパレータ込みで比較し、兄弟ディレクトリ(<ROOT>_evil 等)の取りこぼしを防ぐ。
+  const rootN = path.normalize(ROOT);
+  if (normalized !== rootN && !normalized.startsWith(rootN + path.sep)) throw new Error('範囲外のパスです');
   if (!fs.existsSync(normalized)) throw new Error('見つかりません: ' + rel);
-  if (process.platform === 'win32') exec('explorer "' + normalized + '"');
-  else if (process.platform === 'darwin') exec('open "' + normalized + '"');
-  else exec('xdg-open "' + normalized + '"');
+  // パスは文字列連結でシェルに渡さず、引数配列で渡す（" 等が混じってもコマンドが壊れない）。
+  if (process.platform === 'win32') execFile('explorer', [normalized]);
+  else if (process.platform === 'darwin') execFile('open', [normalized]);
+  else execFile('xdg-open', [normalized]);
   return normalized;
 }
 
@@ -1214,8 +1217,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const result = exportQuotes(body);
       if (result.ok === false) return sendJson(res, 200, result); // 対象0件は Explorer を開かない
-      if (process.platform === 'win32') exec(`explorer "${result.folder}"`);
-      else if (process.platform === 'darwin') exec(`open "${result.folder}"`);
+      if (process.platform === 'win32') execFile('explorer', [result.folder]);
+      else if (process.platform === 'darwin') execFile('open', [result.folder]);
       return sendJson(res, 200, result);
     }
     res.writeHead(404); res.end('not found');
