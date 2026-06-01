@@ -25,11 +25,15 @@ function normForCode(s) {
   return nfkc(String(s == null ? '' : s)).toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-// 既定の集計期間（約13か月のローリング窓）。dbCfg.start/end があればそれを優先。
+// 既定の集計期間（月単位のローリング窓・過去約1年）。dbCfg.start/end があればそれを優先。
+//  ※ 境界を月初に揃えているので「日が変わっても動かず、月が替わったときだけ1か月ぶん前へずれる」。
+//     start = 12か月前の月初／end = 翌月の1日（＝当月末までを含む・排他上限）。
+//     例: 2026年6月のどの日でも 2025-06-01 〜 2026-07-01（13か月分・当月含む）で一定。7月になると1か月ずれる。
 function defaultRange() {
   const d = new Date();
-  const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1); // 明日（今日を含める）
-  const start = new Date(d.getFullYear(), d.getMonth() - 13, 1);        // 13か月前の月初
+  const y = d.getFullYear(), m = d.getMonth();
+  const start = new Date(y, m - 12, 1);  // 12か月前の月初（過去約1年）
+  const end = new Date(y, m + 1, 1);     // 翌月の1日（当月末まで含める排他上限）
   const iso = (x) => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
   return { start: iso(start), end: iso(end) };
 }
@@ -38,7 +42,7 @@ function defaultRange() {
 function buildSql(start, end, scale) {
   const sc = Number(scale) || 10000;
   return `;WITH base AS (
-  SELECT u.TOKSHI, u.SHO, u.DENDATE, u.NO, u.GYO,
+  SELECT u.TOKSHI, u.SHO, u.DENDATE, u.NO, u.GYO, u.DSHU,
          u.TANK/${sc}.0 AS sell, u.BTANK/${sc}.0 AS cost, u.KG AS amt,
          LTRIM(RTRIM(ISNULL(u.NAME,'')))
            + CASE WHEN LTRIM(RTRIM(ISNULL(u.NAME2,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(u.NAME2)) END
@@ -50,10 +54,17 @@ function buildSql(start, end, scale) {
   WHERE u.DENDATE >= '${start}' AND u.DENDATE < '${end}'
 ),
 latest AS (
+  -- 現売単価＝得意先×商品の「最新DENDATE行のTANK」。伝票種(DSHU)で絞らない＝全種から最新を採る。
+  --  ※実測：現行エクスポート(2025-05〜2026-05)との突合で、全DSHU最新が97.1%一致。
+  --    DSHU=51(売上)＆TANK>0 に絞ると79.8%に悪化したため、絞らない現行ロジックを維持する。
   SELECT *, ROW_NUMBER() OVER (PARTITION BY TOKSHI, SHO ORDER BY DENDATE DESC, NO DESC, GYO DESC) AS rn
   FROM base
 ),
-agg AS ( SELECT TOKSHI, SHO, SUM(amt) AS annual FROM base GROUP BY TOKSHI, SHO )
+-- 年間金額＝期間内の 売上(51)＋値引(52) の KG 合計。
+--  ※実測：全DSHU合計=76.0%／51のみ=68.8%／51+52=83.2%／51+52+59=76.0% 一致。
+--    現行エクスポートの「年間金額」は 売上−値引（51+52）が最も合うため 51,52 に限定する。
+--    （別区分59・無償81 は現行レポートの年間金額には含まれない）
+agg AS ( SELECT TOKSHI, SHO, SUM(CASE WHEN DSHU IN (51, 52) THEN amt ELSE 0 END) AS annual FROM base GROUP BY TOKSHI, SHO )
 SELECT
   RTRIM(tk.CODE) AS tcd, RTRIM(sh.CODE) AS pcd,
   l.sell AS sell, a.annual AS amt, l.cost AS cost,
@@ -169,4 +180,33 @@ function loadHanbaiFromDb(dbCfg) {
   finally { try { fs.unlinkSync(csv); } catch (_) {} }
 }
 
-module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange };
+// 商品コード(SHOHIN.CODE) → { zeiKbn(消費税区分=ZEIKBN), zeiRitu(消費税率表№=ZEIRITU) } を読み取り専用で引く。
+//  販売大臣 単価履歴CSVの税2列に使う。codes は自社レコード由来だが、念のためASCII英数字等に限定（SQL安全）。
+function lookupShohinTax(dbCfg, codes) {
+  dbCfg = dbCfg || {};
+  const uniq = Array.from(new Set((codes || []).map((c) => String(c == null ? '' : c).trim())))
+    .filter((c) => c && /^[0-9A-Za-z._-]+$/.test(c));
+  if (!uniq.length) return {};
+  const inList = uniq.map((c) => "'" + c + "'").join(',');
+  const sql = `SELECT RTRIM(CODE) AS code, ZEIKBN AS zeikbn, ZEIRITU AS zeiritu FROM dbo.SHOHIN WHERE RTRIM(CODE) IN (${inList})`;
+  const csv = runQueryToCsv(dbCfg, sql);
+  try {
+    const { parseCsvText } = require('./csv');
+    const rows = parseCsvText(fs.readFileSync(csv, 'utf8').replace(/^﻿/, ''));
+    if (!rows.length) return {};
+    const head = rows[0]; const ix = {}; head.forEach((h, i) => { ix[String(h).trim().toLowerCase()] = i; });
+    const out = {};
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i]; if (!r || !r.length) continue;
+      const code = String(r[ix.code] == null ? '' : r[ix.code]).trim();
+      if (!code) continue;
+      out[code] = {
+        zeiKbn: String(r[ix.zeikbn] == null ? '' : r[ix.zeikbn]).trim(),
+        zeiRitu: String(r[ix.zeiritu] == null ? '' : r[ix.zeiritu]).trim(),
+      };
+    }
+    return out;
+  } finally { try { fs.unlinkSync(csv); } catch (_) {} }
+}
+
+module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax };

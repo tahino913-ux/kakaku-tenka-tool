@@ -155,10 +155,14 @@ function run(folders) {
   customers.forEach((customer) => {
     const ent = byCust.get(customer);
     const all = [...ent.byProd.values()].sort((a, b) => String(a.productName).localeCompare(String(b.productName), 'ja'));
-    // 価格の異常検知 → 見積から外して要確認へ
+    // 価格の異常検知 → 見積から外して要確認へ。
+    //  ※ ここで読むのは「仕入先別の段階で承認済み（exportQuotes が ruleType 込みで異常を分離した後）」の
+    //    見積書。据置(keep_sell)は 改定単価＝現単価 が正常で、そのまま発行されている。xlsx から ruleType は
+    //    復元できないため、② の「値上げなのに同額/値下げ」を再判定すると 据置の正常行を誤って外してしまう。
+    //    そこで keep_sell を渡して ② を抑止し、統合段では ①「売単価が無い/0（見積に載せられない）」だけを弾く。
     const rows = [];
     for (const it of all) {
-      const reason = priceRowAnomaly(it.currentSell, it.newSell);
+      const reason = priceRowAnomaly(it.currentSell, it.newSell, 'keep_sell');
       if (reason) review.push({ customer, productName: it.productName, currentSell: it.currentSell, newSell: it.newSell, reason });
       else rows.push(it);
     }

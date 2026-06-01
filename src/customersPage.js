@@ -100,6 +100,8 @@ const CUSTOMERS_PAGE = `<!doctype html>
   .cust.done{background:#f5fbf6}
   .issuednote{margin:8px 16px;padding:8px 12px;border-radius:8px;background:#eef7ef;border:1px solid #bfe0c4;color:#1f6b35;font-size:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .issuednote .un{background:#fff;border:1px solid #9fcbab;color:#1f6b35;border-radius:7px;padding:2px 9px;font-weight:700;cursor:pointer;font-size:11px}
+  .issuednote .openq{background:#1f6b35;border:1px solid #1f6b35;color:#fff;border-radius:7px;padding:2px 10px;font-weight:700;cursor:pointer;font-size:11px}
+  .issuednote .openq:hover{background:#175a2b}
   .notyet{margin:8px 16px;padding:6px 12px;border-radius:8px;background:#f4f6f9;border:1px solid #e2e6ec;color:#6b7785;font-size:12px}
   .lowmnote{margin:8px 16px;padding:8px 12px;border-radius:8px;background:#fff4d6;border:1px solid #f0d49a;color:#8a5a12;font-size:12px}
   .detail-head{padding:12px 16px 4px}
@@ -185,6 +187,18 @@ const CUSTOMERS_PAGE = `<!doctype html>
   <span id="exportMsg" class="muted"></span>
 </div>
 <div id="exportResult" style="display:none"></div>
+
+<div class="exportbar" id="hanbaiBar" style="background:#eef3fb;border-color:#cdddf3">
+  <b style="color:#1f4e78">📥 販売大臣へ取込</b>
+  <label style="font-size:12px;color:#33405a">実施日が <input type="date" id="hanbaiCutoff" style="font:inherit;padding:4px 6px;border:1px solid #c7ced8;border-radius:6px"> までに到来した</label>
+  <select id="hanbaiScope" style="font:inherit;padding:4px 6px;border:1px solid #c7ced8;border-radius:6px">
+    <option value="all">改定すべて</option>
+    <option value="issued">発行済みの得意先だけ</option>
+  </select>
+  <button class="exp" id="hanbaiExportBtn" style="background:#2e6b3e">単価履歴CSVをダウンロード</button>
+  <span class="exphint">実施日が来た価格改定を、販売大臣の「単価履歴」取込用CSV（Shift_JIS）にします。消費税区分・税率表№はDBから自動付与。既定は改定すべて（発行の有無を問わず）。</span>
+  <span id="hanbaiMsg" class="muted"></span>
+</div>
 
 <div class="gate-overlay" id="gateOverlay">
   <div class="gate">
@@ -352,6 +366,14 @@ function issuedShort(iso){
   return (d.getMonth()+1)+'/'+d.getDate();
 }
 function issuedCountN(){ return Object.keys(ISSUED||{}).length; }
+// 提出済みの見積書(xlsx)をこのページから直接開く（発行履歴の folder から特定）
+async function openIssued(name){
+  try{
+    const r=await fetch('/api/open-issued',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name})}).then(x=>x.json());
+    if(!r.ok){ alert('見積書を開けませんでした：'+(r.error||'')); return; }
+    if(r.note) alert(r.note); // ファイルが見つからずフォルダを開いた場合などの注記
+  }catch(e){ alert('通信に失敗しました：'+e); }
+}
 // 1得意先の「提出済み」を取り消す
 async function unmarkIssued(name){
   if(!confirm('「'+name+'」の提出済みマークを取り消します。よろしいですか？\\n（見積書ファイル自体は消えません。表示の記録だけ消します）')) return;
@@ -411,6 +433,7 @@ function selectCust(name){
   if(iss){
     html+='<div class="issuednote">✅ <b>提出済み</b>　最終提出 '+esc(issuedShort(iss.lastIssuedAt))
       +(iss.quoteNo?'（見積No. '+esc(iss.quoteNo)+'）':'')+(iss.itemCount?' '+iss.itemCount+'品':'')+(iss.count>1?'　／　提出 '+iss.count+' 回':'')
+      +'<button class="openq" data-name="'+esc(c.name)+'" onclick="openIssued(this.getAttribute(\\'data-name\\'))">📄 提出済の見積書を開く</button>'
       +'<button class="un" data-name="'+esc(c.name)+'" onclick="unmarkIssued(this.getAttribute(\\'data-name\\'))">提出済みを取消</button></div>';
   } else {
     html+='<div class="notyet">未提出（この得意先はまだ見積書を発行していません）</div>';
@@ -629,6 +652,29 @@ $('#search').addEventListener('input',applyFilter);
 $('#resetIssuedBtn').addEventListener('click',resetAllIssued);
 $('#exportAllBtn').addEventListener('click',()=>exportFlow('all'));
 $('#exportOneBtn').addEventListener('click',()=>exportFlow('one'));
+// 販売大臣 単価履歴CSV（実施日到来分）のダウンロード
+(function(){
+  const p=n=>String(n).padStart(2,'0');
+  const today=()=>{const d=new Date();return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());};
+  const hc=$('#hanbaiCutoff'); if(hc&&!hc.value) hc.value=today();
+  $('#hanbaiExportBtn').addEventListener('click',async()=>{
+    const cutoff=($('#hanbaiCutoff').value||today());
+    const issuedOnly = $('#hanbaiScope').value==='issued';
+    const scopeLabel = issuedOnly ? '発行済みの得意先' : '改定すべて';
+    const msg=$('#hanbaiMsg'); msg.style.color='#6b7785'; msg.textContent='確認中…';
+    try{
+      const r=await fetch('/api/hanbai-export-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cutoff,issuedOnly})}).then(x=>x.json());
+      if(!r.ok){ msg.style.color='#c0392b'; msg.textContent='エラー: '+(r.error||''); return; }
+      if(!r.count){ msg.style.color='#b8860b'; msg.textContent='対象なし（'+cutoff+' までに実施日が来た'+(issuedOnly?'発行済みの':'')+'改定行はありません）'; return; }
+      let warn='';
+      if(r.dbError) warn='\\n※ 販売大臣DBに接続できなかったため、消費税区分／税率表№は標準値(2／1)で出力します。';
+      else if(r.missingTax) warn='\\n※ '+r.missingTax+' 件はDBに商品が見つからず、消費税は標準値(2／1)で出力します。';
+      if(!confirm(cutoff+' までに実施日が到来した改定（'+scopeLabel+'）'+r.count+' 行 / '+r.customerCount+' 得意先 を、販売大臣の単価履歴取込CSVとして出力します。'+warn+'\\n\\nダウンロードしますか？')){ msg.textContent=''; return; }
+      msg.style.color='#2e7d32'; msg.textContent='✓ ダウンロードしました（'+r.count+' 行 / '+r.customerCount+' 得意先）。販売大臣の「単価履歴」取込で読み込んでください。';
+      window.location='/api/hanbai-export?cutoff='+encodeURIComponent(cutoff)+(issuedOnly?'&issuedOnly=1':'');
+    }catch(e){ msg.style.color='#c0392b'; msg.textContent='通信に失敗しました: '+e; }
+  });
+})();
 $('#gateClose').addEventListener('click',closeGate);
 $('#gateBack').addEventListener('click',closeGate);
 $('#gateIssue').addEventListener('click',()=>{ if(gateOpts) doIssue(gateOpts); });

@@ -282,11 +282,22 @@ async function loadHanbaiSource(){
   const target = $('#srcInfo');
   try {
     const r = await fetch('/api/hanbai-source').then(x => x.json());
+    const usesDb = (r.source === 'db' || r.source === 'auto');
+    let banner = '';
+    if (usesDb) {
+      const rng = r.dbRange ? (esc(r.dbRange.start)+' 〜 '+esc(r.dbRange.end)) : '過去約1年';
+      banner = '<div style="margin-bottom:10px;padding:10px 12px;background:#e9f6ec;border:1px solid #b7e0c0;border-radius:8px;color:#1f6b35;font-size:13px;line-height:1.8">'
+        + '<b>✅ 現在は販売大臣DBから直接取得しています'+(r.source==='auto'?'（自動：DBが無いPCのみ下のファイルを使用）':'（DB直結）')+'。</b><br>'
+        + '取得期間：<b>'+rng+'</b>（実行のたびに「今日を基準に過去約1年」を自動で取り直します）。手動エクスポートや期間の設定は不要です。<br>'
+        + '<span style="color:#4a7a55">↓ 下の「ファイル」設定は、DBが無いPC（自宅など）や他社運用のための予備です。会社PCでは使われません。</span></div>';
+    }
     if (!r.configured) {
-      target.innerHTML = '<span class="err">⚠ config.js の hanbai.path が未設定です</span>';
+      target.innerHTML = banner + (usesDb
+        ? '<div class="hint" style="padding:4px 8px">ファイルパスは未設定ですが、DB直結のため問題ありません。</div>'
+        : '<span class="err">⚠ config.js の hanbai.path が未設定です</span>');
       return;
     }
-    let html = '';
+    let html = banner;
     html += '<table style="border:none;font-size:13px"><tbody>';
     html += '<tr><td style="border:none;padding:3px 8px;color:#6b7785;white-space:nowrap">設定パス</td><td style="border:none;padding:3px 8px"><code style="background:#f5f7fa;padding:2px 6px;border-radius:3px">'+esc(r.configured)+'</code> '+(r.isDir?'<span class="hint">（フォルダ）</span>':'<span class="hint">（ファイル直接指定）</span>')+'</td></tr>';
     if (r.resolved) {

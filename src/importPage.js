@@ -45,30 +45,39 @@ const IMPORT_PAGE = `<!doctype html>
 </header>
 
 <div class="step">
-  <div class="lbl">① 仕入先（メーカー）を選ぶ／登録</div>
-  <div class="hint">仕入先ごとに「メーカー見積のどの列が自社のどの項目か」を一度登録すれば、次回からは自動で当てはまります。<br>初めての仕入先は「＋ 新規」を選んで名前を入力してください。</div>
-  <div class="row">
-    <select id="supplierSel"><option value="__new__">＋ 新規…</option></select>
-    <input id="supplier" placeholder="仕入先名（例: 大黒工業）" style="width:240px">
-    <span id="profMsg" style="font-size:11px;color:#2e7d32"></span>
-  </div>
-  <div id="profSummary" style="display:none;margin-top:8px;padding:8px 10px;background:#eef7ee;border:1px solid #cfe6cf;border-radius:6px;font-size:12px;color:#2e5a2e"></div>
-  <div class="row" style="margin-top:10px;padding:8px 10px;background:#fff8e1;border:1px solid #ffe082;border-radius:6px">
-    <label style="font-size:12px;color:#5a4a1a">🏢 仕入先コード（自社マスタから）：</label>
-    <select id="purchaseCodeSel" style="min-width:380px">
-      <option value="">（未設定／全件候補 — 推奨：選択する）</option>
+  <div class="lbl">① 仕入先を選ぶ（自社マスタの「仕入先コード」から）</div>
+  <div class="hint">値上げ通知は問屋（朝日・中東など）からまとめて届くので、まず<b>仕入先（発注先）をマスタから選びます</b>。選ぶと「仕入先名」と「発注先コード」が自動で入ります。</div>
+  <div class="row" style="padding:8px 10px;background:#fff8e1;border:1px solid #ffe082;border-radius:6px">
+    <label style="font-weight:700;color:#5a4a1a">🏢 仕入先（マスタ）：</label>
+    <select id="purchaseCodeSel" style="min-width:420px">
+      <option value="">― マスタから選択 ―</option>
     </select>
-    <span id="purchaseCodeBadge" style="font-size:11px;color:#7a5a00;font-weight:700"></span>
+    <span id="purchaseCodeBadge" style="font-size:12px;color:#7a5a00;font-weight:700"></span>
   </div>
   <div class="hint" style="font-size:11px;color:#6b7785;margin-top:4px;line-height:1.6">
-    この見積書がどの仕入先(発注先)から来た値上げ通知かを指定すると、自社販売実績の <b>末尾4桁コード</b>（例: 13=朝日食品容器 / 29=大黒工業 / 53=エフピコ商事）に一致する自社品だけを照合候補にします。<br>
-    ※ 問屋経由で買っている同じメーカーの品は <b>その問屋のメーカー見積</b> で別途拾われます。
+    選んだ仕入先(発注先)の <b>末尾4桁コード</b>（例: 13=朝日食品容器 / 29=大黒工業 / 47=ハウスホールドジャパン）に一致する自社品だけを照合候補にします。
   </div>
+  <div class="row" style="margin-top:8px">
+    <label>この見積の仕入先名：</label>
+    <input id="supplier" placeholder="（マスタを選ぶと自動で入ります）" style="width:280px">
+    <span id="profMsg" style="font-size:11px;color:#2e7d32"></span>
+  </div>
+  <div style="margin-top:6px">
+    <a href="#" id="advToggle" style="font-size:12px;color:#1f4e78;text-decoration:none">▸ その他（登録済みから選ぶ／問屋の下のメーカーを分けて登録）</a>
+    <div id="advArea" style="display:none;margin-top:6px;padding:8px 10px;background:#f7f9fc;border:1px solid #e2e6ec;border-radius:6px">
+      <div class="row">
+        <label>登録済みから選ぶ：</label>
+        <select id="supplierSel"><option value="__new__">＋ 新規（上の「仕入先名」に直接入力）…</option></select>
+      </div>
+      <div class="hint" style="margin-top:4px">問屋の下のメーカーを分けて取り込みたいとき（例：朝日の下の「中央化学」「福助」）は、ここで登録済みを選ぶか、上の「仕入先名」に直接入力してください。</div>
+    </div>
+  </div>
+  <div id="profSummary" style="display:none;margin-top:8px;padding:8px 10px;background:#eef7ee;border:1px solid #cfe6cf;border-radius:6px;font-size:12px;color:#2e5a2e"></div>
 </div>
 
 <div class="step" id="step2">
   <div class="lbl">② メーカー見積の中身を読み込む</div>
-  <div class="hint"><b>方法A：ファイルを選ぶ</b>（Excel／CSVに対応）　<b>方法B：PDFやExcelの表をコピーして貼り付け</b><br>ファイルを選ぶか貼り付けると、自動で表に展開されます。</div>
+  <div class="hint"><b>方法A：ファイルを選ぶ</b>（Excel／CSVに対応）　<b>方法B：PDFやExcelの表をコピーして貼り付け</b>　<b>方法C：1件ずつ手入力</b><br>ファイルを選ぶ・貼り付ける・手入力する、どの方法でも自動で表に展開されます。</div>
   <div id="step2Lock" style="margin:6px 0;padding:8px 12px;background:#fff0f0;border:1px solid #f3c0c0;border-radius:6px;font-size:12px;color:#8a3a3a">
     ⤴ まず ① で仕入先（メーカー）を選んでください。新規の場合は名前を入力すると進めます。
   </div>
@@ -83,6 +92,23 @@ const IMPORT_PAGE = `<!doctype html>
     区切り：<select id="delim" disabled><option value="auto">自動</option><option value="tab">タブ</option><option value="comma">カンマ</option><option value="space">連続スペース</option></select>
     <label><input type="checkbox" id="hasHeader" checked disabled> 1行目は見出し</label>
     <button class="go" id="parseBtn" disabled>貼り付けを読み取る</button>
+  </div>
+
+  <div style="margin-top:12px;border-top:1px dashed #d8dee6;padding-top:10px">
+    <div class="lbl" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      方法C：1件ずつ手入力（項目ごとに直接入力）
+      <button class="go" id="manualToggle" type="button" disabled style="padding:4px 10px">✏ 手入力をひらく</button>
+    </div>
+    <div class="hint">貼り付けが使えないとき（口頭・メモ・FAX・電話連絡など）に、項目ごとに直接入力できます。最低でも <b>メーカー商品名</b> と <b>新単価</b> を入れてください。<br>
+      <b>自社コード</b>（任意）を入れると、その商品は照合で <b>「📌 手動紐付け（100%確定）」</b> として扱われます（後で「📊 一覧・進捗」から解除できます）。</div>
+    <div id="manualArea" style="display:none">
+      <div class="wrap" style="max-height:42vh"><table id="manualTbl"></table></div>
+      <div class="row">
+        <button class="go" id="manualAddBtn" type="button" style="background:#3a6ea5">＋ 行を追加</button>
+        <button class="go" id="manualApplyBtn" type="button">この内容を下の表に反映 →</button>
+        <span id="manualMsg" style="font-size:11px;color:#6b7785"></span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -112,8 +138,9 @@ const IMPORT_PAGE = `<!doctype html>
 
 <script>
 const $=s=>document.querySelector(s);
-const FIELDS=[['','（無視）'],['makerCode','メーカー品番'],['makerName','メーカー商品名'],['spec','規格'],['currentCost','現単価'],['newCost','新単価'],['switchDate','切替日']];
+const FIELDS=[['','（無視）'],['makerCode','メーカー品番'],['makerName','メーカー商品名'],['selfCode','自社コード'],['spec','規格'],['currentCost','現単価'],['newCost','新単価'],['switchDate','切替日']];
 let grid=[];
+let suppressProfile=false; // true のとき applyProfile を抑止（手入力＝固定レイアウトを保存済み書式で上書きしない）
 let MAKERS={};            // 仕入先プロファイル（サーバから取得）
 let SUPPLIERS={};         // 仕入先マスタ {4桁: {name,...}}（仕入先コード選択用）
 let activeProfile=null;   // いま選択中の仕入先の保存プロファイル
@@ -137,8 +164,43 @@ async function loadSuppliersMaster(){
   }catch(e){ SUPPLIERS={}; }
   const sel=$('#purchaseCodeSel');
   const codes=Object.keys(SUPPLIERS).sort();
-  sel.innerHTML='<option value="">（未設定／全件候補 — 推奨：選択する）</option>'+
+  sel.innerHTML='<option value="">― マスタから選択 ―</option>'+
     codes.map(c=>'<option value="'+esc(c)+'">'+esc(c)+' '+esc(SUPPLIERS[c].name||'')+'</option>').join('');
+}
+// マスタ会社名 → 照合で使う短い仕入先名へ掃除（㈱/株式会社/全半角空白/末尾の時刻ゴミ等を除去）。
+//  例: 「朝日食品容器　株式会社」→「朝日食品容器」 / 「株式会社　旭創業」→「旭創業」
+//      「ハウスホールドジャパン　株式会社 11：00」→「ハウスホールドジャパン」
+//  これにより既存の照合結果/紐付け(短い名前キー)とズレずに済む。
+function cleanName(raw){
+  let t=String(raw||'').normalize('NFKC');
+  t=t.replace(/[（(]株[）)]|株式会社|㈱|有限会社|㈲|合同会社|合資会社/g,' ');
+  t=t.replace(/\\s*\\d{1,2}[:：]\\d{2}\\s*$/,''); // 末尾の「11:00」のような時刻ゴミ
+  t=t.replace(/[\\s　]+/g,' ').trim();
+  return t;
+}
+// マスタ(仕入先コード)を選んだら：仕入先名を自動補完＋発注先コードを設定。これが主役の選択経路。
+function onPurchaseCodePick(){
+  updatePurchaseBadge();
+  const code=$('#purchaseCodeSel').value;
+  if(code && SUPPLIERS[code]){
+    const nm=cleanName(SUPPLIERS[code].name||'');
+    if(nm){
+      $('#supplier').value=nm;
+      if(MAKERS[nm]){
+        activeProfile=MAKERS[nm];
+        if(activeProfile.delim) $('#delim').value=activeProfile.delim;
+        if(activeProfile.hasHeader!=null) $('#hasHeader').checked=!!activeProfile.hasHeader;
+        $('#profMsg').textContent='✓ 書式登録済み（ファイルを選ぶか貼り付ければ自動で列対応します）';
+        applyProfile();
+      } else {
+        activeProfile=null; $('#profMsg').textContent='';
+      }
+      // 「登録済みから選ぶ」を同期（一致があれば選択／無ければ新規扱い）
+      $('#supplierSel').value = MAKERS[nm] ? nm : '__new__';
+    }
+  }
+  showProfSummary();
+  updateStep2Lock();
 }
 function updatePurchaseBadge(){
   const code=$('#purchaseCodeSel').value;
@@ -150,9 +212,10 @@ function updatePurchaseBadge(){
 function onSupplierPick(){
   const v=$('#supplierSel').value;
   if(v==='__new__'){
+    // 「上の仕入先名に直接入力」モード。マスタで選んだ発注先コードは保持する
+    //  （問屋の下のメーカー名を手入力するケース＝コードは問屋のまま）。
     activeProfile=null; $('#supplier').value=''; $('#supplier').focus();
     $('#profMsg').textContent='';
-    $('#purchaseCodeSel').value=''; updatePurchaseBadge();
     showProfSummary(); updateStep2Lock(); return;
   }
   $('#supplier').value=v;
@@ -172,11 +235,9 @@ function onSupplierPick(){
 }
 // ① の入力状態に応じて ② のフォームを有効／無効化
 function updateStep2Lock(){
-  const sel=$('#supplierSel').value;
-  const name=$('#supplier').value.trim();
-  // 既存仕入先を選んでいる、または「新規」で名前を入れている → 解放
-  const ok = (sel && sel !== '__new__') || (sel === '__new__' && name.length > 0);
-  const ids=['fileBtn','src','delim','hasHeader','parseBtn'];
+  // 仕入先名が入っていれば解放（マスタ選択／登録済み選択／手入力のいずれでも名前が入る）。
+  const ok = $('#supplier').value.trim().length > 0;
+  const ids=['fileBtn','src','delim','hasHeader','parseBtn','manualToggle'];
   ids.forEach(id=>{ const el=$('#'+id); if(el) el.disabled = !ok; });
   $('#step2').classList.toggle('locked', !ok);
 }
@@ -209,6 +270,7 @@ function guess(h){
   const t=norm(h);
   if(/(新単価|新価格|改定後|new)/.test(t)) return 'newCost';
   if(/(現単価|現行|旧単価|現価)/.test(t)) return 'currentCost';
+  if(/(自社コード|自社cd|自社商品|当社コード|弊社コード)/.test(t)) return 'selfCode'; // ※「コード」より前に判定
   if(/(品番|商品cd|商品コード|メーカーcd|^cd$|コード)/.test(t)) return 'makerCode';
   if(/(商品名|品名|名称)/.test(t)) return 'makerName';
   if(/(規格|サイズ|寸法)/.test(t)) return 'spec';
@@ -225,6 +287,7 @@ function splitLine(line,delim){
   return line.split(/ {2,}|\\u3000+/);
 }
 function parse(){
+  suppressProfile=false; // 貼り付けは保存済み書式を適用
   const text=$('#src').value.replace(/\\r/g,'');
   const delim=$('#delim').value;
   const lines=text.split('\\n').map(l=>l.replace(/\\s+$/,'')).filter(l=>l.trim()!=='');
@@ -254,25 +317,28 @@ function jsDetectColumns(rows){
   }
   return null;
 }
-// --- B: 「7月1日～」のような日本語日付 → "YYYY-MM-DD" ---
+// --- B: 切替日を「どんな入力でも YYYY-MM-DD に揃える」---
+//  サーバ側 normDateInput と同じ強さ：NFKC（全角→半角）/ Excelシリアル / 区切りは何でも(-./年月日空白) /
+//  年なしは当年。対応: 2026-07-01・2026/7/1・2026.7.1・2026年7月1日・7月1日・7月1日～・7/1・8/15・全角・46133(シリアル)。
+//  解釈できない文字列（「未定」等）はそのまま返す（入力をロックしない）。
 function jpDateToISO(s,refDate){
-  s=String(s==null?'':s).trim();
+  s=String(s==null?'':s).normalize('NFKC').trim();
   if(!s) return s;
-  // 既にISO/スラッシュ形式ならそのまま（区切りはハイフンに統一）
-  let m=s.match(/^(\\d{4})[-\\/](\\d{1,2})[-\\/](\\d{1,2})/);
-  if(m) return m[1]+'-'+String(+m[2]).padStart(2,'0')+'-'+String(+m[3]).padStart(2,'0');
-  // YYYY年M月D日
-  m=s.match(/(\\d{4})\\s*年\\s*(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*日/);
-  if(m) return m[1]+'-'+String(+m[2]).padStart(2,'0')+'-'+String(+m[3]).padStart(2,'0');
-  // M月D日 → 年なしは「当年」に統一（価格改定は当年が前提。過ぎた月日でも翌年に飛ばさない）。
-  //  以前は「次に来る同月日」で推定していたが、当年の過去月日を翌年(2027等)に誤推定する不具合があった。
-  m=s.match(/(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*日/);
-  if(m){
-    const ref=refDate||new Date();
-    const M=+m[1], D=+m[2];
-    const Y=ref.getFullYear();
-    return Y+'-'+String(M).padStart(2,'0')+'-'+String(D).padStart(2,'0');
+  const p2=n=>String(n).padStart(2,'0');
+  // Excelシリアル(4-6桁・妥当範囲) → 日付
+  if(/^\\d{4,6}$/.test(s)){
+    const n=Number(s);
+    if(n>=20000 && n<=90000){
+      const d=new Date((n-25569)*86400*1000);
+      if(!isNaN(d.getTime())) return d.getUTCFullYear()+'-'+p2(d.getUTCMonth()+1)+'-'+p2(d.getUTCDate());
+    }
   }
+  // 年つき（区切りは - / . 年 月 日 空白 など何でも）
+  let m=s.match(/(\\d{4})\\D{1,3}(\\d{1,2})\\D{1,3}(\\d{1,2})/);
+  if(m){ const mo=+m[2], da=+m[3]; if(mo>=1&&mo<=12&&da>=1&&da<=31) return m[1]+'-'+p2(mo)+'-'+p2(da); }
+  // 年なし → 当年（価格改定は当年が前提。過ぎた月日でも翌年に飛ばさない）
+  m=s.match(/(\\d{1,2})\\D{1,3}(\\d{1,2})/);
+  if(m){ const mo=+m[1], da=+m[2]; if(mo>=1&&mo<=12&&da>=1&&da<=31){ const Y=(refDate||new Date()).getFullYear(); return Y+'-'+p2(mo)+'-'+p2(da); } }
   return s; // 未対応の形は素通り
 }
 
@@ -311,7 +377,7 @@ function applySkipAndRender(){
   const cols=Math.max.apply(null,sliced.concat(skippedRaw).map(r=>r.length||0));
   grid=sliced.map(r=>{ const a=r.slice(); while(a.length<cols) a.push(''); return a.map(c=>String(c==null?'':c)); });
   const skippedPadded=skippedRaw.map(r=>{ const a=r.slice(); while(a.length<cols) a.push(''); return a; });
-  render(cols, skippedPadded); applyProfile();
+  render(cols, skippedPadded); if(!suppressProfile) applyProfile();
 }
 // 適切なCSVパーサ（クォート対応）。ファイル選択でのCSV読み込みに使用。
 function csvParseRows(text){
@@ -355,6 +421,7 @@ function bufToB64(buf){
 // ファイル選択ハンドラ（CSV/Excelに対応）
 async function onFilePicked(ev){
   const f=ev.target.files && ev.target.files[0]; if(!f) return;
+  suppressProfile=false; // ファイル取り込みは保存済み書式を適用
   $('#fileMsg').style.color='#6b7785';
   $('#fileMsg').textContent='読み込み中… '+f.name;
   $('#sheetSel').style.display='none'; $('#sheetSel').innerHTML='';
@@ -439,15 +506,75 @@ function collect(){
   const items=[];
   Object.keys(byRow).forEach(r=>{
     const row=byRow[r], get=f=>map[f]!=null?(row[map[f]]||''):'';
-    const it={makerCode:get('makerCode'),makerName:get('makerName'),spec:get('spec'),currentCost:get('currentCost'),newCost:get('newCost'),switchDate:get('switchDate')};
+    const it={makerCode:get('makerCode'),makerName:get('makerName'),selfCode:get('selfCode'),spec:get('spec'),currentCost:get('currentCost'),newCost:get('newCost'),switchDate:get('switchDate')};
     if(it.makerName||it.makerCode||it.newCost) items.push(it);
   });
   return {map,items};
 }
+// ===== 方法C：1件ずつ手入力 =====
+// 固定レイアウトの入力表（列の意味が決まっているので照合用の項目をそのまま入力できる）。
+const MANUAL_COLS=[['makerCode','メーカー品番'],['makerName','メーカー商品名'],['selfCode','自社コード'],['spec','規格'],['currentCost','現単価'],['newCost','新単価'],['switchDate','切替日']];
+const MANUAL_ROWS0=5;
+function manualRowCount(){ return $('#manualTbl').querySelectorAll('tbody tr').length; }
+function manualRowHtml(r){
+  return '<tr>'+MANUAL_COLS.map((c,ci)=>'<td><input data-mr="'+r+'" data-mc="'+ci+'" style="width:120px;border:1px solid #d4dae2;background:#fff" '+((c[0]==='currentCost'||c[0]==='newCost')?'inputmode="decimal"':'')+'></td>').join('')+'</tr>';
+}
+function renderManual(){
+  let h='<thead><tr>'+MANUAL_COLS.map(c=>'<th style="white-space:nowrap">'+esc(c[1])+((c[0]==='makerName'||c[0]==='newCost')?' <span style="color:#c0392b">*</span>':'')+'</th>').join('')+'</tr></thead><tbody>';
+  for(let r=0;r<MANUAL_ROWS0;r++) h+=manualRowHtml(r);
+  h+='</tbody>';
+  $('#manualTbl').innerHTML=h;
+}
+function addManualRow(){
+  const tb=$('#manualTbl').querySelector('tbody'); if(!tb) return;
+  const tmp=document.createElement('tbody'); tmp.innerHTML=manualRowHtml(manualRowCount());
+  tb.appendChild(tmp.firstChild);
+}
+function manualToGrid(){
+  const rows=[];
+  $('#manualTbl').querySelectorAll('tbody tr').forEach(tr=>{
+    const vals=MANUAL_COLS.map(()=>'');
+    tr.querySelectorAll('input').forEach(inp=>{ vals[+inp.dataset.mc]=inp.value.trim(); });
+    if(vals.some(v=>v!=='')) rows.push(vals);
+  });
+  return rows;
+}
+function applyManual(){
+  const data=manualToGrid();
+  if(!data.length){ $('#manualMsg').style.color='#c0392b'; $('#manualMsg').textContent='入力された行がありません'; return; }
+  const header=MANUAL_COLS.map(c=>c[1]);
+  $('#hasHeader').checked=true;
+  suppressProfile=true;          // 手入力＝固定レイアウト。保存済み書式での列上書きを抑止。
+  loadRows([header].concat(data));
+  $('#manualMsg').style.color='#2e7d32';
+  $('#manualMsg').textContent='✓ '+data.length+'件を下の③に反映しました。内容を確認して「保存」してください。';
+  const ma=$('#mapArea'); if(ma) ma.scrollIntoView({behavior:'smooth',block:'start'});
+}
+$('#manualToggle').addEventListener('click',()=>{
+  if($('#manualToggle').disabled) return;
+  const a=$('#manualArea'); const open=(a.style.display==='none'||!a.style.display);
+  a.style.display=open?'block':'none';
+  $('#manualToggle').textContent=open?'✕ 手入力をとじる':'✏ 手入力をひらく';
+  if(open && !$('#manualTbl').innerHTML) renderManual();
+});
+$('#manualAddBtn').addEventListener('click',addManualRow);
+$('#manualApplyBtn').addEventListener('click',applyManual);
+// 最終行に入力したら自動で1行追加（行が足りなくならないように）
+$('#manualTbl').addEventListener('input',(e)=>{
+  const inp=e.target; if(!inp.dataset||inp.dataset.mr==null) return;
+  if(+inp.dataset.mr===manualRowCount()-1 && inp.value.trim()!=='') addManualRow();
+});
+
 $('#parseBtn').addEventListener('click',parse);
 $('#supplierSel').addEventListener('change',onSupplierPick);
 $('#supplier').addEventListener('input',updateStep2Lock);
-$('#purchaseCodeSel').addEventListener('change',updatePurchaseBadge);
+$('#purchaseCodeSel').addEventListener('change',onPurchaseCodePick);
+$('#advToggle').addEventListener('click',(e)=>{
+  e.preventDefault();
+  const a=$('#advArea'); const open=(a.style.display==='none'||!a.style.display);
+  a.style.display=open?'block':'none';
+  $('#advToggle').textContent=(open?'▾':'▸')+' その他（登録済みから選ぶ／問屋の下のメーカーを分けて登録）';
+});
 $('#skipN').addEventListener('input',applySkipAndRender);
 $('#fileBtn').addEventListener('click',()=>{ if($('#fileBtn').disabled) return; $('#file').click(); });
 $('#file').addEventListener('change',onFilePicked);
@@ -475,7 +602,8 @@ $('#saveBtn').addEventListener('click',async()=>{
         extra=' ／ ⚠ 自動照合に失敗しました（'+(res.shogo.error||'')+'）。シミュレーション画面の「↻ 照合を実行」を押してください。';
         $('#msg').style.color='#b8860b';
       }
-      $('#msg').textContent='✓ 保存しました（'+res.count+'件）。この仕入先の書式（列の対応）を登録しました。次回からは自動で当てはまります。 → '+res.file+extra;
+      const linkMsg=(res.linkedCount>0)?' ／ 📌 自社コード入力 '+res.linkedCount+'件を手動紐付け（100%確定）として登録しました。':'';
+      $('#msg').textContent='✓ 保存しました（'+res.count+'件）。この仕入先の書式（列の対応）を登録しました。次回からは自動で当てはまります。 → '+res.file+linkMsg+extra;
       // 直近の保存内容を現在のプロファイルにも反映（再表示）
       activeProfile={ map:{...map}, delim:$('#delim').value, hasHeader:$('#hasHeader').checked };
       showProfSummary();

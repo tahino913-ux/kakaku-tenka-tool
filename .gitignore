@@ -13,6 +13,10 @@ output/
 maker_quotes/
 settings.json
 損益.csv
+発行履歴.json
+# 販売大臣 単価履歴の取込/サンプルCSV(実コードを含む)
+売上履歴tesuto.csv
+*履歴tesuto.csv
 
 # --- チャットログ(会話履歴・個人情報) ---
 _chatlogs/

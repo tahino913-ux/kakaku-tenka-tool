@@ -50,6 +50,8 @@ function getSettings() {
     // 自社販売実績ファイルの取込ルール（列の役割・階層セルの分解規則）
     //  画面で設定して保存。hanbai.js のパースに反映される。
     selfProfile:    u.selfProfile || null,
+    // 任意のアクセスパスワード（共用PC向け簡易ロック）。空＝認証なし（既定）。
+    accessPassword: u.accessPassword || '',
   };
 }
 
@@ -70,6 +72,7 @@ function saveSettings(patch) {
     productLinks:   patch.productLinks !== undefined ? patch.productLinks : (cur.productLinks || {}),
     suppliers:      patch.suppliers !== undefined ? patch.suppliers : (cur.suppliers || {}),
     selfProfile:    patch.selfProfile !== undefined ? patch.selfProfile : (cur.selfProfile || null),
+    accessPassword: patch.accessPassword !== undefined ? patch.accessPassword : (cur.accessPassword || ''),
     _savedAt:       new Date().toISOString(),
   };
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2), 'utf8');

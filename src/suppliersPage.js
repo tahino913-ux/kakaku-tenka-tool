@@ -39,6 +39,13 @@ const SUPPLIERS_PAGE = `<!doctype html>
   <a href="/self">⚙ 自社データ設定</a>
 </header>
 
+<div class="card" style="background:#eef3fb;border-color:#cdddf3">
+  <div style="font-size:13px;color:#1f4e78;line-height:1.8">
+    ℹ️ <b>照合に使うのは「仕入先コード」と「仕入先名」だけ</b>です。<br>
+    <span style="color:#33405a">電話番号・住所は<b>連絡先メモ（参考情報）</b>で、メーカー見積の取込・照合・見積書には一切影響しません（メーカーへ価格確認の連絡をするとき用）。</span>
+  </div>
+</div>
+
 <div class="card">
   <div class="toolbar">
     <label>① ファイル選択
@@ -69,7 +76,7 @@ const SUPPLIERS_PAGE = `<!doctype html>
   <div id="currentSum" class="hint" style="margin-bottom:6px">読込中…</div>
   <div style="max-height:400px;overflow:auto">
     <table id="currentTbl">
-      <thead><tr><th>仕入先コード</th><th>仕入先名</th><th>電話番号</th><th>住所</th></tr></thead>
+      <thead><tr><th>仕入先コード</th><th>仕入先名</th><th>電話番号<span class="muted">（参考）</span></th><th>住所<span class="muted">（参考）</span></th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -113,7 +120,7 @@ function renderPreview(map) {
   $('#previewCard').style.display = '';
   const keys = Object.keys(map).sort();
   $('#previewSum').textContent = keys.length + '件の仕入先を検出（保存ボタンで settings.json に書き込み）';
-  const thead = $('#previewTbl thead'); thead.innerHTML = '<tr><th>仕入先コード</th><th>仕入先名</th><th>電話番号</th><th>住所</th></tr>';
+  const thead = $('#previewTbl thead'); thead.innerHTML = '<tr><th>仕入先コード</th><th>仕入先名</th><th>電話番号（参考）</th><th>住所（参考）</th></tr>';
   const tb = $('#previewTbl tbody'); tb.innerHTML = '';
   for (const k of keys.slice(0, 50)) {
     const v = map[k] || {};
