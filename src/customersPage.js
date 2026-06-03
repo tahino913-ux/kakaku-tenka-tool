@@ -123,8 +123,11 @@ const CUSTOMERS_PAGE = `<!doctype html>
   <h1>👥 得意先別 商品一覧</h1>
   <span class="sub">得意先を選ぶと、その得意先が買う全商品（複数メーカーまたがり）を表示</span>
   <span class="spacer"></span>
-  <a href="/">← シミュレーション画面へ</a>
+  <a href="/">← シミュレーション</a>
   <a href="/list">📊 一覧・進捗</a>
+  <a href="/import">＋ メーカー見積取込</a>
+  <a href="/suppliers">📒 仕入先マスタ</a>
+  <a href="/self">🗂 自社データ設定</a>
 </header>
 
 <div class="toolbar">
@@ -188,16 +191,10 @@ const CUSTOMERS_PAGE = `<!doctype html>
 </div>
 <div id="exportResult" style="display:none"></div>
 
-<div class="exportbar" id="hanbaiBar" style="background:#eef3fb;border-color:#cdddf3">
-  <b style="color:#1f4e78">📥 販売大臣へ取込</b>
-  <label style="font-size:12px;color:#33405a">実施日が <input type="date" id="hanbaiCutoff" style="font:inherit;padding:4px 6px;border:1px solid #c7ced8;border-radius:6px"> までに到来した</label>
-  <select id="hanbaiScope" style="font:inherit;padding:4px 6px;border:1px solid #c7ced8;border-radius:6px">
-    <option value="all">改定すべて</option>
-    <option value="issued">発行済みの得意先だけ</option>
-  </select>
-  <button class="exp" id="hanbaiExportBtn" style="background:#2e6b3e">単価履歴CSVをダウンロード</button>
-  <span class="exphint">実施日が来た価格改定を、販売大臣の「単価履歴」取込用CSV（Shift_JIS）にします。消費税区分・税率表№はDBから自動付与。既定は改定すべて（発行の有無を問わず）。</span>
-  <span id="hanbaiMsg" class="muted"></span>
+<div class="exportbar" id="hanbaiMoved" style="background:#f3f5f8;border-color:#d8dee6;color:#55606e;font-size:12.5px">
+  📦 <b>基幹システム（販売大臣）への取込CSV</b>（単価履歴＝売価／仕入原価）は、
+  <a href="/" style="color:#2f6fb0;font-weight:700">シミュレーション画面の「📅 実施日カレンダー」</a>
+  に移動しました（実施日が来た分をその場でダウンロードできます）。
 </div>
 
 <div class="gate-overlay" id="gateOverlay">
@@ -652,29 +649,7 @@ $('#search').addEventListener('input',applyFilter);
 $('#resetIssuedBtn').addEventListener('click',resetAllIssued);
 $('#exportAllBtn').addEventListener('click',()=>exportFlow('all'));
 $('#exportOneBtn').addEventListener('click',()=>exportFlow('one'));
-// 販売大臣 単価履歴CSV（実施日到来分）のダウンロード
-(function(){
-  const p=n=>String(n).padStart(2,'0');
-  const today=()=>{const d=new Date();return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());};
-  const hc=$('#hanbaiCutoff'); if(hc&&!hc.value) hc.value=today();
-  $('#hanbaiExportBtn').addEventListener('click',async()=>{
-    const cutoff=($('#hanbaiCutoff').value||today());
-    const issuedOnly = $('#hanbaiScope').value==='issued';
-    const scopeLabel = issuedOnly ? '発行済みの得意先' : '改定すべて';
-    const msg=$('#hanbaiMsg'); msg.style.color='#6b7785'; msg.textContent='確認中…';
-    try{
-      const r=await fetch('/api/hanbai-export-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cutoff,issuedOnly})}).then(x=>x.json());
-      if(!r.ok){ msg.style.color='#c0392b'; msg.textContent='エラー: '+(r.error||''); return; }
-      if(!r.count){ msg.style.color='#b8860b'; msg.textContent='対象なし（'+cutoff+' までに実施日が来た'+(issuedOnly?'発行済みの':'')+'改定行はありません）'; return; }
-      let warn='';
-      if(r.dbError) warn='\\n※ 販売大臣DBに接続できなかったため、消費税区分／税率表№は標準値(2／1)で出力します。';
-      else if(r.missingTax) warn='\\n※ '+r.missingTax+' 件はDBに商品が見つからず、消費税は標準値(2／1)で出力します。';
-      if(!confirm(cutoff+' までに実施日が到来した改定（'+scopeLabel+'）'+r.count+' 行 / '+r.customerCount+' 得意先 を、販売大臣の単価履歴取込CSVとして出力します。'+warn+'\\n\\nダウンロードしますか？')){ msg.textContent=''; return; }
-      msg.style.color='#2e7d32'; msg.textContent='✓ ダウンロードしました（'+r.count+' 行 / '+r.customerCount+' 得意先）。販売大臣の「単価履歴」取込で読み込んでください。';
-      window.location='/api/hanbai-export?cutoff='+encodeURIComponent(cutoff)+(issuedOnly?'&issuedOnly=1':'');
-    }catch(e){ msg.style.color='#c0392b'; msg.textContent='通信に失敗しました: '+e; }
-  });
-})();
+// 基幹システム取込CSV（単価履歴／仕入原価）のダウンロードは sim 画面の「📅 実施日カレンダー」へ移動した。
 $('#gateClose').addEventListener('click',closeGate);
 $('#gateBack').addEventListener('click',closeGate);
 $('#gateIssue').addEventListener('click',()=>{ if(gateOpts) doIssue(gateOpts); });
@@ -688,7 +663,21 @@ $('#cRound').addEventListener('change',load);
   el.addEventListener('change',load);
   el.addEventListener('keydown',e=>{ if(e.key==='Enter') load(); });
 });
-(async()=>{ await initControls(); await loadIssueLog(); load(); })();
+(async()=>{
+  await initControls(); await loadIssueLog(); await load();
+  // メイン表の得意先リンク（/customers?customer=...）で来たら、その得意先を選択して表示。
+  try{
+    const want=new URLSearchParams(location.search).get('customer');
+    if(want){
+      if(DATA.find(x=>x.name===want)){
+        selectCust(want);
+        const sel=$('#listCol .cust.sel'); if(sel) sel.scrollIntoView({block:'center'});
+      } else {
+        $('#msg').textContent='「'+want+'」は現在の改定対象に見つかりませんでした（実施日・照合の結果に含まれていない可能性）。';
+      }
+    }
+  }catch(e){}
+})();
 </script>
 </body></html>`;
 

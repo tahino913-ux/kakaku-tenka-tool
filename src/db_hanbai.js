@@ -97,13 +97,15 @@ function runQueryToCsv(dbCfg, sql) {
   fs.writeFileSync(paramFile, [server, database, sqlFile, outFile].join('\n'), 'utf8');
 
   const q = (p) => p.replace(/\\/g, '\\\\'); // TEMP配下=ASCII。.ps1内Windowsパス用
-  // ⚠ 読み取り専用。Application Intent=ReadOnly を付け、SELECT 以外は発行しない。
+  // ⚠ 読み取り専用。安全の本体は「SELECT 以外を一切発行しない」こと。
+  //   加えて ApplicationIntent=ReadOnly を意思表示として付与（スタンドアロンSQL Serverでは無視され
+  //   書込み阻止効果は無いが、可用性グループ等では読み取りルーティングされる多層防御）。
   const script =
     "$ErrorActionPreference='Stop'\n" +
     "$p=[System.IO.File]::ReadAllLines('" + q(paramFile) + "',[System.Text.Encoding]::UTF8)\n" +
     "$server=$p[0]; $db=$p[1]; $sqlf=$p[2]; $outf=$p[3]\n" +
     "$sql=[System.IO.File]::ReadAllText($sqlf,[System.Text.Encoding]::UTF8)\n" +
-    "$cs=\"Server=$server;Database=$db;Integrated Security=SSPI;TrustServerCertificate=True;Encrypt=False;Connect Timeout=15;Application Name=PriceTool-ReadOnly\"\n" +
+    "$cs=\"Server=$server;Database=$db;Integrated Security=SSPI;TrustServerCertificate=True;Encrypt=False;Connect Timeout=15;ApplicationIntent=ReadOnly;Application Name=PriceTool-ReadOnly\"\n" +
     "$cn=New-Object System.Data.SqlClient.SqlConnection $cs\n" +
     "$cn.Open()\n" +
     "try {\n" +

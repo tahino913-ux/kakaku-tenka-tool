@@ -29,6 +29,7 @@ const { loadCsv } = require('./csv');
 const { xlsToCsv } = require('./xls2csv');
 const { priceRowAnomaly } = require('./anomaly');
 const { buildHanbaiCsv } = require('./hanbai_export');
+const { buildCostCsv } = require('./cost_export');
 const os = require('os');
 
 const RATE_CAUTION_PCT = 30; // 値上率がこの%以上の行は sim で黄色く注意表示（除外はしない・調整可）
@@ -415,6 +416,105 @@ function impactAllSuppliers(body) {
     supplierCount: perSupplier.filter((p) => !p.error).length, rowCount, withQty,
     perSupplier,
   };
+}
+
+// 二重登録検知：同じ自社商品コードが複数の仕入先（最新照合結果）にまたがって一致登録されていないか。
+//  例: 修正見積を別の仕入先名で取り込むと、同じ商品が2仕入先に出て損益/見積/CSVが二重になる。
+//  戻り値: [{ code, name, suppliers:[...], prices:{supplier:newCost} }]（2仕入先以上に出た商品だけ）。
+function crossSupplierDupCheck() {
+  const files = listLatestCsv();
+  const byCode = new Map(); // 自社CD -> { name, prices:{仕入先:新仕入} }
+  for (const f of files) {
+    const sup = String(f).split('_照合結果_')[0];
+    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    const seen = new Set(); // 同一ファイル内の同一コードは1回（得意先が複数でも1商品）
+    for (const r of recs) {
+      if (!/^[✓📌]/.test(r['照合'] || '')) continue;         // 一致行のみ（✓=CD/名前一致・📌=手動紐付け）
+      const code = String(r['販売実績商品コード'] || '').trim();
+      if (!code || seen.has(code)) continue; seen.add(code);
+      if (!byCode.has(code)) byCode.set(code, { name: String(r['販売実績商品名'] || '').replace(/\s+/g, ' ').slice(0, 28), prices: {} });
+      const e = byCode.get(code); if (e.prices[sup] == null) e.prices[sup] = r['新仕入単価'];
+    }
+  }
+  const dups = [];
+  for (const [code, e] of byCode) {
+    const sups = Object.keys(e.prices);
+    if (sups.length > 1) dups.push({ code, name: e.name, suppliers: sups, prices: e.prices });
+  }
+  dups.sort((a, b) => String(a.code).localeCompare(String(b.code)));
+  return dups;
+}
+
+// 紐付けモーダル用：指定仕入先の「メーカー商品名の候補」と既存の手動紐付けを返す。
+//  実施日フィルタ（横断）ビューでは行ごとに仕入先が違うので、行の仕入先でこれを引いて候補を出す。
+function linkContext(supplier) {
+  const sup = String(supplier || '').trim();
+  const links = (getProductLinks()[sup]) || {};
+  const names = new Set();
+  if (sup) {
+    for (const f of listLatestCsv()) {
+      if (String(f).split('_照合結果_')[0] !== sup) continue;
+      let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+      for (const r of recs) {
+        const nm = String(r['メーカー商品名'] || '').trim();
+        if (nm && nm !== '【販売実績なし or 商品名不一致】') names.add(nm);
+      }
+    }
+  }
+  return { ok: true, supplier: sup, makerNames: [...names].sort((a, b) => a.localeCompare(b, 'ja')), links };
+}
+
+// 行配列から損益サマリを作る（calcAll の summary と同じ式）。calc-by-date 用。
+function summarizeRows(rows) {
+  let totalCostImpact = 0, totalSellImpact = 0, sumCurSales = 0, sumCurProfit = 0, sumNewSales = 0, sumNewProfit = 0, withQty = 0, estimated = 0;
+  for (const r of rows) {
+    if (fin(r.annualCostImpact)) totalCostImpact += r.annualCostImpact;
+    if (fin(r.annualSellImpact)) totalSellImpact += r.annualSellImpact;
+    if (fin(r.qty) && r.qty > 0) {
+      withQty++;
+      if (r.qtySource === 'estimated') estimated++;
+      if (fin(r.annualSellCurrent)) { sumCurSales += r.annualSellCurrent; sumCurProfit += (r.currentSell - r.currentCost) * r.qty; }
+      if (fin(r.annualSellNew)) { sumNewSales += r.annualSellNew; sumNewProfit += (r.newSell - r.newCost) * r.qty; }
+    }
+  }
+  return {
+    count: rows.length, withQty, estimated,
+    totalCostImpact, totalSellImpact, net: totalSellImpact - totalCostImpact,
+    avgCurMargin: sumCurSales > 0 ? (sumCurProfit / sumCurSales) * 100 : NaN,
+    avgNewMargin: sumNewSales > 0 ? (sumNewProfit / sumNewSales) * 100 : NaN,
+    totalSellNow: sumCurSales, totalSellNew: sumNewSales,
+  };
+}
+
+// 実施日で全仕入先 横断に絞り込んだ「通常の表」用の行＋サマリ。
+//  date=YYYY-MM-DD。各仕入先 最新CSVを全体方針で計算し、提出対象（一致）かつ
+//  実施日(正規化ISO)が一致する行だけを集めて返す（読み取り専用の横断ビュー）。
+function calcByDate(body) {
+  const date = String((body && body.date) || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { ok: false, error: '日付が不正です' };
+  const rule = body && body.rule ? body.rule : { type: 'add_increase' };
+  const rounding = body && body.rounding ? body.rounding : getSettings().rounding;
+  const selfUplift = body ? body.selfUplift : 0;
+  const files = listLatestCsv();
+  const rows = [];
+  const supSet = new Set();
+  for (const f of files) {
+    let res;
+    try { res = calcAll({ file: f, rule, rounding, selfUplift }); } catch (e) { continue; }
+    const sup = res.supplier || String(f).split('_照合結果_')[0] || '';
+    for (const r of (res.rows || [])) {
+      if (!r.customerName || r.customerName === '-' || /未一致/.test(r.matchStatus || '')) continue; // 休眠/未一致は除外
+      const eff = normDateInput(r.effectiveDate || r.switchDate || '');
+      if (eff !== date) continue;
+      rows.push(Object.assign({ supplier: sup }, r)); // 行に仕入先を付与（横断ビューで表示）
+      supSet.add(sup);
+    }
+  }
+  // 仕入先→得意先→商品名で安定ソート
+  rows.sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
+    String(a.customerName).localeCompare(String(b.customerName), 'ja') ||
+    String(a.productName).localeCompare(String(b.productName), 'ja'));
+  return { ok: true, date, rows, summary: summarizeRows(rows), count: rows.length, supplierCount: supSet.size };
 }
 
 // ---- 実施日カレンダー（全仕入先 横断）の集計 ---------------------------
@@ -1097,6 +1197,38 @@ function buildHanbaiExport(cutoffIso, issuedOnly) {
   return { buffer, count, skipped, customerCount, missingTax, dbError, total: lines.length };
 }
 
+// 仕入先単価（新原価）更新CSV：実施日が到来した照合済み商品の「新仕入原価」を商品コードで1件に集約。
+//  コストは得意先に依らず同じなので商品単位（同一商品は実施日が新しい方を採用）。
+//  発行(得意先見積)の有無は問わない＝メーカー見積照合で価格改定が確定した分すべてを基幹システムへ反映する。
+//  新原価 = メーカー見積の新仕入単価(newCost)。自社上乗せ%は売価側にしか効かないので実際に払う仕入額そのもの。
+function collectCostUpdateLines(cutoffIso) {
+  const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(String(cutoffIso || '')) ? cutoffIso : null;
+  const { byCustomer } = buildCustomerCandidates({});
+  const byProduct = new Map(); // 商品コード -> line（実施日が新しい方）
+  for (const [, sp] of byCustomer) {
+    for (const it of sp.keep) {
+      const eff = String(it.effectiveDate || '');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;     // 実施日がISOで取れない行は対象外
+      if (cutoff && eff > cutoff) continue;                // まだ実施日が来ていない行は除外
+      const pc = String(it.productCode || '').trim();
+      if (!pc) continue;                                   // 商品コードが無い行は取込不可
+      if (!(Number(it.newCost) > 0)) continue;             // 新仕入原価が無い/0は除外
+      const line = { productCode: pc, newCost: it.newCost, effectiveDate: eff, productName: it.productName, supplier: it.supplier };
+      const prev = byProduct.get(pc);
+      if (!prev || eff > prev.effectiveDate) byProduct.set(pc, line); // 同一商品は実施日が新しい方
+    }
+  }
+  const lines = [...byProduct.values()];
+  return { lines, productCount: lines.length };
+}
+
+// 上の行 → 2列CSV(商品コード,新原価・Shift_JIS)バッファ等を返す。DBは不要（コストは照合結果から取れる）。
+function buildCostExport(cutoffIso) {
+  const { lines, productCount } = collectCostUpdateLines(cutoffIso);
+  const { buffer, count, skipped } = buildCostCsv(lines);
+  return { buffer, count, skipped, productCount, total: lines.length };
+}
+
 // ---- HTTP ----------------------------------------------------------
 function sendJson(res, code, obj) {
   const buf = Buffer.from(JSON.stringify(obj), 'utf8');
@@ -1162,6 +1294,10 @@ const server = http.createServer(async (req, res) => {
     if (!isLocalHostHeader(req.headers.host) || !isLocalOrigin(req.headers.origin)) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('forbidden: このツールはローカル(localhost)からのみ利用できます');
+    }
+    // 死活確認（起動時の二重起動防止に使う）。ローカル限定・パスワード不要・機微情報なし。
+    if (url === '/api/ping') {
+      return sendJson(res, 200, { ok: true, app: 'kakaku-tenka-sim' });
     }
     // #2 アクセスパスワード（settings.accessPassword が設定されている場合のみ）
     const accessPw = String((getSettings().accessPassword) || '').trim();
@@ -1438,6 +1574,37 @@ const server = http.createServer(async (req, res) => {
         return res.end('export error: ' + String(e && e.message || e));
       }
     }
+    // 仕入先単価（新原価）更新CSV：件数の事前確認（ダウンロード前にユーザへ提示）
+    if (req.method === 'POST' && url === '/api/cost-export-check') {
+      const body = await readBody(req);
+      try {
+        const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(String(body && body.cutoff)) ? body.cutoff : todayIso();
+        const r = buildCostExport(cutoff);
+        return sendJson(res, 200, { ok: true, cutoff, count: r.count, productCount: r.productCount, skipped: r.skipped });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    // 仕入先単価（新原価）更新CSV：ダウンロード（Shift_JIS）。GETナビゲーションで添付ダウンロード。
+    if (req.method === 'GET' && url === '/api/cost-export') {
+      try {
+        let cutoff = todayIso();
+        const qi = req.url.indexOf('?');
+        if (qi >= 0) { const sp = new URLSearchParams(req.url.slice(qi + 1)); const c = sp.get('cutoff'); if (/^\d{4}-\d{2}-\d{2}$/.test(String(c))) cutoff = c; }
+        const r = buildCostExport(cutoff);
+        const fnAscii = 'shiire_genka_' + cutoff + '.csv';
+        const fnJp = '仕入原価更新_' + cutoff + '.csv';
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=Shift_JIS',
+          'Content-Disposition': 'attachment; filename="' + fnAscii + '"; filename*=UTF-8\'\'' + encodeURIComponent(fnJp),
+          'Content-Length': r.buffer.length,
+        });
+        return res.end(r.buffer);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('export error: ' + String(e && e.message || e));
+      }
+    }
     if (req.method === 'GET' && url === '/api/makers') {
       return sendJson(res, 200, { makers: getMakers() });
     }
@@ -1462,6 +1629,14 @@ const server = http.createServer(async (req, res) => {
         try {
           const outFiles = runShogo(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
           saved.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)) };
+          // 二重登録の検知：取り込んだ仕入先と「別の仕入先」に同じ自社商品が出ていないか。
+          //  例: 修正見積を違う仕入先名で取り込むと、同じ商品が2仕入先に出て二重になる。
+          try {
+            const mySup = String((body && body.supplier) || '').trim();
+            const all = crossSupplierDupCheck();
+            const mine = all.filter((d) => d.suppliers.indexOf(mySup) >= 0);
+            if (mine.length) saved.dupWarning = { count: mine.length, supplier: mySup, items: mine.slice(0, 8) };
+          } catch (_) { /* 検知失敗は無視（保存は成功） */ }
         } catch (e) {
           saved.shogo = { ok: false, error: String(e && e.message || e) };
         }
@@ -1503,6 +1678,19 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       return sendJson(res, 200, impactAllSuppliers(body));
     }
+    if (req.method === 'POST' && url === '/api/calc-by-date') {
+      const body = await readBody(req);
+      try { return sendJson(res, 200, calcByDate(body)); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    if (req.method === 'GET' && url === '/api/dup-check') {
+      try { return sendJson(res, 200, { ok: true, dups: crossSupplierDupCheck() }); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), dups: [] }); }
+    }
+    if (req.method === 'GET' && url === '/api/link-context') {
+      try { const sp = new URLSearchParams(req.url.split('?')[1] || ''); return sendJson(res, 200, linkContext(sp.get('supplier') || '')); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
     if (req.method === 'POST' && url === '/api/export') {
       const body = await readBody(req);
       const result = exportQuotes(body);
@@ -1517,6 +1705,26 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// 既定ブラウザでURLを開く（OS別）。
+function openBrowser(urlStr) {
+  if (process.platform === 'win32') exec(`start "" "${urlStr}"`);
+  else if (process.platform === 'darwin') exec(`open "${urlStr}"`);
+  else exec(`xdg-open "${urlStr}"`);
+}
+// 指定ポートで「このツールのサーバが既に動いているか」を死活確認（/api/ping が app名を返すか）。
+function probeOurServer(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port, path: '/api/ping', timeout: 1000 }, (res) => {
+      let d = ''; res.on('data', (c) => { d += c; }); res.on('end', () => {
+        try { const j = JSON.parse(d); resolve(!!(j && j.app === 'kakaku-tenka-sim')); }
+        catch (_) { resolve(false); }
+      });
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+  });
+}
+
 function listen(port) {
   server.once('error', (e) => {
     if (e.code === 'EADDRINUSE' && port < PORT_START + 20) listen(port + 1);
@@ -1526,10 +1734,26 @@ function listen(port) {
     const urlStr = `http://localhost:${port}`;
     console.log('=== 価格転嫁シミュレーション ===');
     console.log('ブラウザで開きます: ' + urlStr);
+    if (port === PORT_START) console.log('※ ブックマーク用URL（次回からこれを開けばOK）: ' + urlStr);
+    else console.log('※ ' + PORT_START + ' が使用中だったため ' + port + ' で起動しました（古いウィンドウを閉じて開き直すと ' + PORT_START + ' に戻ります）。');
     console.log('（終了するにはこの画面で Ctrl+C）');
-    if (process.platform === 'win32') exec(`start "" "${urlStr}"`);
-    else if (process.platform === 'darwin') exec(`open "${urlStr}"`);
+    openBrowser(urlStr);
   });
+}
+
+// 既に起動済みなら二重起動せず、その画面(:8765)をブラウザで開くだけ。未起動なら 8765 で起動。
+//  → ポートが固定されるので、ブックマーク(http://localhost:8765)が毎回確実に効く。
+async function startOrReuse() {
+  const urlStr = `http://localhost:${PORT_START}`;
+  const alreadyRunning = await probeOurServer(PORT_START);
+  if (alreadyRunning) {
+    console.log('✓ すでに起動しています。その画面をブラウザで開きました: ' + urlStr);
+    console.log('（二重には起動しません。このウィンドウは閉じて構いません。終了はもとのウィンドウで Ctrl+C）');
+    openBrowser(urlStr);
+    setTimeout(() => process.exit(0), 600); // ブラウザ起動コマンドを投げてから終了
+    return;
+  }
+  listen(PORT_START);
 }
 
 // 直接 `node src/server.js` で起動したときだけサーバを立てる（テスト時は require のみ）
@@ -1538,7 +1762,7 @@ if (require.main === module) {
   //  （1回のエラーで全停止すると、以降すべての操作が「Failed to fetch」になるのを防ぐ）
   process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e && e.stack || e); });
   process.on('unhandledRejection', (e) => { console.error('[unhandledRejection]', e && e.stack || e); });
-  listen(PORT_START);
+  startOrReuse();
 }
 
 module.exports = { calcAll, impactAllSuppliers, exportQuotes, saveMakerQuote, server };
@@ -1595,6 +1819,7 @@ const PAGE = `<!doctype html>
   td.ratewarn{ background:#fff4d6 !important; color:#9a6a00; font-weight:700; cursor:help; }
   #priceAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fdecea; border:1px solid #f5b7b1; color:#922b21; font-size:13px; }
   #rateAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fff4d6; border:1px solid #f0d090; color:#7a5200; font-size:13px; }
+  #dupAlert{ margin:8px 0; padding:9px 12px; border-radius:8px; background:#fdeede; border:1px solid #e6b87a; color:#8a4b12; font-size:13px; line-height:1.7; }
   .jumphint{ display:inline-block; margin-left:8px; padding:1px 8px; border-radius:10px; background:rgba(0,0,0,.08); font-weight:700; white-space:nowrap; }
   tr.flashrow{ animation:flashrow 1.4s ease-out 1; }
   @keyframes flashrow{ 0%{ background:#ffe08a; } 60%{ background:#fff3c4; } 100%{ background:transparent; } }
@@ -1642,6 +1867,7 @@ const PAGE = `<!doctype html>
   #calPanel .cnav button{ background:#eaf1f8; color:var(--accent); border:none; border-radius:8px; padding:5px 11px; font-weight:700; cursor:pointer; font-size:14px; }
   #calPanel .cnav button:hover{ background:#dbe8f5; }
   #calPanel .cnav .cmonth{ font-weight:800; font-size:15px; min-width:120px; text-align:center; }
+  #calPanel #calNavRow{ margin-left:0; padding:12px 20px 0; }
   #calPanel .cclose{ margin-left:auto; background:#fff; border:1px solid #cdd7e1; border-radius:8px; padding:5px 13px; font-weight:700; cursor:pointer; color:#5a6b7a; font-size:13px; }
   #calBody.collapsed{ display:none; }
   #calChips{ display:flex; flex-wrap:wrap; gap:8px; padding:12px 20px 0; }
@@ -1666,7 +1892,12 @@ const PAGE = `<!doctype html>
   .calcell.has.today .dn{ background:#e0392c; }
   .calcell.has.today .cnt{ background:#e0392c; }
   .calcell.has.today.sel{ box-shadow:0 0 0 3px #b5231a inset; }
-  #calTodayBanner .tbnr{ margin:12px 20px 0; background:#fdecea; border:1px solid #f3b4ad; color:#a01b10; border-radius:10px; padding:9px 14px; font-size:13px; font-weight:700; }
+  #calTodayBanner .tbnr{ margin:12px 20px 0; background:#fdecea; border:1px solid #f3b4ad; color:#a01b10; border-radius:10px; padding:9px 14px; font-size:13px; font-weight:700; cursor:pointer; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  #calTodayBanner .tbnr:hover{ background:#fbded9; }
+  #calTodayBanner .tbnr .tbtn{ margin-left:auto; background:#c0392b; color:#fff; border-radius:7px; padding:4px 12px; font-size:12.5px; font-weight:800; white-space:nowrap; }
+  #calTodayBanner .tbnr .thint{ margin-left:auto; color:#9a4b42; font-weight:600; font-size:11.5px; }
+  /* 畳んでいるときは当日バナーをより目立たせる（開いて確認を促す） */
+  #calPanel.collapsed #calTodayBanner .tbnr{ margin:10px 18px; box-shadow:0 1px 6px rgba(192,57,43,.18); }
   #calReminder .rbnr{ margin:12px 20px 0; border-radius:10px; padding:9px 14px; font-size:12.5px; display:flex; flex-wrap:wrap; gap:14px; align-items:center; }
   #calReminder .rbnr.warn{ background:#fff7e6; border:1px solid #f0c879; color:#7a5300; }
   #calReminder .rbnr.ok{ background:#eef7ef; border:1px solid #bfe0c4; color:#2e6b35; }
@@ -1674,6 +1905,16 @@ const PAGE = `<!doctype html>
   #calReminder .rtag{ display:inline-block; border-radius:999px; padding:1px 8px; font-size:11px; font-weight:700; margin-right:5px; }
   #calReminder .rtag.w{ background:#f0a800; color:#fff; } #calReminder .rtag.g{ background:#3a9a4a; color:#fff; } #calReminder .rtag.x{ background:#b0b8c0; color:#fff; }
   #calReminder .rgo{ background:#fff; border:1px solid #d8c089; color:#7a5300; border-radius:7px; padding:3px 10px; font-size:11.5px; font-weight:700; cursor:pointer; text-decoration:none; }
+  #calExport{ margin:12px 20px 0; border:1px solid #e3d2bb; background:#fbf6ef; border-radius:10px; padding:10px 14px; font-size:12.5px; }
+  #calExport .cetitle{ font-weight:800; color:#8a5a1f; margin-bottom:7px; }
+  #calExport .cerow{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  #calExport .celine{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:8px; }
+  #calExport .ceop{ color:#6a5a42; font-size:12px; }
+  #calExport .ceop b{ font-weight:800; color:#8a5a1f; }
+  #calExport input[type=date], #calExport select{ font:inherit; padding:4px 6px; border:1px solid #d8c7b2; border-radius:6px; }
+  #calExport .cehint{ margin-top:8px; color:#7a6a52; font-size:11px; line-height:1.6; }
+  .calexpbtn{ color:#fff; border:none; border-radius:7px; padding:6px 12px; font-size:12px; font-weight:700; cursor:pointer; min-width:172px; }
+  .calexpbtn:hover{ filter:brightness(1.08); }
   #calDetail{ border-top:1px solid #e6ecf2; padding:14px 20px 20px; max-height:46vh; overflow:auto; }
   #calDetail h3{ margin:0 0 8px; font-size:14px; color:#33485c; }
   #calDetail table{ width:100%; border-collapse:collapse; font-size:12.5px; }
@@ -1681,6 +1922,7 @@ const PAGE = `<!doctype html>
   #calDetail td{ border-bottom:1px solid #f1f4f7; padding:5px 8px; vertical-align:top; }
   #calDetail tr:hover td{ background:#f8fafc; }
   #calDetail .empty{ color:#9aa6b2; padding:8px 0; }
+  #calDetail .calnote{ background:#eef7ee; border:1px solid #cfe6cf; border-radius:8px; padding:10px 14px; font-size:13px; color:#2e5a2e; }
   #importLink{ margin-left:auto; }
   #importLink:hover, #listLink:hover, #suppliersLink:hover, #selfLink:hover{ background:#dbe8f5; }
   #settingsBtn:hover{ background:#eaf1f8; }
@@ -1713,7 +1955,7 @@ const PAGE = `<!doctype html>
   <a href="/list" id="listLink" style="margin-left:0">📊 一覧・進捗</a>
   <a href="/import" id="importLink" style="margin-left:0">＋ メーカー見積取込</a>
   <a href="/suppliers" id="suppliersLink" style="margin-left:0">📒 仕入先マスタ</a>
-  <a href="/self" id="selfLink" style="margin-left:0">⚙ 自社データ設定</a>
+  <a href="/self" id="selfLink" style="margin-left:0">🗂 自社データ設定</a>
   <button id="settingsBtn">⚙ 設定</button>
 </header>
 
@@ -1774,18 +2016,38 @@ const PAGE = `<!doctype html>
 <section id="calPanel">
   <div class="chead">
     <h2>📅 実施日カレンダー</h2>
-    <div class="cnav">
-      <button id="calPrev" title="前の月">◀</button>
-      <span class="cmonth" id="calMonth"></span>
-      <button id="calNext" title="次の月">▶</button>
-      <button id="calToday" title="今月へ" style="font-size:12px;padding:6px 10px">今月</button>
-    </div>
     <button class="cclose" id="calToggle" title="カレンダーの表示／非表示を切り替え">▲ 畳む</button>
   </div>
   <div id="calTodayBanner"></div>
   <div id="calBody">
     <div id="calReminder"></div>
+    <div id="calExport">
+      <div class="cetitle">🏷 実施日が来た改定を 基幹システム（販売大臣）へ取込</div>
+      <div class="cerow">
+        <label style="color:#5a4630">実施日が <input type="date" id="calCutoff"> までに到来した分</label>
+      </div>
+      <div class="celine">
+        <button id="calHanbaiBtn" class="calexpbtn" style="background:#2e6b3e">📥 単価履歴CSV（売価）</button>
+        <select id="calHanbaiScope" title="単価履歴CSVの対象範囲">
+          <option value="all">改定すべて</option>
+          <option value="issued">発行済みの得意先だけ</option>
+        </select>
+        <span class="ceop">👉 取込先： <b>販売大臣 63→13 データ受入 → 売上履歴 → データ取込</b></span>
+      </div>
+      <div class="celine">
+        <button id="calCostBtn" class="calexpbtn" style="background:#b5742a">🏭 仕入原価CSV</button>
+        <span class="ceop">👉 取込先： <b>販売大臣 63→13 データ受入 → 商品 → データ取込</b></span>
+      </div>
+      <div id="calExpMsg" style="font-size:11.5px;margin-top:7px"></div>
+      <div class="cehint">単価履歴CSV＝得意先×商品の新「販売単価」（11列・税付き・DBから税自動付与）。仕入原価CSV＝商品ごとの新「仕入原価」（商品コード,新原価の2列）。どちらもShift_JIS。範囲セレクトは単価履歴CSVのみ有効。</div>
+    </div>
     <div id="calChips"></div>
+    <div class="cnav" id="calNavRow">
+      <button id="calPrev" title="前の月">◀</button>
+      <span class="cmonth" id="calMonth"></span>
+      <button id="calNext" title="次の月">▶</button>
+      <button id="calToday" title="今月へ" style="font-size:12px;padding:6px 10px">今月</button>
+    </div>
     <div class="calgrid" id="calGrid"></div>
     <div id="calDetail"></div>
   </div>
@@ -1871,6 +2133,12 @@ const PAGE = `<!doctype html>
   </div>
 </div>
 
+<div id="dateFilterBar" style="display:none;margin:8px 0;padding:9px 14px;background:#eef4fb;border:1px solid #c6d8ef;border-radius:8px;font-size:13px;color:#23476e;align-items:center;gap:12px;flex-wrap:wrap">
+  <span id="dateFilterLabel" style="font-weight:700"></span>
+  <span style="color:#5a6b7a;font-size:12px">📅 実施日カレンダーで選んだ改定を表示中（全仕入先・読み取り）。価格を編集したいときは解除して通常表示に戻してください。</span>
+  <button id="dateFilterClear" type="button" style="margin-left:auto;background:#2f6fb0;color:#fff;border:none;border-radius:7px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer">× 解除して通常表示に戻す</button>
+</div>
+<div id="dupAlert" style="display:none"></div>
 <div id="priceAlert"></div>
 <div id="rateAlert"></div>
 <div class="hbar" id="hbar"><div id="hbarInner"></div></div>
@@ -1899,6 +2167,7 @@ const RULE_LABEL = { add_increase:'上乗せ', keep_margin_rate:'粗利維持', 
 let baseRows = [];      // 画面の行構造（ファイル読込時に確定）
 let lastSummary = null; // 直近の集計（選択中ファイルのみ。カード表示に使用）
 let allImpact = null;   // 全仕入先 横断の損益インパクト（損益パネルが ΔC/ΔS に使用）
+let dateFilter = null;  // 実施日カレンダーで選んだ日(YYYY-MM-DD)。非nullの間は「全仕入先・その実施日」読み取り表示。
 let currentSupplier = ''; // 現在表示中の照合結果CSVの仕入先名（productLinks 引き当てに使用）
 let currentLinks = {};    // 現在の仕入先の productLinks（{自社CD: メーカー商品名}）
 let allMakerNames = [];   // 編集モーダルのドロップダウン候補
@@ -1961,6 +2230,15 @@ function buildProdNameHtml(r){
     : '';
   return line1 + line2;
 }
+// 得意先セル。実在の得意先名はリンク化＝クリックでその得意先の得意先別ページを別タブで開く。
+//  未一致/休眠（得意先が「-」や空）はリンクにしない。
+function custCellHtml(r){
+  const nm = r.customerName;
+  if(!nm || nm==='-') return '<td>—</td>';
+  return '<td><a href="/customers?customer='+encodeURIComponent(nm)+'" target="_blank" rel="noopener" '
+    +'title="この得意先の得意先別ページを開く" '
+    +'style="color:#1b6b3a;text-decoration:none;border-bottom:1px dotted #6aa97f">'+esc(nm)+'</a></td>';
+}
 
 async function loadFiles(selectFile){
   const r = await fetch('/api/files').then(x=>x.json());
@@ -1988,8 +2266,60 @@ async function runShogo(){
   finally{ btn.disabled=false; }
 }
 
+// 1行ぶんの <tr> を組み立てて tbody へ。readOnly=true（実施日フィルタの横断ビュー）では
+//  改定後仕入の編集欄・行ルール・紐付けボタンを出さず、仕入先名を商品名の下に小さく添える。
+function buildMainRow(r, i, readOnly){
+  const tr = document.createElement('tr');
+  tr.id='row'+i;
+  if(isUnmatched(r)) tr.className='unmatched';
+  let prodName = buildProdNameHtml(r);
+  if(readOnly && r.supplier) prodName += '<div style="font-size:10px;color:#1f6fb2;margin-top:2px">🏢 '+esc(r.supplier)+'</div>';
+  const costCell = readOnly
+    ? '<td class="r">'+num(r.newCost)+'</td>'
+    : '<td class="r"><input class="num newcost" data-i="'+i+'" type="number" step="0.01" value="'+(Number.isFinite(r.newCost)?r.newCost:'')+'"></td>';
+  const ruleCell = readOnly
+    ? '<td class="c"><span class="hint">—</span></td>'
+    : '<td class="c"><select class="rule-sel rowrule" data-i="'+i+'">'+
+        '<option value="">（全体）</option>'+
+        '<option value="add_increase">上乗せ</option>'+
+        '<option value="keep_margin_rate">粗利維持</option>'+
+        '<option value="markup">掛率</option>'+
+        '<option value="sell_cost_rate">売価×仕入率</option>'+
+        '<option value="keep_sell">据置</option>'+
+      '</select></td>';
+  const linkCell = '<td class="c">'+linkCellHtml(r, i)+'</td>'; // 横断（読み取り）ビューでも紐付けは可能
+  tr.innerHTML =
+    custCellHtml(r)+
+    '<td class="c">'+matchPctCell(r)+'</td>'+
+    '<td>'+prodName+'</td>'+
+    '<td class="r">'+num(r.currentCost)+'</td>'+
+    costCell+
+    '<td class="r" id="ci'+i+'"></td>'+
+    '<td class="r">'+num(r.currentSell)+'</td>'+
+    '<td class="r hi" id="ns'+i+'"></td>'+
+    '<td class="r" id="si'+i+'"></td>'+
+    '<td class="r">'+pct(r.currentMarginRate)+'</td>'+
+    '<td class="r" id="nm'+i+'"></td>'+
+    '<td class="c" id="qt'+i+'"></td>'+
+    '<td class="r" id="aci'+i+'"></td>'+
+    '<td class="r" id="asi'+i+'"></td>'+
+    ruleCell+ linkCell;
+  return tr;
+}
+// baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
+function renderMainRows(readOnly){
+  const tb = $('#tbody'); tb.innerHTML='';
+  baseRows.forEach((r,i)=> tb.appendChild(buildMainRow(r, i, readOnly)));
+  if(!readOnly){
+    tb.querySelectorAll('.newcost').forEach(el=> el.addEventListener('input', debounce(recalc,200)));
+    tb.querySelectorAll('.rowrule').forEach(el=> el.addEventListener('change', recalc));
+  }
+  // 紐付けボタンは読み取り（実施日フィルタ）ビューでも有効（openLinkModal が行の仕入先で処理）
+  tb.querySelectorAll('.linkBtn').forEach(el=> el.addEventListener('click', (e)=> openLinkModal(Number(e.currentTarget.dataset.i))));
+}
 // ファイルを読み込み、表の“構造”を作る（入力欄やルール選択を配置）
 async function loadFile(){
+  clearDateFilter(); // 通常のファイル表示に入る＝実施日フィルタは解除
   $('#msg').textContent='';
   const s = settings();
   const res = await fetch('/api/calc',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -2000,48 +2330,32 @@ async function loadFile(){
   currentLinks = res.productLinks || {};
   allMakerNames = res.makerNames || [];
   currentSuppliers = res.suppliers || {};
-  const tb = $('#tbody'); tb.innerHTML='';
-  baseRows.forEach((r,i)=>{
-    const tr = document.createElement('tr');
-    tr.id='row'+i;
-    if(isUnmatched(r)) tr.className='unmatched';
-    // 商品名セル: 2行表示で「自社」と「メーカー」の対応を一目で確認できるようにする。
-    //  [自社CD] 自社商品名(コア) #仕入先商品コード
-    //    └メーカー: [メーカーCD] メーカー商品名 [一致率]
-    const prodName = buildProdNameHtml(r);
-    tr.innerHTML =
-      '<td>'+esc(r.customerName||'—')+'</td>'+
-      '<td class="c">'+matchPctCell(r)+'</td>'+
-      '<td>'+prodName+'</td>'+
-      '<td class="r">'+num(r.currentCost)+'</td>'+
-      '<td class="r"><input class="num newcost" data-i="'+i+'" type="number" step="0.01" value="'+(Number.isFinite(r.newCost)?r.newCost:'')+'"></td>'+
-      '<td class="r" id="ci'+i+'"></td>'+
-      '<td class="r">'+num(r.currentSell)+'</td>'+
-      '<td class="r hi" id="ns'+i+'"></td>'+
-      '<td class="r" id="si'+i+'"></td>'+
-      '<td class="r">'+pct(r.currentMarginRate)+'</td>'+
-      '<td class="r" id="nm'+i+'"></td>'+
-      '<td class="c" id="qt'+i+'"></td>'+
-      '<td class="r" id="aci'+i+'"></td>'+
-      '<td class="r" id="asi'+i+'"></td>'+
-      '<td class="c"><select class="rule-sel rowrule" data-i="'+i+'">'+
-        '<option value="">（全体）</option>'+
-        '<option value="add_increase">上乗せ</option>'+
-        '<option value="keep_margin_rate">粗利維持</option>'+
-        '<option value="markup">掛率</option>'+
-        '<option value="sell_cost_rate">売価×仕入率</option>'+
-        '<option value="keep_sell">据置</option>'+
-      '</select></td>'+
-      '<td class="c">'+linkCellHtml(r, i)+'</td>';
-    tb.appendChild(tr);
-  });
-  // 入力イベント
-  tb.querySelectorAll('.newcost').forEach(el=> el.addEventListener('input', debounce(recalc,200)));
-  tb.querySelectorAll('.rowrule').forEach(el=> el.addEventListener('change', recalc));
-  tb.querySelectorAll('.linkBtn').forEach(el=> el.addEventListener('click', (e)=> openLinkModal(Number(e.currentTarget.dataset.i))));
+  renderMainRows(false);
   updateView(res.rows, res.summary);
   syncHScroll();
 }
+// 実施日カレンダーで選んだ日の改定を、全仕入先 横断で表に表示（読み取り）。
+async function loadByDate(dateIso, label){
+  if(!dateIso) return;
+  const s = settings();
+  $('#msg').textContent='';
+  const res = await fetch('/api/calc-by-date',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ date:dateIso, rule:s.rule, rounding:s.rounding, selfUplift:s.selfUplift })}).then(x=>x.json());
+  if(!res.ok){ $('#msg').textContent='エラー: '+(res.error||''); return; }
+  dateFilter = dateIso;
+  baseRows = res.rows; currentSupplier=''; currentLinks={};
+  renderMainRows(true);
+  updateView(res.rows, res.summary);
+  syncHScroll();
+  const lab = label || (function(d){ const p=String(d).split('-'); return Number(p[0])+'年'+Number(p[1])+'月'+Number(p[2])+'日'; })(dateIso);
+  const bar=$('#dateFilterBar');
+  $('#dateFilterLabel').textContent='📅 '+lab+' の改定 '+res.count+'件（全'+res.supplierCount+'仕入先）';
+  bar.style.display='flex';
+  // 表が見えるようにスクロール
+  const w=$('#wrap'); if(w) w.scrollIntoView({behavior:'smooth',block:'start'});
+}
+// 実施日フィルタを解除（表示状態のみ。次の loadFile / loadByDate で実データを描き直す）
+function clearDateFilter(){ dateFilter=null; const b=$('#dateFilterBar'); if(b) b.style.display='none'; }
 
 // 表の上の補助スクロールバーを表の実幅に合わせ、横スクロールが必要なときだけ表示する。
 function syncHScroll(){
@@ -2056,7 +2370,8 @@ function syncHScroll(){
 // 紐付けセルのHTML。確定済(📌)はラベル＋編集ボタン、未確定は淡色の「✏編集」のみ。
 function linkCellHtml(r, i){
   const code = r.productCode || '';
-  const linked = code && currentLinks[code] === r.makerName;
+  // 確定済み判定：現在ファイルの紐付け辞書 or 行のステータスが「📌 手動紐付け」（横断ビューは辞書が空なので後者で判定）
+  const linked = code && (currentLinks[code] === r.makerName || /📌/.test(r.matchStatus||''));
   if (linked) return '<span style="color:#1e7e34;font-weight:600">📌 確定</span> <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
   if (!code) return '<span class="hint">—</span>';
   return '<button class="linkBtn" data-i="'+i+'" style="font-size:11px;color:#6b7785">✏ 紐付け</button>';
@@ -2094,14 +2409,25 @@ function linkDecisiveDiff(selfCore, maker){
 
 // 編集モーダル: 自社CD ⇔ メーカー商品 を選び直す or 解除する
 // 検索/類似度順/決定的トークン警告つきで、007485 のような誤紐付けを防ぐ
-function openLinkModal(idx){
+async function openLinkModal(idx){
   const r = baseRows[idx]; if(!r) return;
-  if (!currentSupplier){ alert('仕入先が確定できないファイルです（紐付けは保存できません）'); return; }
   if (!r.productCode){ alert('自社商品コードが空のため紐付けできません（販売実績側で先に紐付けるか、要確認.xlsx を確認してください）'); return; }
-  const cur = currentLinks[r.productCode] || '';
+  // 仕入先・候補・既存紐付けを決める。実施日フィルタ（全仕入先 横断・読み取り）中は「行の仕入先(r.supplier)」で引く。
+  let supplier, makerNames, links;
+  if (dateFilter){
+    supplier = r.supplier || '';
+    if (!supplier){ alert('この行は仕入先が不明で紐付けできません'); return; }
+    const ctx = await fetch('/api/link-context?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
+    if (!ctx || !ctx.ok){ alert('紐付け候補の取得に失敗しました'); return; }
+    makerNames = ctx.makerNames || []; links = ctx.links || {};
+  } else {
+    if (!currentSupplier){ alert('仕入先が確定できないファイルです（紐付けは保存できません）'); return; }
+    supplier = currentSupplier; makerNames = allMakerNames; links = currentLinks;
+  }
+  const cur = links[r.productCode] || '';
   const selfCore = r.productNameCore || r.productName || '';
   // 候補を類似度でスコアリング・降順ソート
-  const scored = allMakerNames.map((n) => ({ name:n, score:linkSim(selfCore, n) }))
+  const scored = makerNames.map((n) => ({ name:n, score:linkSim(selfCore, n) }))
     .sort((a,b) => b.score - a.score);
 
   const wrap = document.createElement('div');
@@ -2109,7 +2435,7 @@ function openLinkModal(idx){
     '<div id="linkBack" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9000"></div>'+
     '<div id="linkDlg" style="position:fixed;top:6%;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;padding:18px;width:640px;max-width:95%;z-index:9001;box-shadow:0 10px 40px rgba(0,0,0,.2)">'+
       '<h3 style="margin:0 0 12px">📌 商品紐付けの編集</h3>'+
-      '<div style="margin-bottom:6px"><b>仕入先:</b> '+esc(currentSupplier)+'</div>'+
+      '<div style="margin-bottom:6px"><b>仕入先:</b> '+esc(supplier)+'</div>'+
       '<div style="margin-bottom:6px"><b>自社商品:</b> '+esc(r.productCode||'')+' <span style="color:#1f4e78">'+esc(selfCore)+'</span></div>'+
       '<div style="margin-bottom:10px;font-size:12px;color:#6b7785"><b>現在の照合:</b> '+esc(r.matchStatus||'')+' / '+esc(r.makerName||'(未マッチ)')+'</div>'+
       '<div style="margin-bottom:4px"><b>確定するメーカー商品</b> <span style="font-size:11px;color:#6b7785">（自社商品との類似度順。✓=80%以上）</span></div>'+
@@ -2172,16 +2498,17 @@ function openLinkModal(idx){
     const v = sel.value;
     try {
       const res = await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ supplier: currentSupplier, productCode: r.productCode, makerName: v })}).then(x=>x.json());
+        body: JSON.stringify({ supplier: supplier, productCode: r.productCode, makerName: v })}).then(x=>x.json());
       if (!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
       close();
-      await loadFile();
+      if (dateFilter) await loadByDate(dateFilter); else await loadFile(); // 横断ビューはその日を再描画
     } catch (e) { alert('保存に失敗: '+e); }
   });
 }
 
 // 現在の画面値を集めてサーバへ → 計算結果のセルだけ更新
 async function recalc(){
+  if(dateFilter){ await loadByDate(dateFilter); return; } // 実施日フィルタ中は横断ビューを方針変更で取り直す
   const s = settings();
   const rows = baseRows.map((_,i)=>({
     newCost: $('.newcost[data-i="'+i+'"]').value,
@@ -2316,13 +2643,14 @@ function renderPL(){
   const f = parseFloat($('#plUnit').value)||1;
   const toYen = (id)=>{ const v=parseFloat($(id).value); return (Number.isFinite(v)?v:0)*f; };
   const S=toYen('#plSales'), V=toYen('#plVar'), F=toYen('#plFixed'), Fadd=toYen('#plSelfCost');
-  // 全仕入先 合算があればそれを優先。まだ無ければ選択中ファイルの集計で暫定表示。
-  const agg = allImpact || lastSummary;
+  // 実施日フィルタ中は「その日の改定だけ」の集計。通常は全仕入先 合算を優先（無ければ暫定）。
+  const agg = dateFilter ? lastSummary : (allImpact || lastSummary);
   const dC = agg && Number.isFinite(agg.totalCostImpact) ? agg.totalCostImpact : 0; // 年間 仕入増
   const dS = agg && Number.isFinite(agg.totalSellImpact) ? agg.totalSellImpact : 0; // 年間 増収
   const scopeEl = $('#plScope');
   if(scopeEl){
-    if(allImpact) scopeEl.textContent = '＝全 '+allImpact.supplierCount+' 仕入先・数量あり '+allImpact.withQty+' 明細を合算（年間 仕入増 '+yen(dC)+' ／ 増収 '+yen(dS)+'）';
+    if(dateFilter) scopeEl.textContent = '＝実施日 '+dateFilter+' の改定のみ（'+((agg&&agg.count)||0)+'件・数量あり '+((agg&&agg.withQty)||0)+'）：年間 仕入増 '+yen(dC)+' ／ 増収 '+yen(dS);
+    else if(allImpact) scopeEl.textContent = '＝全 '+allImpact.supplierCount+' 仕入先・数量あり '+allImpact.withQty+' 明細を合算（年間 仕入増 '+yen(dC)+' ／ 増収 '+yen(dS)+'）';
     else scopeEl.textContent = '（表示中の照合結果のみで暫定表示。全仕入先の合算を計算中…）';
   }
 
@@ -2355,7 +2683,7 @@ function renderPL(){
 
 // 全体方針(ルール/端数/自社上乗せ%)を変えたら、選択中ファイルの再計算に加えて
 //  全仕入先 合算の損益も取り直す（損益パネルが全商品を反映するように）。
-function recalcAll(){ recalc(); loadAllImpact(); }
+function recalcAll(){ if(dateFilter){ loadByDate(dateFilter); return; } recalc(); loadAllImpact(); }
 $('#file').addEventListener('change', loadFile); // ファイル切替は表示の切替だけ＝損益(全社)は不変
 $('#shogoBtn').addEventListener('click', runShogo);
 $('#rule').addEventListener('change', ()=>{ $('#factorBox').style.display = $('#rule').value==='markup'?'flex':'none'; recalcAll(); });
@@ -2565,6 +2893,7 @@ function setCalCollapsed(collapsed){
   panel.classList.toggle('collapsed', collapsed);
   body.classList.toggle('collapsed', collapsed);
   if(tog) tog.textContent = collapsed ? '▼ 開く' : '▲ 畳む';
+  renderTodayBanner(); // 畳む/開くで当日バナーの文言（▼開いて確認 ⇔ 操作ヒント）を更新
   try{ localStorage.setItem('calCollapsed', collapsed?'1':'0'); }catch(_){}
 }
 function toggleCalPanel(){
@@ -2611,6 +2940,25 @@ function renderReminder(){
     (anyWarn?'<a class="rgo" href="/self" target="_blank">自社データ設定を開く</a>':'')+'</div>';
 }
 
+// 本日が実施日のとき、カレンダーを畳んでいても見える赤バナーを出す。
+//  畳んでいるときは「▼ 開いて確認する」を、開いているときは操作ヒントを併記（クリックでその日の改定を表示）。
+//  renderCalendar からも、畳む/開くの切替(setCalCollapsed)からも呼ばれ、状態に合わせて文言が変わる。
+function renderTodayBanner(idx){
+  const tb=$('#calTodayBanner'); if(!tb) return;
+  idx = idx || buildEffIndex();
+  const todayKey=todayKeyStr();
+  const todayList = idx.byKey.get(todayKey);
+  if(!(todayList && todayList.length)){ tb.innerHTML=''; return; }
+  const p=todayKey.split('-');
+  const collapsed = $('#calBody') && $('#calBody').classList.contains('collapsed');
+  const cta = collapsed
+    ? '<span class="tbtn">▼ カレンダーを開いて確認する</span>'
+    : '<span class="thint">クリックでその日の改定を表で表示（カレンダーは赤で強調）</span>';
+  tb.innerHTML='<div class="tbnr" title="クリックすると本日の改定を表示します">'
+    +'🔔 <span>本日 '+Number(p[1])+'/'+Number(p[2])+' が実施日の商品が <b>'+todayList.length+'件</b> あります。基幹システムへの取込・見積提出のタイミングです。</span>'
+    +cta+'</div>';
+}
+
 function renderCalendar(){
   const idx = buildEffIndex();
   const y=calState.year, mo=calState.month;
@@ -2619,13 +2967,8 @@ function renderCalendar(){
   renderReminder();
 
   const todayKey = todayKeyStr();
-  // 本日が実施日かのバナー
-  const todayList = idx.byKey.get(todayKey);
-  const tb=$('#calTodayBanner');
-  if(todayList && todayList.length){
-    const p=todayKey.split('-');
-    tb.innerHTML='<div class="tbnr">🔔 本日 '+Number(p[1])+'/'+Number(p[2])+' が実施日の商品が '+todayList.length+'件 あります（カレンダーで赤く表示）。</div>';
-  } else tb.innerHTML='';
+  // 本日が実施日かのバナー（畳んでいても見える＝開いて確認を促す。state-aware で文言を出し分け）
+  renderTodayBanner(idx);
 
   // 実施日チップ（全期間・件数つき）＝よく使う 06/01 等にワンタップ移動。本日は🔔赤で強調
   const keys = Array.from(idx.byKey.keys()).sort();
@@ -2666,23 +3009,45 @@ function renderCalDetail(idx){
   const k=calState.selKey;
   const box=$('#calDetail');
   const tk=todayKeyStr();
-  let list = k==='__none' ? idx.noDate : (idx.byKey.get(k)||[]);
-  let title;
-  if(k==='__none') title='実施日 未設定（'+idx.noDate.length+'件）— メーカー見積に実施日が無い行です';
-  else if(k){ const p=k.split('-'); title=(k===tk?'🔔 本日 ':'')+Number(p[0])+'年'+Number(p[1])+'月'+Number(p[2])+'日 の実施予定（'+list.length+'件）'; }
-  else title='日付（色つきの日）をクリックすると、その日の明細が出ます';
-  if(!list.length){ box.innerHTML='<h3>'+esc(title)+'</h3><div class="empty">明細はありません。</div>'; return; }
-  // 仕入先→得意先→商品名の順で見やすく
-  const sorted=list.slice().sort((a,b)=> (a.supplier+a.customer+a.name).localeCompare(b.supplier+b.customer+b.name,'ja'));
-  let rows=sorted.map(it=> '<tr><td>'+esc(it.supplier||'—')+'</td><td>'+esc(it.customer)+'</td><td>'+esc(it.name)+'</td></tr>').join('');
-  const supN = (calData.suppliers && calData.suppliers.length) || 0;
-  box.innerHTML='<h3>'+esc(title)+'　<span style="color:#9aa6b2;font-weight:400">全'+supN+'仕入先 横断</span></h3>'+
-    '<table><thead><tr><th style="width:20%">仕入先</th><th style="width:30%">得意先</th><th>商品名</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  if(k==='__none'){
+    // 実施日が無い行は日付で絞り込めないので、従来どおりの一覧をここに出す。
+    const list=idx.noDate;
+    if(!list.length){ box.innerHTML=''; return; }
+    const sorted=list.slice().sort((a,b)=> (a.supplier+a.customer+a.name).localeCompare(b.supplier+b.customer+b.name,'ja'));
+    const rows=sorted.map(it=> '<tr><td>'+esc(it.supplier||'—')+'</td><td>'+esc(it.customer)+'</td><td>'+esc(it.name)+'</td></tr>').join('');
+    box.innerHTML='<h3>'+esc('実施日 未設定（'+list.length+'件）— メーカー見積に実施日が無い行です')+'</h3>'+
+      '<table><thead><tr><th style="width:20%">仕入先</th><th style="width:30%">得意先</th><th>商品名</th></tr></thead><tbody>'+rows+'</tbody></table>';
+    return;
+  }
+  if(!k){ box.innerHTML='<div class="empty">日付（色つきの日）をクリックすると、その日に実施する改定が <b>下のシミュレーション表</b> に出ます。</div>'; return; }
+  // 日付が選ばれたら、メインのシミュレーション表に「その日の改定（全仕入先・読み取り）」を表示する。
+  const list = idx.byKey.get(k)||[];
+  const p=k.split('-');
+  const label=Number(p[0])+'年'+Number(p[1])+'月'+Number(p[2])+'日';
+  const supN=(calData.suppliers && calData.suppliers.length)||0;
+  box.innerHTML='<div class="calnote">▼ <b>下のシミュレーション表</b>に '+(k===tk?'🔔 本日 ':'')+esc(label)+' の改定（'+list.length+'件・全'+supN+'仕入先）を表示しました。価格・損益はいつもの表で確認できます（読み取り表示）。</div>';
+  if(dateFilter!==k) loadByDate(k, label); // 既に同じ日を表示中なら再取得しない（月送り等での無駄打ち防止）
 }
 
+// 実施日フィルタの解除：通常表示（選択中ファイル）に戻し、全社損益を取り直す。カレンダーの選択も外す。
+$('#dateFilterClear').addEventListener('click', ()=>{
+  calState.selKey=null;
+  loadFile();          // clearDateFilter を内包＝バナーも消える。選択中ファイルを編集可能で再描画。
+  loadAllImpact();     // 損益パネルを全社合算へ戻す
+  renderCalendar();    // カレンダーの選択ハイライト/注記をクリア
+});
 // カレンダーの操作配線（常時表示パネル）
 $('#calBtn').addEventListener('click', toggleCalPanel);
 $('#calToggle').addEventListener('click', toggleCalPanel);
+// 当日バナーをクリック＝畳んでいれば開き、本日の改定をその場で表示（カレンダーへスクロール）
+$('#calTodayBanner').addEventListener('click', (e)=>{
+  if(!e.target.closest('.tbnr')) return; // バナーが無い（本日が実施日でない）ときは何もしない
+  if($('#calBody') && $('#calBody').classList.contains('collapsed')) setCalCollapsed(false);
+  calState.selKey = todayKeyStr();
+  const n=new Date(); calState.year=n.getFullYear(); calState.month=n.getMonth(); // 本日の月へ移動
+  renderCalendar();
+  const p=$('#calPanel'); if(p) p.scrollIntoView({behavior:'smooth',block:'start'});
+});
 $('#calPrev').addEventListener('click', ()=> calShift(-1));
 $('#calNext').addEventListener('click', ()=> calShift(1));
 $('#calToday').addEventListener('click', ()=>{ const n=new Date(); calState.year=n.getFullYear(); calState.month=n.getMonth(); renderCalendar(); });
@@ -2696,6 +3061,41 @@ $('#calChips').addEventListener('click', (e)=>{
 (function initCalendarPanel(){
   try{ if(localStorage.getItem('calCollapsed')==='1') setCalCollapsed(true); }catch(_){}
   loadCalendar();
+})();
+// 実施日が来た改定を 基幹システム（販売大臣）へ取込：2つのCSVダウンロード（カレンダー内）。
+(function initCalExport(){
+  const p=n=>String(n).padStart(2,'0');
+  const today=()=>{const d=new Date();return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());};
+  const cc=$('#calCutoff'); if(cc&&!cc.value) cc.value=today();
+  const m=()=>$('#calExpMsg');
+  const hb=$('#calHanbaiBtn'); if(hb) hb.addEventListener('click', async ()=>{
+    const cutoff=($('#calCutoff').value||today());
+    const issuedOnly=$('#calHanbaiScope').value==='issued';
+    const box=m(); box.style.color='#6b7785'; box.textContent='確認中…';
+    try{
+      const r=await fetch('/api/hanbai-export-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cutoff,issuedOnly})}).then(x=>x.json());
+      if(!r.ok){ box.style.color='#c0392b'; box.textContent='エラー: '+(r.error||''); return; }
+      if(!r.count){ box.style.color='#b8860b'; box.textContent='対象なし（'+cutoff+' までに実施日が来た'+(issuedOnly?'発行済みの':'')+'改定はありません）'; return; }
+      let warn='';
+      if(r.dbError) warn='\\n※ 販売大臣DBに接続できず、消費税区分／税率表№は標準値(2／1)で出力します。';
+      else if(r.missingTax) warn='\\n※ '+r.missingTax+' 件はDBに商品が無く、消費税は標準値(2／1)で出力します。';
+      if(!confirm(cutoff+' までに実施日が到来した改定 '+r.count+' 行 / '+r.customerCount+' 得意先 を、販売大臣の「単価履歴」取込CSVとして出力します。'+warn+'\\n\\nダウンロードしますか？')){ box.textContent=''; return; }
+      box.style.color='#2e7d32'; box.textContent='✓ 単価履歴CSVをダウンロードしました（'+r.count+' 行 / '+r.customerCount+' 得意先）。';
+      window.location='/api/hanbai-export?cutoff='+encodeURIComponent(cutoff)+(issuedOnly?'&issuedOnly=1':'');
+    }catch(e){ box.style.color='#c0392b'; box.textContent='通信に失敗しました: '+e; }
+  });
+  const cb=$('#calCostBtn'); if(cb) cb.addEventListener('click', async ()=>{
+    const cutoff=($('#calCutoff').value||today());
+    const box=m(); box.style.color='#6b7785'; box.textContent='確認中…';
+    try{
+      const r=await fetch('/api/cost-export-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cutoff})}).then(x=>x.json());
+      if(!r.ok){ box.style.color='#c0392b'; box.textContent='エラー: '+(r.error||''); return; }
+      if(!r.count){ box.style.color='#b8860b'; box.textContent='対象なし（'+cutoff+' までに実施日が来た改定はありません）'; return; }
+      if(!confirm(cutoff+' までに実施日が到来した商品 '+r.count+' 件 の新しい仕入原価を、基幹システム取込用CSV（商品コード,新原価）として出力します。\\n\\nダウンロードしますか？')){ box.textContent=''; return; }
+      box.style.color='#2e7d32'; box.textContent='✓ 仕入原価CSVをダウンロードしました（'+r.count+' 商品）。';
+      window.location='/api/cost-export?cutoff='+encodeURIComponent(cutoff);
+    }catch(e){ box.style.color='#c0392b'; box.textContent='通信に失敗しました: '+e; }
+  });
 })();
 
 // 得意先別ページから「商品名リンク」で開かれた時：その仕入先の照合結果を選んで該当行へジャンプ＋強調。
@@ -2718,8 +3118,21 @@ function focusRow(customer, code, name){
   tr.classList.add('focusrow');
   setTimeout(()=>{ tr.classList.remove('focusrow'); }, 6000);
 }
+// 二重登録（同じ自社商品が複数の仕入先に出る）を検知してバナー表示。
+async function loadDupCheck(){
+  const box=$('#dupAlert'); if(!box) return;
+  try{
+    const r=await fetch('/api/dup-check').then(x=>x.json());
+    const dups=(r&&r.dups)||[];
+    if(!dups.length){ box.style.display='none'; box.innerHTML=''; return; }
+    const sample=dups.slice(0,6).map(d=>'　・'+esc(d.name||d.code)+'（'+d.suppliers.map(s=>esc(s)).join(' / ')+'）').join('<br>');
+    box.style.display='block';
+    box.innerHTML='⚠ <b>二重登録の疑い '+dups.length+'件</b>：同じ自社商品が <b>複数の仕入先</b>に登録されています。'
+      +'修正見積を違う仕入先名で取り込むと起きます（損益・見積・取込CSVが二重に）。正しい仕入先名で取り込み直すか、片方を整理してください。<br>'+sample+(dups.length>6?'<br>　…ほか':'');
+  }catch(e){ box.style.display='none'; }
+}
 (async ()=>{
-  await initSettings(); fetchPL(); loadAllImpact();
+  await initSettings(); fetchPL(); loadAllImpact(); loadDupCheck();
   const params=new URLSearchParams(location.search);
   const fSup=params.get('focusSupplier');
   if(fSup){

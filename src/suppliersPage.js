@@ -34,9 +34,10 @@ const SUPPLIERS_PAGE = `<!doctype html>
   <span class="hint" style="color:#cfe0f0">販売大臣「仕入先表形式」を取込</span>
   <span class="spacer"></span>
   <a href="/">← シミュレーション</a>
-  <a href="/list">📊 一覧</a>
+  <a href="/customers">👥 得意先別</a>
+  <a href="/list">📊 一覧・進捗</a>
   <a href="/import">＋ メーカー見積取込</a>
-  <a href="/self">⚙ 自社データ設定</a>
+  <a href="/self">🗂 自社データ設定</a>
 </header>
 
 <div class="card" style="background:#eef3fb;border-color:#cdddf3">

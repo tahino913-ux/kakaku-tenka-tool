@@ -9,9 +9,10 @@ const IMPORT_PAGE = `<!doctype html>
 <title>メーカー見積 取り込み</title>
 <style>
   body{margin:0;font-family:"メイリオ","Meiryo","Segoe UI",sans-serif;background:#f4f6f9;color:#1f2733;font-size:13px}
-  header{background:#1f4e78;color:#fff;padding:10px 16px;display:flex;align-items:center;gap:14px}
+  header{background:#1f4e78;color:#fff;padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   header h1{font-size:16px;margin:0}
-  header a{color:#cfe0f0;margin-left:auto;font-size:12px}
+  header a{color:#cfe0f0;font-size:12px;text-decoration:none;background:rgba(255,255,255,.08);padding:5px 10px;border-radius:6px}
+  header a:hover{background:rgba(255,255,255,.18)}
   .step{background:#fff;border:1px solid #e2e6ec;border-radius:10px;margin:12px 16px;padding:12px 14px}
   .lbl{font-weight:700;color:#2a3a4a;margin-bottom:6px}
   .hint{color:#6b7785;font-size:11px;margin-bottom:6px;line-height:1.6}
@@ -40,9 +41,14 @@ const IMPORT_PAGE = `<!doctype html>
 </style></head><body>
 <header>
   <h1>メーカー見積 取り込み</h1>
-  <a href="/" style="color:#cfe0f0;margin-left:auto;font-size:12px;text-decoration:none">← シミュレーション画面へ</a>
-  <a href="/list" style="color:#cfe0f0;margin-left:14px;font-size:12px;text-decoration:none">📊 一覧・進捗</a>
+  <button id="resetBtn" type="button" title="入力中の仕入先・取り込みデータをすべて消して、別の仕入先を最初から取り込みます" style="margin-left:auto;background:rgba(255,255,255,.18);color:#fff;border:1px solid rgba(255,255,255,.6);border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer">🆕 入力をクリア（別の仕入先へ）</button>
+  <a href="/">← シミュレーション</a>
+  <a href="/customers">👥 得意先別</a>
+  <a href="/list">📊 一覧・進捗</a>
+  <a href="/suppliers">📒 仕入先マスタ</a>
+  <a href="/self">🗂 自社データ設定</a>
 </header>
+<div id="topMsg" style="display:none;margin:0 0 10px;padding:10px 14px;border-radius:8px;font-size:12.5px;line-height:1.6"></div>
 
 <div class="step">
   <div class="lbl">① 仕入先を選ぶ（自社マスタの「仕入先コード」から）</div>
@@ -133,6 +139,17 @@ const IMPORT_PAGE = `<!doctype html>
     <label>先頭の <input type="number" id="skipN" min="0" value="0" style="width:60px"> 行を捨てる</label>
     <span class="muted" id="skipHint" style="font-size:11px;color:#6b7785"></span>
   </div>
+  <div id="bulkDateRow" style="margin:6px 0 10px;padding:8px 12px;background:#eef6ff;border:1px solid #bcd8f5;border-radius:6px;font-size:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <b style="color:#1a4a7a;white-space:nowrap">📅 実施日（切替日）を一括入力</b>
+    <span style="color:#5a6b7a">メーカー見積に実施日が無いとき、全商品にまとめて入れられます</span>
+    <input type="text" id="bulkDate" placeholder="例 2026-07-01 / 7/1" style="width:140px">
+    <select id="bulkDateScope" style="width:auto">
+      <option value="empty">空欄の行だけに入れる</option>
+      <option value="all">全行に上書きする</option>
+    </select>
+    <button id="bulkDateBtn" type="button" class="go" style="background:#2f6fb0">全商品に反映</button>
+    <span id="bulkDateMsg" style="font-size:11px"></span>
+  </div>
   <div class="wrap"><table id="grid"></table></div>
 </div>
 
@@ -141,6 +158,52 @@ const $=s=>document.querySelector(s);
 const FIELDS=[['','（無視）'],['makerCode','メーカー品番'],['makerName','メーカー商品名'],['selfCode','自社コード'],['spec','規格'],['currentCost','現単価'],['newCost','新単価'],['switchDate','切替日']];
 let grid=[];
 let suppressProfile=false; // true のとき applyProfile を抑止（手入力＝固定レイアウトを保存済み書式で上書きしない）
+// 実施日（切替日）の一括入力。{date:'YYYY-MM-DD', scope:'empty'|'all'} or null。
+//  実施日列が無いメーカー見積でも保存時に全商品へ付与できるよう、collect() で適用する（authoritative）。
+let forcedSwitchDate=null;
+// grid（取り込んだ表）を読み込んだ時点の仕入先名。別の仕入先に切り替えた取り違えを検知する。
+let loadedForSupplier='';
+
+// 上部の常設バナー（保存結果など。リセットしても消えない位置に出す）。kind: 'ok' | 'warn' | 'err'
+function showTop(html, kind){
+  const b=$('#topMsg'); if(!b) return;
+  const st = kind==='err' ? ['#fdecea','#f3b6ae','#a32820']
+           : kind==='warn' ? ['#fff7e6','#f0c879','#7a5300']
+           : ['#eef7ee','#bfe0c4','#2e6b35'];
+  b.style.display='block'; b.style.background=st[0]; b.style.border='1px solid '+st[1]; b.style.color=st[2];
+  b.innerHTML=html;
+}
+function hideTop(){ const b=$('#topMsg'); if(b){ b.style.display='none'; b.innerHTML=''; } }
+// 取り込みデータ部分だけクリア（仕入先の選択はそのまま）。②③・貼り付け・手入力・一括実施日を初期化。
+function clearImportData(){
+  $('#src').value=''; grid=[]; originalRows=[]; forcedSwitchDate=null; loadedForSupplier='';
+  if($('#bulkDate')) $('#bulkDate').value=''; if($('#bulkDateMsg')) $('#bulkDateMsg').textContent='';
+  if($('#grid')) $('#grid').innerHTML='';
+  if($('#mapArea')) $('#mapArea').style.display='none';
+  if($('#skipRow')) $('#skipRow').style.display='none';
+  if($('#fileMsg')) $('#fileMsg').textContent='';
+  if($('#msg')) $('#msg').textContent='';
+  if($('#manualArea')){ $('#manualArea').style.display='none'; $('#manualTbl').innerHTML=''; }
+  if($('#manualToggle')) $('#manualToggle').textContent='✏ 手入力をひらく';
+  if($('#manualMsg')) $('#manualMsg').textContent='';
+}
+// すべてクリア（仕入先の選択も）＝別の仕入先を最初から取り込む。
+function resetImport(){
+  clearImportData();
+  $('#supplier').value=''; if($('#supplierSel')) $('#supplierSel').value='__new__';
+  if($('#purchaseCodeSel')) $('#purchaseCodeSel').value='';
+  activeProfile=null; if($('#profMsg')) $('#profMsg').textContent='';
+  updatePurchaseBadge(); showProfSummary(); updateStep2Lock();
+}
+// 取り込んだ表の仕入先と、いま選んでいる仕入先が食い違っていれば警告（取り違え防止）。一致なら何もしない。
+function warnSupplierMismatch(){
+  const now=$('#supplier').value.trim();
+  if(grid.length && loadedForSupplier && now && now!==loadedForSupplier){
+    showTop('⚠ 表示中の取り込みデータは <b>「'+esc(loadedForSupplier)+'」</b> で読み込んだものです。'
+      +'いま選択中の仕入先は <b>「'+esc(now)+'」</b>。<br>別の仕入先の見積を取り込むなら、右上の '
+      +'<b>「🆕 入力をクリア」</b> を押してから貼り付け／ファイル選択してください（このまま保存すると「'+esc(now)+'」として保存されます）。','warn');
+  }
+}
 let MAKERS={};            // 仕入先プロファイル（サーバから取得）
 let SUPPLIERS={};         // 仕入先マスタ {4桁: {name,...}}（仕入先コード選択用）
 let activeProfile=null;   // いま選択中の仕入先の保存プロファイル
@@ -201,6 +264,7 @@ function onPurchaseCodePick(){
   }
   showProfSummary();
   updateStep2Lock();
+  warnSupplierMismatch();
 }
 function updatePurchaseBadge(){
   const code=$('#purchaseCodeSel').value;
@@ -232,6 +296,7 @@ function onSupplierPick(){
   }
   showProfSummary();
   updateStep2Lock();
+  warnSupplierMismatch();
 }
 // ① の入力状態に応じて ② のフォームを有効／無効化
 function updateStep2Lock(){
@@ -347,6 +412,12 @@ function jpDateToISO(s,refDate){
 let originalRows=[];
 function loadRows(rows){
   if(!rows||!rows.length){ alert('読み取れる行がありません'); return; }
+  // 新しいデータを読むたびに一括 実施日はリセット（別の見積へ持ち越さない）
+  forcedSwitchDate=null;
+  if($('#bulkDateMsg')) $('#bulkDateMsg').textContent='';
+  // この表を「いまの仕入先」で読み込んだと記録（後で取り違え検知に使う）＋古い警告を消す
+  loadedForSupplier=$('#supplier').value.trim();
+  hideTop();
   // 元の生データを保持（Cで行数を変えるたびに参照）
   originalRows=rows.map(r=>r.slice());
   // A: 自動で見出し行を探す
@@ -496,6 +567,7 @@ function render(cols, skippedRows){
   html+='</tbody>';
   $('#grid').innerHTML=html;
   $('#mapArea').style.display='block';
+  applyForcedDateToGrid(); // 一括 実施日が設定済みなら、再描画後も切替日列へ反映し続ける
 }
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function collect(){
@@ -507,6 +579,10 @@ function collect(){
   Object.keys(byRow).forEach(r=>{
     const row=byRow[r], get=f=>map[f]!=null?(row[map[f]]||''):'';
     const it={makerCode:get('makerCode'),makerName:get('makerName'),selfCode:get('selfCode'),spec:get('spec'),currentCost:get('currentCost'),newCost:get('newCost'),switchDate:get('switchDate')};
+    // 実施日 一括入力：列が無い／空欄の行へ付与（scope='all' なら既存も上書き）。
+    if(forcedSwitchDate && forcedSwitchDate.date && (forcedSwitchDate.scope==='all' || !String(it.switchDate||'').trim())){
+      it.switchDate=forcedSwitchDate.date;
+    }
     if(it.makerName||it.makerCode||it.newCost) items.push(it);
   });
   return {map,items};
@@ -567,7 +643,11 @@ $('#manualTbl').addEventListener('input',(e)=>{
 
 $('#parseBtn').addEventListener('click',parse);
 $('#supplierSel').addEventListener('change',onSupplierPick);
-$('#supplier').addEventListener('input',updateStep2Lock);
+$('#supplier').addEventListener('input',()=>{ updateStep2Lock(); warnSupplierMismatch(); });
+$('#resetBtn').addEventListener('click',()=>{
+  if((grid.length || $('#supplier').value.trim()) && !confirm('入力中の仕入先・取り込みデータをすべて消して、別の仕入先を最初から取り込みますか？')) return;
+  resetImport(); hideTop(); $('#supplier').focus();
+});
 $('#purchaseCodeSel').addEventListener('change',onPurchaseCodePick);
 $('#advToggle').addEventListener('click',(e)=>{
   e.preventDefault();
@@ -576,6 +656,32 @@ $('#advToggle').addEventListener('click',(e)=>{
   $('#advToggle').textContent=(open?'▾':'▸')+' その他（登録済みから選ぶ／問屋の下のメーカーを分けて登録）';
 });
 $('#skipN').addEventListener('input',applySkipAndRender);
+// 実施日列が grid にあれば、その列のセルへ forcedSwitchDate を反映（見える化）。戻り値: 埋めた行数／-1=列なし。
+function applyForcedDateToGrid(){
+  if(!forcedSwitchDate || !forcedSwitchDate.date) return 0;
+  let dateCol=-1;
+  $('#grid').querySelectorAll('thead select').forEach(s=>{ if(s.value==='switchDate') dateCol=+s.dataset.c; });
+  if(dateCol<0) return -1; // 切替日の列が無い → 保存時に collect() で全商品へ付与
+  let n=0;
+  $('#grid').querySelectorAll('tbody input[data-c="'+dateCol+'"]').forEach(inp=>{
+    if(forcedSwitchDate.scope==='all' || !inp.value.trim()){ inp.value=forcedSwitchDate.date; n++; }
+  });
+  return n;
+}
+$('#bulkDateBtn').addEventListener('click',()=>{
+  const msg=$('#bulkDateMsg');
+  const raw=$('#bulkDate').value.trim();
+  if(!raw){ msg.style.color='#c0392b'; msg.textContent='日付を入れてください'; return; }
+  if(!grid.length){ msg.style.color='#c0392b'; msg.textContent='先に②でデータを読み取ってください'; return; }
+  const iso=jpDateToISO(raw,new Date());
+  if(!/^\\d{4}-\\d{2}-\\d{2}$/.test(iso)){ msg.style.color='#c0392b'; msg.textContent='日付として読み取れません（例 2026-07-01 / 7/1）'; return; }
+  forcedSwitchDate={date:iso,scope:$('#bulkDateScope').value};
+  const n=applyForcedDateToGrid();
+  msg.style.color='#2e7d32';
+  msg.textContent = (n>=0)
+    ? '✓ 切替日列の '+n+' 行に '+iso+' を反映しました（保存時に書き込まれます）'
+    : '✓ 実施日の列が無いので、保存時に全商品へ '+iso+' を付与します';
+});
 $('#fileBtn').addEventListener('click',()=>{ if($('#fileBtn').disabled) return; $('#file').click(); });
 $('#file').addEventListener('change',onFilePicked);
 loadMakers();
@@ -587,27 +693,37 @@ $('#saveBtn').addEventListener('click',async()=>{
   const {map,items}=collect();
   if(map.newCost==null||(map.makerName==null&&map.makerCode==null)){ $('#msg').style.color='#c0392b'; $('#msg').textContent='「新単価」と「メーカー商品名(または品番)」の列を指定してください'; return; }
   if(!items.length){ $('#msg').style.color='#c0392b'; $('#msg').textContent='データ行がありません'; return; }
+  // 取り違えガード：表示中のデータを読み込んだ仕入先と、保存先の仕入先が違うときは確認する。
+  if(loadedForSupplier && loadedForSupplier!==supplier &&
+     !confirm('表示中のデータは「'+loadedForSupplier+'」で読み込んだものです。\\nこれを「'+supplier+'」として保存します。よろしいですか？')){ return; }
   $('#msg').style.color='#6b7785'; $('#msg').textContent='保存中…';
   const purchaseCode=$('#purchaseCodeSel').value.trim();
   const payload={supplier,items,map,delim:$('#delim').value,hasHeader:$('#hasHeader').checked,purchaseCode};
   try{
     const res=await fetch('/api/maker-quote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(x=>x.json());
     if(res.ok){
-      $('#msg').style.color='#2e7d32';
-      let extra='';
+      let extra='', kind='ok';
       if(res.shogo && res.shogo.ok){
         const n=(res.shogo.files||[]).length;
         extra=' ／ 🔄 自動で照合しました（照合結果 '+n+' 本を更新）。シミュレーション画面の「対象」にすぐ出ます。';
       } else if(res.shogo){
         extra=' ／ ⚠ 自動照合に失敗しました（'+(res.shogo.error||'')+'）。シミュレーション画面の「↻ 照合を実行」を押してください。';
-        $('#msg').style.color='#b8860b';
+        kind='warn';
       }
       const linkMsg=(res.linkedCount>0)?' ／ 📌 自社コード入力 '+res.linkedCount+'件を手動紐付け（100%確定）として登録しました。':'';
-      $('#msg').textContent='✓ 保存しました（'+res.count+'件）。この仕入先の書式（列の対応）を登録しました。次回からは自動で当てはまります。 → '+res.file+linkMsg+extra;
-      // 直近の保存内容を現在のプロファイルにも反映（再表示）
-      activeProfile={ map:{...map}, delim:$('#delim').value, hasHeader:$('#hasHeader').checked };
-      showProfSummary();
-      loadMakers();
+      let okMsg='✓ <b>'+esc(supplier)+'</b> を保存しました（'+res.count+'件）。書式（列の対応）も登録したので次回から自動適用されます。 → '+esc(res.file||'')+linkMsg+extra
+        +'<br><b>続けて別の仕入先を取り込めます</b>（入力はクリアしました。① で次の仕入先を選んでください）。';
+      // 二重登録の警告：同じ商品が「別の仕入先」にも登録されている＝取り違えの可能性。
+      const dw=res.dupWarning;
+      if(dw && dw.count){
+        kind='warn';
+        const ex=(dw.items||[]).slice(0,5).map(d=>'　・'+esc(d.name||d.code)+'（'+d.suppliers.map(s=>esc(s)).join(' / ')+'）').join('<br>');
+        okMsg+='<br><br>⚠ <b>二重登録の疑い '+dw.count+'件</b>：取り込んだ商品が <b>別の仕入先にも</b>登録されています。同じ商品を2つの仕入先名で取り込むと、損益・見積・取込CSVが二重になります。正しい仕入先名で取り込み直すか、片方を整理してください。<br>'+ex+(dw.count>5?'<br>　…ほか':'');
+      }
+      // 保存できたら入力を全クリア（A社→B社の取り違え事故を防ぐ）。成功メッセージは消えない上部バナーに出す。
+      resetImport();
+      showTop(okMsg, kind);
+      loadMakers();             // 新しく登録した書式をプルダウンに反映
     }
     else { $('#msg').style.color='#c0392b'; $('#msg').textContent='保存失敗: '+(res.error||''); }
   }catch(e){ $('#msg').style.color='#c0392b'; $('#msg').textContent='保存失敗: '+e; }

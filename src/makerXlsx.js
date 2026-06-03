@@ -98,13 +98,43 @@ function convert(xlsxPath, outDir) {
     }
   }
   for (const [sup, rows] of bySupplier) {
-    const lines = ['仕入先,メーカー商品CD,商品名,現単価,新単価,切替日'];
-    for (const r of rows) lines.push([sup, r.メーカー商品CD, r.商品名, r.現単価, r.新単価, r.切替日].map(csvCell).join(','));
     const out = path.join(outDir, sanitize(sup) + '.csv');
+    // 商品単位 upsert：既存 <仕入先>.csv があれば読み込み、商品キー（品番優先・無ければ商品名）で
+    //  「今回の取り込みを後勝ち」で統合する。これで同一仕入先の異なる部分xlsxを別々に取り込んでも
+    //  前回の商品が消えない（上書きによる無音のデータ消失を防止）。paste-import＋mergeMakerFiles と同じ
+    //  「蓄積＋後勝ち」モデルに揃える（xlsx取込だけが上書きで消す唯一の例外だった＝是正）。
+    const merged = new Map();
+    for (const r of readExistingMakerRows(out)) merged.set(prodKey(r.メーカー商品CD, r.商品名), r);
+    for (const r of rows) merged.set(prodKey(r.メーカー商品CD, r.商品名), r); // 今回が後勝ち
+    const final = [...merged.values()];
+    const lines = ['仕入先,メーカー商品CD,商品名,現単価,新単価,切替日'];
+    for (const r of final) lines.push([sup, r.メーカー商品CD, r.商品名, r.現単価, r.新単価, r.切替日].map(csvCell).join(','));
     fs.writeFileSync(out, '﻿' + lines.join('\r\n'));
-    summary.push({ supplier: sup, file: path.basename(out), items: rows.length });
+    summary.push({ supplier: sup, file: path.basename(out), items: final.length });
   }
   return summary;
+}
+
+// 商品の同一判定キー（shogo.makerProdKey と同じ規則：品番があれば品番、無ければ商品名を NFKC＋空白除去＋小文字で）。
+//  ※ shogo は makerXlsx を require するため、循環参照を避けてここに同等実装を置く。
+function prodKey(code, name) {
+  const n = (s) => String(s == null ? '' : s).normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+  return (code && String(code).trim()) ? ('CD:' + n(code)) : ('NM:' + n(name));
+}
+// 既存 maker_quotes/<仕入先>.csv を行配列で読む（無ければ空）。makerXlsx が書いた列名を読む。
+function readExistingMakerRows(file) {
+  try {
+    if (!fs.existsSync(file)) return [];
+    const { loadCsv } = require('./csv');
+    const { records } = loadCsv(file);
+    return records.map((r) => ({
+      メーカー商品CD: r['メーカー商品CD'] || r['メーカー品番'] || r['品番'] || '',
+      商品名: r['商品名'] || r['メーカー商品名'] || '',
+      現単価: r['現単価'] || r['現価格'] || '',
+      新単価: r['新単価'] || r['新価格'] || '',
+      切替日: r['切替日'] || r['実施日'] || r['適用日'] || '',
+    })).filter((r) => String(r.商品名).trim() !== '' || String(r.メーカー商品CD).trim() !== '');
+  } catch (_) { return []; }
 }
 
 if (require.main === module) {

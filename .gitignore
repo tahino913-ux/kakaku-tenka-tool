@@ -12,6 +12,7 @@ input/
 output/
 maker_quotes/
 settings.json
+settings.json.bak*
 損益.csv
 発行履歴.json
 # 販売大臣 単価履歴の取込/サンプルCSV(実コードを含む)
@@ -37,3 +38,6 @@ _chatlogs/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# --- 一時テスト/検証の残骸（ヘッドレスブラウザのプロファイル等。__ で始まる作業用） ---
+__*

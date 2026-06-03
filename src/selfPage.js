@@ -39,11 +39,12 @@ const SELF_PAGE = `<!doctype html>
   .info-box{background:#fff8e1;border:1px solid #ffe082;padding:8px 10px;border-radius:6px;font-size:12px;margin:6px 0}
 </style></head><body>
 <header>
-  <h1>⚙ 自社データ取込設定</h1>
+  <h1>🗂 自社データ取込設定</h1>
   <span class="hint" style="color:#cfe0f0">販売実績を読み込み、どこが何の情報か確認・保存</span>
   <span class="spacer"></span>
   <a href="/">← シミュレーション</a>
-  <a href="/list">📊 一覧</a>
+  <a href="/customers">👥 得意先別</a>
+  <a href="/list">📊 一覧・進捗</a>
   <a href="/import">＋ メーカー見積取込</a>
   <a href="/suppliers">📒 仕入先マスタ</a>
 </header>

@@ -42,8 +42,11 @@ const LIST_PAGE = `<!doctype html>
   <h1>メーカー見積 一覧 / 進捗</h1>
   <span class="sub">取り込み・照合・見積書の進み具合をひと目で</span>
   <span class="spacer"></span>
-  <a href="/">← シミュレーション画面へ</a>
-  <a href="/import">＋ メーカー見積を取り込む</a>
+  <a href="/">← シミュレーション</a>
+  <a href="/customers">👥 得意先別</a>
+  <a href="/import">＋ メーカー見積取込</a>
+  <a href="/suppliers">📒 仕入先マスタ</a>
+  <a href="/self">🗂 自社データ設定</a>
 </header>
 
 <div class="card">
