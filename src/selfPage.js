@@ -287,15 +287,37 @@ async function loadHanbaiSource(){
     let banner = '';
     if (usesDb) {
       const rng = r.dbRange ? (esc(r.dbRange.start)+' 〜 '+esc(r.dbRange.end)) : '過去約1年';
+      const cm = Number(r.candidateMonths) || 12;
       banner = '<div style="margin-bottom:10px;padding:10px 12px;background:#e9f6ec;border:1px solid #b7e0c0;border-radius:8px;color:#1f6b35;font-size:13px;line-height:1.8">'
         + '<b>✅ 現在は販売大臣DBから直接取得しています'+(r.source==='auto'?'（自動：DBが無いPCのみ下のファイルを使用）':'（DB直結）')+'。</b><br>'
-        + '取得期間：<b>'+rng+'</b>（実行のたびに「今日を基準に過去約1年」を自動で取り直します）。手動エクスポートや期間の設定は不要です。<br>'
-        + '<span style="color:#4a7a55">↓ 下の「ファイル」設定は、DBが無いPC（自宅など）や他社運用のための予備です。会社PCでは使われません。</span></div>';
+        + '年間金額・損益の集計期間：<b>'+rng+'</b>（実行のたびに「今日を基準に直近約1年」を自動で取り直します）。手動エクスポートは不要です。'
+        + '<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #b7e0c0">'
+        +   '⏳ <b>照合に含める期間（さかのぼり）</b>：'
+        +   '<input id="candMonths" type="number" min="12" max="60" step="1" value="'+cm+'" style="width:64px;padding:3px 6px;border:1px solid #b7e0c0;border-radius:4px;font:inherit;text-align:right"> か月　'
+        +   '<button id="candSave" style="padding:4px 12px;background:#1f6b35;color:#fff;border:none;border-radius:4px;cursor:pointer">保存</button>'
+        +   ' <span id="candMsg" style="font-size:12px"></span><br>'
+        +   '<span style="color:#4a7a55;font-size:12px">この期間に売上がある商品を照合の<b>候補</b>に含めます（既定12か月）。長くすると、1年以上ご無沙汰の商品も見積で拾えます。'
+        +   '<b>年間金額・損益は上記のとおり直近約1年で計算</b>するので、延ばしても損益は歪みません。変更は次回の「↻ 照合を実行」から有効。</span></div>'
+        + '<div style="margin-top:6px"><span style="color:#4a7a55">↓ 下の「ファイル」設定は、DBが無いPC（自宅など）や他社運用のための予備です。会社PCでは使われません。</span></div></div>';
+    }
+    // 「照合に含める期間」保存ボタンを配線（DB案内バナーがあるときだけ要素が存在）
+    function bindPeriod(){
+      const b = $('#candSave'); if(!b) return;
+      b.addEventListener('click', async ()=>{
+        const m = $('#candMonths').value, msg = $('#candMsg');
+        msg.style.color='#6b7785'; msg.textContent='保存中…';
+        try{
+          const res = await fetch('/api/hanbai-period',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({months:m})}).then(x=>x.json());
+          if(res.ok){ msg.style.color='#1f6b35'; msg.textContent='✓ 保存（'+res.candidateMonths+'か月）。次回の「↻ 照合を実行」から有効'; $('#candMonths').value=res.candidateMonths; }
+          else { msg.style.color='#c0392b'; msg.textContent='失敗: '+(res.error||''); }
+        }catch(e){ msg.style.color='#c0392b'; msg.textContent='失敗: '+e; }
+      });
     }
     if (!r.configured) {
       target.innerHTML = banner + (usesDb
         ? '<div class="hint" style="padding:4px 8px">ファイルパスは未設定ですが、DB直結のため問題ありません。</div>'
         : '<span class="err">⚠ config.js の hanbai.path が未設定です</span>');
+      bindPeriod();
       return;
     }
     let html = banner;
@@ -315,6 +337,7 @@ async function loadHanbaiSource(){
       html += '<div class="info-box" style="margin-top:8px">⚠ パスは設定されていますが、その場所にファイル(または.xls/.xlsx/.csv) が存在しません。config.js を確認するか、フォルダに販売実績ファイルを置いてください。</div>';
     }
     target.innerHTML = html;
+    bindPeriod();
   } catch (e) {
     target.innerHTML = '<span class="err">読込失敗: '+esc(String(e))+'</span>';
   }

@@ -55,6 +55,49 @@
 7. **メーカー見積 取り込み画面（/import）**：PDF/Excelの表を貼り付け→自動で列分解→列対応を指定・ズレ修正→`maker_quotes/`にCSV保存。
 8. **メーカー見積 .xlsx 直読みインポータ（2026-05-26 追加・動作確認済み）**：`src/xlsxread.js`（Node標準zlibのみでxlsx解凍・解析＝**ゼロ依存/Excel不要**）＋`src/makerXlsx.js`（見出し列を自動検出、シート名＝メーカー名で**1ブック複数シート→メーカー別CSV**）。`maker_quotes/` に置いた .xlsx は **照合.bat 実行時に自動展開**。単発変換は `取込.bat` にドロップ。中東(問屋)の `日野折箱店様（容器メーカー）.xlsx`（3シート: エフピコ122/中央化学64/福助1）で検証済み。
 
+### 🆕 実施日カレンダーの横断ビューに「進捗（提出済み/検討中/未提出）」を表示（2026-06-03・実データ検証済み）
+
+- **依頼**：カレンダーで実施日を選んだとき、そこのアイテムが**どこまで進んでいるか**分かるように。→ 上の3区分（対象/検討中/提出済み）の状態をそのまま流用。
+- **実装（`src/server.js` のみ）**：`calcByDate` が各行に `itemStatus`（''=未提出 / 'hold'=検討中 / 'issued'=提出済み）を付与（得意先別ページと同じ rowKey＝`得意先+仕入先+normName(品番|名)` で `品目ステータス.json` を引く）＋戻りに `statusCounts{issued,hold,todo}`。クライアント：横断（読み取り）ビューの各行に `progressBadge`（✅提出済み/🤔検討中/⬜未提出）を商品名の下に表示、`#dateFilterBar` のラベルに内訳「✅提出済 a・🤔検討中 b・⬜未提出 c」を併記。
+- **効果**：「実施日が近いのに未提出の品」が一目で分かる＝取りこぼし防止。発行（提出）や🤔検討中の操作が、カレンダーの進捗に自動で反映される。
+- **検証**：server構文OK＋**配信JS構文OK(vm.Script)**＋`progressBadge`/未提出 配信確認＋**実データ** calc-by-date(2026-06-01)=314件・全行に itemStatus・statusCounts={issued0,hold0,todo314}（新方式で未発行のため全件 未提出＝正常）。⚠ **要 sim.bat 再起動**。本セッションで再起動済み（PID更新）。
+- 補足：旧来の per-customer 発行履歴（発行履歴.json）はアイテム単位の提出済みには使わない（カレンダーは per-item の `品目ステータス` 由来＝正確）。今後の発行・検討中操作で自然に埋まる。
+
+### 🆕 得意先別：アイテムを「対象／🤔検討中（除外）／✅提出済み」の3区分で管理（2026-06-03・実データ検証済み）
+
+- **依頼**：①見積提出後のアイテムは別枠で管理したい ②一覧に出ているが見積から除外（検討中）できるように。→ **アイテム（商品＝rowKey）単位の状態**1つで両方を解決（ユーザ選択＝アイテム単位）。
+- **状態（`output/品目ステータス.json`・gitignore・Drive同期）**：`{得意先名:{rowKey:{s:'hold'|'issued',at?,quoteNo?}}}`。`''`=対象（見積に載る）／`hold`=検討中（一覧に残すが見積から除外）／`issued`=提出済み（発行で自動付与・別枠へ）。価格・照合には無影響＝載せる/載せないと表示振り分けのみ。
+- **サーバ（`src/server.js`）**：`readItemStatus`/`setItemStatus`/`markItemsIssued`/`clearIssuedStatuses` を追加。`buildCustomerCandidates` が keep 各行に `status`（issued は at/quoteNo も）を付与。`aggregateCustomers` が keep を **対象=products／holdProducts／issuedProducts** に3分割（productCount＝対象のみ）。`exportCustomerQuotes` は**対象(status'')だけ発行**し、発行した rowKey を `markItemsIssued`＝次回から提出済み別枠＆作業表から外れる。基幹CSV（単価履歴・仕入原価）は **hold だけ除外・issued は含める**（＝実際に改定した分は基幹へ反映）。`POST /api/item-status{customer,rowKey,status}`（hold/解除）。`/api/issue-log-reset` は `clearIssuedStatuses` も呼び、提出済みアイテムを対象へ戻す（バッジと別枠を同期。hold は残す）。
+- **画面（`src/customersPage.js`）**：対象テーブル先頭に「操作」列＝**🤔 検討中**ボタン。表の下に **🤔検討中（除外）**（開）・**✅提出済み**（畳む）の `<details>` セクション（各行「↩ 対象へ戻す」、提出済みは見積No/提出日も）。左一覧に「検討中N」タグ。`setItemState(rowKey,status)`→`/api/item-status`→`load()` で3区分が即更新。発行成功後は `load()` で提出済みへ移動。
+- **検証**：server/customersPage 構文OK＋**/customers 配信JS構文OK(vm.Script)**＋**実データ(ｂｉｂ)**：対象4→🤔検討中で1件が「検討中」へ移動・対象から消える(対象3)→「対象へ戻す」で対象4へ復帰、を実サーバで確認。`品目ステータス.json` はバックアップ/復元で実害なし。⚠ **要 sim.bat 再起動**（server.js/customersPage.js）。本セッションで新コード再起動済み（PID更新）。
+- **未検証（ユーザ）**：ブラウザ実操作（🤔検討中→セクション移動／発行→✅提出済みへ自動移動／↩戻す）と、提出済みアイテムの基幹CSV反映は未実機。
+
+### 🆕 マスタにメーカー品番を入れればCD一致で拾う＋照合の対象期間をUIで変更（2026-06-03・実DB検証済み）
+
+- **依頼**：メーカー品番が分かるので**自社の商品マスタ（SHOHIN）に入れて確実にCD一致で拾いたい**。DB直結なので「照合を実行」で反映されるか？ → 続けて、照合の**販売期間もページ上で変えたい**。
+- **(1) マスタの品番をCD一致で読む（`src/db_hanbai.js`）**：従来 CD一致は **売上明細(URIMEI)の商品名**だけを探索範囲(`codeNorm`)にしていた＝**マスタに品番を入れても照合は見に行かなかった**（URIMEIの過去伝票は凍結されるため）。→ 照合SQLに **SHOHIN の商品名2〜5（NM2-5）＋摘要（TEK）** を追加し、`codeNorm` に連結（**CD一致専用＝名前一致 `coreNorm` には入れない**ので名前照合は不変＝安全）。これでマスタにメーカー品番を入れておけばCD一致で確実に拾え、**DB直結なので「↻ 照合を実行」で即反映**（エクスポート不要）。
+  - **実DB検証**：テスト品 自社006036「角切小鉢70A（赤金）」のマスタ NM3 に `CA11070` を登録 → `codeNorm` に `ca11070` 含む＝true、`codeHit('CA11070')`＝true、合成メーカー品(品番CA11070)で **[✓ CD一致] 006036** を確認。⚠ **読み取り専用(SELECTのみ)** 不変。
+- **(2) 照合の対象期間をUIで変更（`db_hanbai.js`＋`server.js`＋`selfPage.js`）**：上の検証で 006036 は**最終売上2024-12-20＝過去約1年の窓外**で照合候補に出ないと判明。→ **「照合に含める期間（さかのぼり月数）」を /self で設定**できるように（既定12・12〜60か月に丸め）。⭐ 重要：**候補に含める期間（可変）と 年間金額(損益)の集計期間（常に直近約1年）を分離**＝期間を延ばしても**損益は歪まない**。
+  - 実装：`db_hanbai.buildSql(candidateStart, end, annualStart, scale)`＝base は candidateStart..end（候補）、agg(年間金額)は `DENDATE>=annualStart`（直近1年）に限定。`monthsBackStart()`／`loadHanbaiFromDb` が `dbCfg.candidateMonths` を解釈。`shogo.loadHanbaiRecords` が `settings.hanbai.candidateMonths` を db 設定に載せて渡す。`GET /api/hanbai-source` に candidateMonths を追加、`POST /api/hanbai-period{months}` で保存（`saveSettings({hanbai:{candidateMonths}})`＝浅いマージで source/db 保持・自社品検索キャッシュ破棄）。/self のDB案内バナーに 月数入力＋保存＋注記を追加。
+  - **実DB検証**：candidateMonths=12→件数2500・**006036なし**／=24→件数3191・**006036あり・年間金額=0（損益歪まない）・現売単価14.1・codeNormにca11070**。**期間を延ばすと候補に入りCD一致もするが損益は直近1年のまま**＝設計どおり。`POST /api/hanbai-period` 24→ok、999→60に丸め、保存後 `getSettings().hanbai.db.database` 生存（DB接続壊れない・settings.jsonバックアップ/復元で確認）。
+- **検証総括**：db_hanbai/shogo/server/selfPage 構文OK＋**/self 配信JS構文OK(vm.Script)**＋期間UI要素あり。⚠ **要 sim.bat 再起動**（db_hanbai.js/shogo.js/server.js/selfPage.js 変更）。本セッションでは検証後に新コードで再起動済み（PID更新）。
+- **使い方（ユーザ）**：① 商品マスタの「商品名2〜5」か「摘要」にメーカー品番を入れる ② 1年以上ご無沙汰の品も拾いたいときは /self で「照合に含める期間」を延ばす ③「↻ 照合を実行」。※ 期間外の品は損益に効かない（年間金額0）が見積には出せる。
+- **残検証（ユーザ）**：ブラウザ実操作（/self で期間変更→保存→↻照合→角切小鉢70A赤金がCD一致で出る）は未実機。
+
+### 🆕 休眠（メーカー品が未マッチ）をメイン画面から直接 手動紐付けで救済（2026-06-03・実DB検証済み）
+
+- **依頼**：メーカー見積の自動照合で「実績はあるのに商品名の揺らぎで**休眠**になった商品」を、手動で直す方法。
+- **これまでの穴（実コードで確認）**：休眠行＝メーカー品が自社品に1つも当たらなかった行で、**自社CDが無い**ため `linkCellHtml` がボタンを出さず「—」、`openLinkModal` も「自社商品コードが空」で拒否（`server.js`）。＝休眠はメイン画面から直せず、取り込みページ(/import)で自社コードを与えて取り込み直すしかなかった。
+- **実装＝紐付けモーダルを2モード化（`src/server.js` のみ）**：
+  - **maker（自社CDあり・従来）**：自社品に対して「確定するメーカー商品」を選ぶ（不変）。
+  - **self（自社CD無し・休眠＝新）**：メーカー品(固定)に対して、**販売実績の自社品(自社CD)を検索して選ぶ**。保存で `productLinks[仕入先][選んだ自社CD]=メーカー商品名`（既存 `/api/product-link`）＝📌手動紐付け。休眠の解消は再照合が要るので、保存後に**「↻ 照合を実行」を即実行するか確認**するダイアログを出す。
+  - 休眠行の紐付けセルに **「✏ 実績と紐付け」ボタン**（橙）を表示（`linkCellHtml`：自社CD無しでもメーカー商品名があれば出す）。横断（実施日フィルタ）ビューでも有効。
+  - 候補は類似度順（同じ発注先＝仕入先コード一致を +0.15 で優先）。決定的トークン警告・検索（商品名/CD）も従来同様。
+- **サーバ追加**：`GET /api/self-products?supplier=`＝販売実績の自社品を**自社CDで重複排除**して返す（`{code,name,purchaseCode,currentSell}`）。販売実績は短時間キャッシュ（5分）＝連打で毎回DB/ファイルを読まない。読み込みは `shogo.js` から切り出した共用 `loadHanbaiRecords()`（DB直結 'db'/'auto'/ファイル・**照合 run() と同一ロジックに集約**＝二重実装解消）。**⚠ 読み取り専用（SELECTのみ）**は不変。
+- **検証**：① shogo/server 構文OK ② **配信クライアントJS 構文OK(vm.Script)**（休眠紐付けUI・/api/self-products・openLinkModal を配信HTMLに確認）③ **実DB**：`/api/self-products?supplier=大黒工業`＝自社品1260件・自社CD重複0・発注先0029一致197件・3.3秒（以後キャッシュ）④ run() に未定義参照なし＝照合は挙動不変。⚠ **要 sim.bat 再起動**（server.js/shogo.js 変更）。
+- ⚠ テンプレートリテラル規約の罠：confirm の改行は `\\n`（`\n` だと配信時に実改行になり文字列が壊れる）。今回 vm.Script 検証で1回踏んで修正済み。
+- **残検証（ユーザ）**：ブラウザ実操作（休眠行の「✏ 実績と紐付け」→自社品検索→保存→照合で休眠解消）は未実機。
+
 ### ✅ メーカー見積の二重取り込み防止＝検証完了＋makerXlsxをupsert化（2026-06-02・実データ検証済み）
 
 ユーザ依頼「念入りに検証」。実データ（maker_quotes 全CSV＝生3507品／7仕入先）と人工境界ケースで二重取り込みを精査し、**二重計上（double-count）は全レイヤーで防止されている**ことを確認。唯一の実害＝.xlsx取込の上書きによる**データ消失**を修正（消失を根絶）。⚠ **要 sim.bat 再起動**（makerXlsx.js 変更）。

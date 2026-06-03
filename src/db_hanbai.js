@@ -37,9 +37,19 @@ function defaultRange() {
   const iso = (x) => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
   return { start: iso(start), end: iso(end) };
 }
+// さかのぼり月数 → 開始日(ISO・月初)。defaultRange と同じ流儀（当月から months か月前の月初）。
+//  照合の「候補に含める期間」用。12〜60に丸める（1年〜5年）。
+function monthsBackStart(months) {
+  const m = Math.max(12, Math.min(60, Math.round(Number(months) || 12)));
+  const d = new Date();
+  const s = new Date(d.getFullYear(), d.getMonth() - m, 1);
+  return s.getFullYear() + '-' + String(s.getMonth() + 1).padStart(2, '0') + '-' + String(s.getDate()).padStart(2, '0');
+}
 
 // 読み取り専用の集計SQLを組み立てる（パラメータは検証済みの定数のみ＝SQLインジェクション面なし）。
-function buildSql(start, end, scale) {
+//  candidateStart..end = 照合の候補に含める期間（さかのぼり可変）。この間に売上があれば候補に出る。
+//  annualStart..end    = 年間金額(損益)の集計期間（常に直近約1年）。候補期間を延ばしても損益は歪まない。
+function buildSql(candidateStart, end, annualStart, scale) {
   const sc = Number(scale) || 10000;
   return `;WITH base AS (
   SELECT u.TOKSHI, u.SHO, u.DENDATE, u.NO, u.GYO, u.DSHU,
@@ -51,7 +61,7 @@ function buildSql(start, end, scale) {
            + CASE WHEN LTRIM(RTRIM(ISNULL(u.NAME5,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(u.NAME5)) END AS pname,
          u.SHIIRE AS shiicode
   FROM dbo.URIMEI u
-  WHERE u.DENDATE >= '${start}' AND u.DENDATE < '${end}'
+  WHERE u.DENDATE >= '${candidateStart}' AND u.DENDATE < '${end}'
 ),
 latest AS (
   -- 現売単価＝得意先×商品の「最新DENDATE行のTANK」。伝票種(DSHU)で絞らない＝全種から最新を採る。
@@ -64,14 +74,22 @@ latest AS (
 --  ※実測：全DSHU合計=76.0%／51のみ=68.8%／51+52=83.2%／51+52+59=76.0% 一致。
 --    現行エクスポートの「年間金額」は 売上−値引（51+52）が最も合うため 51,52 に限定する。
 --    （別区分59・無償81 は現行レポートの年間金額には含まれない）
-agg AS ( SELECT TOKSHI, SHO, SUM(CASE WHEN DSHU IN (51, 52) THEN amt ELSE 0 END) AS annual FROM base GROUP BY TOKSHI, SHO )
+agg AS ( SELECT TOKSHI, SHO, SUM(CASE WHEN DSHU IN (51, 52) AND DENDATE >= '${annualStart}' THEN amt ELSE 0 END) AS annual FROM base GROUP BY TOKSHI, SHO )
 SELECT
   RTRIM(tk.CODE) AS tcd, RTRIM(sh.CODE) AS pcd,
   l.sell AS sell, a.annual AS amt, l.cost AS cost,
   CONVERT(char(10), l.DENDATE, 23) AS lastdate,
   RTRIM(ISNULL(si.CODE,'')) AS scd,
   RTRIM(ISNULL(tk.NM1,'')) AS cname,
-  l.pname AS pname
+  l.pname AS pname,
+  -- 商品マスタ(SHOHIN)の 商品名2〜5＋摘要。CD一致用の文字列(codeNorm)にだけ足す＝
+  --  「メーカー品番を自社マスタに入れておけば CD一致で確実に拾える」を可能にする（名前一致には使わない）。
+  --  ※ 売上明細(URIMEI)の NAME は過去伝票で凍結されるため、マスタ編集を即 照合へ反映するにはマスタを直接読む必要がある。
+  LTRIM(RTRIM(ISNULL(sh.NM2,'')))
+    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.NM3,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.NM3)) END
+    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.NM4,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.NM4)) END
+    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.NM5,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.NM5)) END
+    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.TEK,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.TEK)) END AS mname
 FROM latest l
 JOIN agg a ON a.TOKSHI = l.TOKSHI AND a.SHO = l.SHO
 LEFT JOIN dbo.TOKUI  tk ON tk.ICODE = l.TOKSHI
@@ -151,6 +169,8 @@ function csvToRecords(csvPath) {
     const pname = String(r[ix.pname] == null ? '' : r[ix.pname]).trim();
     if (!pcd && !pname) continue;
     const scd = String(r[ix.scd] == null ? '' : r[ix.scd]).trim();
+    // 商品マスタの 商品名2〜5＋摘要（メーカー品番を入れておく欄）。CD一致用文字列にだけ足す。
+    const mname = ix.mname != null ? String(r[ix.mname] == null ? '' : r[ix.mname]).trim() : '';
     out.push({
       customerCode: tcd,
       customerName: String(r[ix.cname] == null ? '' : r[ix.cname]).trim(),
@@ -161,8 +181,10 @@ function csvToRecords(csvPath) {
       origCost: toNum(r[ix.cost]),
       lastDate: String(r[ix.lastdate] == null ? '' : r[ix.lastdate]).trim(),
       norm: normName(pname),
-      codeNorm: normForCode(pname),
-      coreNorm: normName(coreName(pname)),
+      // CD一致は 売上明細の名前(pname) に加え 商品マスタの名称2-5/摘要(mname) も探索範囲に含める
+      //  ＝マスタにメーカー品番を登録しておけば、売上明細に品番が無くても CD一致で確実に拾える。
+      codeNorm: normForCode((pname + ' ' + mname).trim()),
+      coreNorm: normName(coreName(pname)), // 名前一致は従来どおり pname のみ（mname は名前一致に使わない）
       // 仕入先コード：DB結合の実値(4桁)を優先。空なら従来の末尾数字推定にフォールバック。
       purchaseCode: scd ? scd.padStart(4, '0') : require('./hanbai').trailingPurchaseCode(pname),
     });
@@ -174,9 +196,11 @@ function csvToRecords(csvPath) {
 function loadHanbaiFromDb(dbCfg) {
   dbCfg = dbCfg || {};
   const range = defaultRange();
-  const start = dbCfg.start || range.start;
+  const annualStart = dbCfg.start || range.start; // 年間金額(損益)の起点＝直近約1年（明示startがあれば優先）
   const end = dbCfg.end || range.end;
-  const sql = buildSql(start, end, dbCfg.scale);
+  // 候補に含める期間（さかのぼり月数・既定12）。明示の start があるときはそれを候補起点にも使う。
+  const candidateStart = dbCfg.start ? annualStart : monthsBackStart(dbCfg.candidateMonths);
+  const sql = buildSql(candidateStart, end, annualStart, dbCfg.scale);
   const csv = runQueryToCsv(dbCfg, sql);
   try { return csvToRecords(csv); }
   finally { try { fs.unlinkSync(csv); } catch (_) {} }

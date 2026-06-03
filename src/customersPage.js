@@ -103,6 +103,21 @@ const CUSTOMERS_PAGE = `<!doctype html>
   .issuednote .openq{background:#1f6b35;border:1px solid #1f6b35;color:#fff;border-radius:7px;padding:2px 10px;font-weight:700;cursor:pointer;font-size:11px}
   .issuednote .openq:hover{background:#175a2b}
   .notyet{margin:8px 16px;padding:6px 12px;border-radius:8px;background:#f4f6f9;border:1px solid #e2e6ec;color:#6b7785;font-size:12px}
+  /* 検討中タグ（得意先一覧）／アイテム状態ボタン／別枠セクション */
+  .cust .holdm{color:#8a5a12;font-size:11px;font-weight:700;margin-left:6px}
+  td.actcell{white-space:nowrap}
+  button.hold-btn{background:#fff;border:1px solid #e0c48a;color:#8a5a12;border-radius:6px;padding:2px 7px;font-size:11px;cursor:pointer}
+  button.hold-btn:hover{background:#fff8ec}
+  button.back-btn{background:#fff;border:1px solid #9fcbab;color:#1f6b35;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer}
+  button.back-btn:hover{background:#f0faf2}
+  details.itemsec{margin:10px 16px;border-radius:8px;border:1px solid #e2e6ec;overflow:hidden}
+  details.itemsec>summary{cursor:pointer;padding:8px 12px;font-size:13px;font-weight:700;user-select:none}
+  details.sec-hold{border-color:#f0d49a}
+  details.sec-hold>summary{background:#fff4d6;color:#8a5a12}
+  details.sec-issued{border-color:#bfe0c4}
+  details.sec-issued>summary{background:#eef7ef;color:#1f6b35}
+  details.itemsec .table-pad{padding:0 0 6px}
+  details.itemsec table{font-size:12px}
   .lowmnote{margin:8px 16px;padding:8px 12px;border-radius:8px;background:#fff4d6;border:1px solid #f0d49a;color:#8a5a12;font-size:12px}
   .detail-head{padding:12px 16px 4px}
   .detail-head h2{margin:0;font-size:18px;color:#1f4e78}
@@ -270,6 +285,38 @@ function fmtPct1(v){ return v==null?'—':v.toFixed(1)+'%'; }
 function isLowMargin(m){ return m!=null && m < lowMarginPct; }
 // 得意先の「改定後粗利率がしきい値未満」の商品数
 function lowMarginCount(c){ let n=0; for(const p of (c.products||[])){ if(isLowMargin(marginRate(p.newSell,p.newCost))) n++; } return n; }
+// 別枠セクション（検討中／提出済み）の表。kind: 'hold'|'issued'
+function sectionHtml(title, items, kind){
+  if(!items || !items.length) return '';
+  const open = kind==='hold' ? ' open' : ''; // 検討中は開いて見せる／提出済みは畳む
+  const issuedTh = kind==='issued' ? '<th>提出</th>' : '';
+  let rows='';
+  for(const p of items){
+    const info = kind==='issued' ? (issuedShort(p.issuedAt)+(p.issuedQuoteNo?'（'+esc(p.issuedQuoteNo)+'）':'')) : '';
+    rows+='<tr>'
+      +'<td><span class="sup-badge">'+esc(p.supplier)+'</span></td>'
+      +'<td class="pcode">'+esc(p.productCode||'')+'</td>'
+      +'<td>'+esc(p.productName)+'</td>'
+      +'<td class="num">'+yen(p.currentSell)+'</td>'
+      +'<td class="num">'+yen(p.newSell)+'</td>'
+      +'<td>'+esc(p.effectiveDate||'')+'</td>'
+      +(kind==='issued'?'<td class="muted">'+info+'</td>':'')
+      +'<td><button class="back-btn" data-key="'+esc(p.rowKey)+'" title="この商品を見積の「対象」に戻します">↩ 対象へ戻す</button></td>'
+      +'</tr>';
+  }
+  return '<details class="itemsec sec-'+kind+'"'+open+'><summary>'+title+' <b>'+items.length+'</b> 件</summary>'
+    +'<div class="table-pad"><table><thead><tr><th>仕入先</th><th>商品コード</th><th>商品名</th><th class="num">現売価</th><th class="num">改定後売価</th><th>実施日</th>'+issuedTh+'<th>操作</th></tr></thead><tbody>'
+    +rows+'</tbody></table></div></details>';
+}
+// アイテムの状態変更（hold=検討中へ／''=対象へ戻す）→ 保存して再取得（3区分が更新される）
+async function setItemState(rowKey, status){
+  if(!selName || !rowKey) return;
+  try{
+    const res=await fetch('/api/item-status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:selName,rowKey:rowKey,status:status})}).then(x=>x.json());
+    if(!res.ok){ alert('変更に失敗: '+(res.error||'')); return; }
+    await load(); // 再計算＋再描画（selectCust 再実行で対象/検討中/提出済みが更新）
+  }catch(e){ alert('変更に失敗: '+e); }
+}
 // 行ルールの選択肢（先頭＝全体ルールを継承）
 const ROW_RULE_OPTS=[['','（全体）'],['add_increase','上乗せ'],['keep_margin_rate','粗利維持'],['markup','掛率×'],['sell_cost_rate','売価×仕入率'],['keep_sell','据置']];
 function rowRuleSelect(p){
@@ -405,11 +452,12 @@ function renderList(){
     const rev = c.reviewCount ? '<span class="rev">要確認'+c.reviewCount+'</span>' : '';
     const lowN = lowMarginCount(c);
     const low = lowN ? '<span class="lowm">薄利'+lowN+'</span>' : '';
+    const hold = c.holdCount ? '<span class="holdm">検討中'+c.holdCount+'</span>' : '';
     const iss = ISSUED[c.name];
     const issBadge = iss ? '<span class="issued" title="最終提出 '+esc(iss.lastIssuedAt||'')+(iss.count>1?' / 提出'+iss.count+'回':'')+'">✅ 提出済 '+issuedShort(iss.lastIssuedAt)+(iss.count>1?'×'+iss.count:'')+'</span>' : '';
     html+='<div class="cust'+sel+(iss?' done':'')+'" data-name="'+esc(c.name)+'" onclick="selectCust(this.getAttribute(\\'data-name\\'))">'
       +'<div style="min-width:0"><div class="nm">'+esc(c.name)+'</div>'
-      +'<div class="meta">仕入先 '+c.supplierCount+' 社'+rev+low+issBadge+'</div></div>'
+      +'<div class="meta">仕入先 '+c.supplierCount+' 社'+rev+low+hold+issBadge+'</div></div>'
       +'<span class="cnt">'+c.productCount+'</span>'
       +'</div>';
   }
@@ -445,7 +493,7 @@ function selectCust(name){
       +'行ルールや改定後売価を見直すと、表の「改定後粗利率」がオレンジから外れます。</div>';
   }
   html+='<div class="table-pad"><table><thead>'
-    +'<tr><th rowspan="2">仕入先</th><th rowspan="2">商品コード</th><th rowspan="2">商品名</th>'
+    +'<tr><th rowspan="2">操作</th><th rowspan="2">仕入先</th><th rowspan="2">商品コード</th><th rowspan="2">商品名</th>'
     +'<th class="grp" colspan="3">仕入（現→改定後）</th>'
     +'<th class="grp" colspan="5">売価・粗利率（現→改定後）</th>'
     +'<th rowspan="2">行ルール<br><span class="muted">(全体=メイン設定)</span></th>'
@@ -462,6 +510,7 @@ function selectCust(name){
     const newM = marginRate(p.newSell, p.newCost);         // 改定後粗利率
     const lowCls = isLowMargin(newM) ? ' lowmargin' : '';
     html+='<tr>'
+      +'<td class="actcell"><button class="hold-btn" data-key="'+esc(p.rowKey)+'" title="この商品を今回の見積から外して「検討中（除外）」へ移します">🤔 検討中</button></td>'
       +'<td><span class="sup-badge">'+esc(p.supplier)+'</span></td>'
       +'<td class="pcode">'+esc(p.productCode||'')+'</td>'
       +'<td>'+prodLink(c.name, p.supplier, p.productCode, p.productName)+'</td>'
@@ -480,7 +529,13 @@ function selectCust(name){
       +'</tr>';
   }
   html+='</tbody></table></div>';
+  // 別枠：🤔 検討中（除外）／✅ 提出済み（発行したアイテム）
+  html+=sectionHtml('🤔 検討中（見積から除外）', c.holdProducts, 'hold');
+  html+=sectionHtml('✅ 提出済み（発行したアイテム）', c.issuedProducts, 'issued');
   $('#detailCol').innerHTML=html;
+  // 「🤔 検討中へ」「↩ 対象へ戻す」の配線
+  $('#detailCol').querySelectorAll('button.hold-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'hold')));
+  $('#detailCol').querySelectorAll('button.back-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'')));
   // 行まるめの変更 → その行だけ別のまるめで再計算（サーバ集計＝見積書と同じ計算）。
   //  ※ rowround も .rowrule クラスを持つので、行ルールの配線が拾わないよう先に処理して除外する。
   $('#detailCol').querySelectorAll('select.rowround').forEach(sel=>{
@@ -598,7 +653,7 @@ function doIssue(opts){
         for(const nm of res.issuedCustomers){ const prev=ISSUED[nm]||{}; ISSUED[nm]={lastIssuedAt:now,count:(prev.count||0)+1,quoteNo:prev.quoteNo||'',itemCount:prev.itemCount||0,folder:res.folderName||''}; }
         renderList(); if(selName) selectCust(selName);
       }
-      loadIssueLog().then(()=>{ renderList(); if(selName&&DATA.find(x=>x.name===selName)) selectCust(selName); }); // サーバの正確な記録で上書き
+      loadIssueLog().then(()=>load()); // 履歴更新＋顧客データ再取得（発行したアイテムを「提出済み」別枠へ移す）
       showResult(res);
     }).catch(e=>{ setExpBusy(false); showExportMsg('発行に失敗: '+(e&&e.message||e),true); });
 }

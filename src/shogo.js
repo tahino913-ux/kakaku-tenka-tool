@@ -113,6 +113,48 @@ function mergeMakerFiles(makerFiles, channelMap) {
   return res;
 }
 
+// 販売実績レコードを取得する（DB直結 or ファイル）。run()＝照合 と サーバの「自社品検索(休眠の手動紐付け)」で共用。
+//  opts.settings: getSettings() 相当（省略時は読み直す） / opts.hanbaiArg: 明示した販売実績ファイル（あれば常にファイル優先）
+//  opts.log: 進捗ログ関数（省略時は無音）。戻り値: hanbai.js:parseHanbai 形のレコード配列。
+//  ※ 取得ロジックは run() と完全に同じ（DB 'db'/'auto'/'file' とフォールバック）。1か所に集約して二重実装を避ける。
+function loadHanbaiRecords(opts) {
+  opts = opts || {};
+  const s = opts.settings || getSettings();
+  const hanbaiArg = opts.hanbaiArg || null;
+  const log = opts.log || function () {};
+  // 販売実績の取得元。'db'=販売大臣SQL直結(読み取り専用) / 'auto'=DBが繋がれば直結・ダメならファイル / 'file'(既定)=ファイル。
+  //  引数で販売実績ファイルを明示した時は常にファイルを優先。
+  const mode = (!hanbaiArg && s.hanbai && s.hanbai.source) || 'file';
+  let hanbai = null;
+  if (mode === 'db' || mode === 'auto') {
+    try {
+      log('販売実績を 販売大臣DB から直接取得中…（読み取り専用・書き込みなし）');
+      const { loadHanbaiFromDb } = require('./db_hanbai');
+      // candidateMonths（照合に含める さかのぼり期間・/self で変更）を db 設定に載せて渡す。
+      hanbai = loadHanbaiFromDb(Object.assign({}, (s.hanbai && s.hanbai.db) || {}, { candidateMonths: (s.hanbai && s.hanbai.candidateMonths) }));
+      log('販売実績レコード: ' + hanbai.length + ' 件（DB: ' + ((s.hanbai.db && s.hanbai.db.database) || '') + '）');
+    } catch (e) {
+      if (mode === 'db') throw e; // 'db'(厳格)は失敗＝中断（古いファイルで黙って続行しない）
+      log('⚠ DB直結に失敗→販売実績ファイルにフォールバックします: ' + String(e && e.message || e).split('\n')[0]);
+      hanbai = null;
+    }
+  }
+  if (hanbai === null) {
+    const hanbaiSrc = resolveHanbaiSource(hanbaiArg || (s.hanbai && s.hanbai.path));
+    if (!hanbaiSrc) {
+      throw new Error('販売実績が見つかりません。config.js の hanbai.path を確認してください（指定: ' + ((s.hanbai && s.hanbai.path) || '未設定') + '）');
+    }
+    let hanbaiCsv = hanbaiSrc;
+    if (isXls(hanbaiSrc)) {
+      log('販売実績(.XLS)をCSVへ変換中… ' + path.basename(hanbaiSrc));
+      hanbaiCsv = xlsToCsv(hanbaiSrc);
+    }
+    hanbai = loadHanbai(hanbaiCsv);
+    log('販売実績レコード: ' + hanbai.length + ' 件（' + path.basename(hanbaiSrc) + '）');
+  }
+  return hanbai;
+}
+
 function run(argv) {
   const s = getSettings();
   const nameFloor = (s.hanbai && Number(s.hanbai.nameFloor)) || 60;
@@ -133,36 +175,9 @@ function run(argv) {
     makerArg = args[0]; hanbaiArg = null;
   }
 
-  // 販売実績の取得元。'db'=販売大臣SQL Server直結(読み取り専用) / 'auto'=DBが繋がれば直結・ダメならファイル
-  //  / 'file'(既定)=従来どおりファイル(CSV/XLS)。引数で販売実績ファイルを明示した時は常にファイルを優先。
-  //  ※ 'auto' は会社PC(DBあり)=直結／自宅PC(DBなし・Drive同期)=ファイル を1設定で両立させるため。
-  const mode = (!hanbaiArg && s.hanbai && s.hanbai.source) || 'file';
-  let hanbai = null;
-  if (mode === 'db' || mode === 'auto') {
-    try {
-      console.log('販売実績を 販売大臣DB から直接取得中…（読み取り専用・書き込みなし）');
-      const { loadHanbaiFromDb } = require('./db_hanbai');
-      hanbai = loadHanbaiFromDb((s.hanbai && s.hanbai.db) || {});
-      console.log('販売実績レコード: ' + hanbai.length + ' 件（DB: ' + ((s.hanbai.db && s.hanbai.db.database) || '') + '）');
-    } catch (e) {
-      if (mode === 'db') throw e; // 'db'(厳格)は失敗＝中断（古いファイルで黙って続行しない）
-      console.log('⚠ DB直結に失敗→販売実績ファイルにフォールバックします: ' + String(e && e.message || e).split('\n')[0]);
-      hanbai = null;
-    }
-  }
-  if (hanbai === null) {
-    const hanbaiSrc = resolveHanbaiSource(hanbaiArg || (s.hanbai && s.hanbai.path));
-    if (!hanbaiSrc) {
-      throw new Error('販売実績が見つかりません。config.js の hanbai.path を確認してください（指定: ' + ((s.hanbai && s.hanbai.path) || '未設定') + '）');
-    }
-    let hanbaiCsv = hanbaiSrc;
-    if (isXls(hanbaiSrc)) {
-      console.log('販売実績(.XLS)をCSVへ変換中… ' + path.basename(hanbaiSrc));
-      hanbaiCsv = xlsToCsv(hanbaiSrc);
-    }
-    hanbai = loadHanbai(hanbaiCsv);
-    console.log('販売実績レコード: ' + hanbai.length + ' 件（' + path.basename(hanbaiSrc) + '）');
-  }
+  // 販売実績の取得（DB直結 or ファイル）。取得ロジックは loadHanbaiRecords に集約（'auto'=会社PCは
+  //  DB直結／自宅PCはファイル を1設定で両立）。引数で販売実績ファイルを明示した時は常にファイル優先。
+  const hanbai = loadHanbaiRecords({ settings: s, hanbaiArg, log: console.log });
 
   // .xlsx のメーカー見積を maker_quotes/ のCSVへ展開（ドロップ→照合.bat だけで使える）
   const expandXlsx = (file) => {
@@ -220,4 +235,4 @@ if (require.main === module) {
   try { run(process.argv); }
   catch (e) { console.error('✗ ' + (e && e.message || e)); process.exit(1); }
 }
-module.exports = { run, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey, fileTimeOf };
+module.exports = { run, loadHanbaiRecords, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey, fileTimeOf };

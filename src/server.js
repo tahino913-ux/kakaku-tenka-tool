@@ -22,7 +22,7 @@ const { SUPPLIERS_PAGE } = require('./suppliersPage');
 const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
 const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile } = require('./settings');
-const { run: runShogo, resolveHanbaiSource } = require('./shogo');
+const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords } = require('./shogo');
 const { readXlsxBuffer } = require('./xlsxread');
 const { detectColumns: detectMakerCols, serialToDate } = require('./makerXlsx');
 const { loadCsv } = require('./csv');
@@ -66,6 +66,49 @@ function recordIssuance(issued, folderName, atIso) {
     };
   }
   writeIssueLog(log);
+}
+
+// ---- 得意先別アイテムの状態（検討中＝除外／提出済み）-------------------
+//  { 得意先名: { rowKey: { s:'hold'|'issued', at?, quoteNo? } } }
+//  s='hold'（検討中）＝今回の見積から外すが一覧には残す。s='issued'（提出済み）＝発行済みで別枠へ。
+//  価格・照合には無影響＝見積書に「載せる/載せない」と表示の振り分けだけ。output/=Drive同期で両PC共有。
+const ITEM_STATUS_PATH = path.join(OUTPUT_DIR, '品目ステータス.json');
+function readItemStatus() {
+  try { return JSON.parse(fs.readFileSync(ITEM_STATUS_PATH, 'utf8') || '{}') || {}; }
+  catch (e) { return {}; }
+}
+function writeItemStatus(map) {
+  try { fs.mkdirSync(OUTPUT_DIR, { recursive: true }); fs.writeFileSync(ITEM_STATUS_PATH, JSON.stringify(map || {}, null, 2), 'utf8'); }
+  catch (e) { /* 記録失敗は見積自体を妨げない */ }
+}
+// 検討中(hold)のON/OFF・提出済み(issued)の解除。status=''で「対象に戻す」（hold/issued どちらも解除）。
+function setItemStatus(customer, rowKey, status) {
+  const map = readItemStatus();
+  if (!customer || !rowKey) return map;
+  if (status === 'hold') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = { s: 'hold' }; }
+  else if (map[customer]) { delete map[customer][rowKey]; if (!Object.keys(map[customer]).length) delete map[customer]; }
+  writeItemStatus(map);
+  return map;
+}
+// 発行時に「対象だったアイテム」を提出済みへ（rowKey 単位）。
+function markItemsIssued(customer, rowKeys, quoteNo, atIso) {
+  if (!customer || !rowKeys || !rowKeys.length) return;
+  const map = readItemStatus();
+  if (!map[customer]) map[customer] = {};
+  for (const k of rowKeys) map[customer][k] = { s: 'issued', at: atIso, quoteNo: quoteNo || '' };
+  writeItemStatus(map);
+}
+// 提出済み(issued)だけを対象へ戻す（検討中 hold は残す）。customer 指定でその得意先のみ、無指定で全件。
+//  「提出履歴をリセット（新サイクル）」「提出済みを取消」と歩調を合わせる。
+function clearIssuedStatuses(customer) {
+  const map = readItemStatus();
+  const custs = customer ? [customer] : Object.keys(map);
+  for (const c of custs) {
+    if (!map[c]) continue;
+    for (const k of Object.keys(map[c])) if (map[c][k] && map[c][k].s === 'issued') delete map[c][k];
+    if (!Object.keys(map[c]).length) delete map[c];
+  }
+  writeItemStatus(map);
 }
 
 // ---- 入力CSVの読込キャッシュ（ファイル名+更新時刻で判定） ----------
@@ -464,6 +507,46 @@ function linkContext(supplier) {
   return { ok: true, supplier: sup, makerNames: [...names].sort((a, b) => a.localeCompare(b, 'ja')), links };
 }
 
+// 販売実績レコードのキャッシュ（自社品検索の連打で毎回DB/ファイルを読まないよう短時間キャッシュ）。
+//  ※ 照合(shogo)は毎回フレッシュに読むのでこのキャッシュは「自社品検索」専用。force で破棄して読み直せる。
+let _hanbaiCache = null; // { at, records }
+function getHanbaiRecordsCached(force) {
+  const TTL = 5 * 60 * 1000; // 5分（DB読取は約1.5秒・ファイルも数秒かかるため）
+  if (!force && _hanbaiCache && (Date.now() - _hanbaiCache.at) < TTL) return _hanbaiCache.records;
+  const records = loadHanbaiRecords({ settings: getSettings() }); // ログは無音（UI用途）
+  _hanbaiCache = { at: Date.now(), records };
+  return records;
+}
+
+// 休眠（メーカー品が自社品に1つも当たっていない行）を手動で直すための「自社販売実績品の候補」。
+//  メイン画面の休眠行に自社CDが無い＝従来は紐付けできなかった。ここで販売実績から自社CDの一覧を返し、
+//  利用者が「このメーカー品＝この自社実績品」を選べるようにする（保存は既存の /api/product-link）。
+//  戻り値: { ok, supplier, supplierPurchaseCode, count, products:[{code,name,purchaseCode,currentSell}] }（自社CDで重複排除）。
+function selfProducts(supplier, force) {
+  const sup = String(supplier || '').trim();
+  const { coreName } = require('./hanbai');
+  const recs = getHanbaiRecordsCached(force);
+  const byCode = new Map(); // 自社CD -> 代表レコード（現売単価が最大＝主力得意先のものを残す）
+  for (const r of recs) {
+    const code = String(r.productCode || '').trim();
+    if (!code) continue;
+    const cur = byCode.get(code);
+    const sell = fin(r.currentSell) ? r.currentSell : null;
+    if (!cur || (sell != null && (cur.currentSell == null || sell > cur.currentSell))) {
+      byCode.set(code, {
+        code,
+        name: (coreName(r.productName || '') || r.productName || '').replace(/\s+/g, ' ').trim(),
+        purchaseCode: r.purchaseCode || '',
+        currentSell: sell,
+      });
+    }
+  }
+  const makers = getMakers() || {};
+  const supPC = (makers[sup] && makers[sup].purchaseCode) || '';
+  const products = [...byCode.values()].sort((a, b) => String(a.code).localeCompare(String(b.code)));
+  return { ok: true, supplier: sup, supplierPurchaseCode: supPC, count: products.length, products };
+}
+
 // 行配列から損益サマリを作る（calcAll の summary と同じ式）。calc-by-date 用。
 function summarizeRows(rows) {
   let totalCostImpact = 0, totalSellImpact = 0, sumCurSales = 0, sumCurProfit = 0, sumNewSales = 0, sumNewProfit = 0, withQty = 0, estimated = 0;
@@ -496,6 +579,7 @@ function calcByDate(body) {
   const rounding = body && body.rounding ? body.rounding : getSettings().rounding;
   const selfUplift = body ? body.selfUplift : 0;
   const files = listLatestCsv();
+  const itemStatusMap = readItemStatus(); // 各行の進捗（提出済み/検討中）を 得意先別ページと同じ rowKey で引く
   const rows = [];
   const supSet = new Set();
   for (const f of files) {
@@ -506,7 +590,11 @@ function calcByDate(body) {
       if (!r.customerName || r.customerName === '-' || /未一致/.test(r.matchStatus || '')) continue; // 休眠/未一致は除外
       const eff = normDateInput(r.effectiveDate || r.switchDate || '');
       if (eff !== date) continue;
-      rows.push(Object.assign({ supplier: sup }, r)); // 行に仕入先を付与（横断ビューで表示）
+      // 得意先別ページの状態（''=未提出/対象・hold=検討中・issued=提出済み）を rowKey で引く。
+      const prodKey = (r.productCode != null && String(r.productCode).trim() !== '') ? normName(String(r.productCode)) : ('名:' + normName(r.productName));
+      const rowKey = r.customerName + '\u0001' + sup + '\u0001' + prodKey;
+      const stEntry = (itemStatusMap[r.customerName] && itemStatusMap[r.customerName][rowKey]) || null;
+      rows.push(Object.assign({ supplier: sup, itemStatus: (stEntry && stEntry.s) || '' }, r)); // 行に仕入先＋進捗を付与
       supSet.add(sup);
     }
   }
@@ -514,7 +602,10 @@ function calcByDate(body) {
   rows.sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
     String(a.customerName).localeCompare(String(b.customerName), 'ja') ||
     String(a.productName).localeCompare(String(b.productName), 'ja'));
-  return { ok: true, date, rows, summary: summarizeRows(rows), count: rows.length, supplierCount: supSet.size };
+  // 進捗の内訳（提出済み／検討中／未提出）。カレンダー日付ビューの「どこまで進んだか」表示用。
+  const statusCounts = { issued: 0, hold: 0, todo: 0 };
+  for (const r of rows) { const s = r.itemStatus; if (s === 'issued') statusCounts.issued++; else if (s === 'hold') statusCounts.hold++; else statusCounts.todo++; }
+  return { ok: true, date, rows, summary: summarizeRows(rows), count: rows.length, supplierCount: supSet.size, statusCounts };
 }
 
 // ---- 実施日カレンダー（全仕入先 横断）の集計 ---------------------------
@@ -942,7 +1033,7 @@ function buildCustomerCandidates(opts) {
   // 仕入先ごと最新1本だけ読む（案A：照合は仕入先ごとに統合済み＝最新の取り込みが反映される）。
   //  以前は input/ の全CSVを読んでいたため、古い照合結果が混ざって更新前の価格が残る恐れがあった。
   const files = listLatestCsv();
-  // 得意先名 -> Map(key=仕入先商品 -> { supplier, r, score, priceReason })
+  // 得意先名 -> Map(key=仕入先\u0001商品 -> { supplier, r, score, priceReason })
   const byCustomer = new Map();
   const errors = [];
   for (const file of files) {
@@ -958,7 +1049,7 @@ function buildCustomerCandidates(opts) {
       const m = byCustomer.get(cust);
       const prodKey = (r.productCode != null && String(r.productCode).trim() !== '')
         ? normName(r.productCode) : ('名:' + normName(r.productName));
-      const key = supplier + '' + prodKey; // 仕入先が違えば別行（統合見積書と同じ扱い）
+      const key = supplier + '\u0001' + prodKey; // 仕入先が違えば別行（統合見積書と同じ扱い）
       const cand = { supplier, r, score: matchScore(r.matchStatus), priceReason: r.priceWarning || r.costConflict };
       const prev = m.get(key);
       if (!prev) { m.set(key, cand); }
@@ -978,6 +1069,7 @@ function buildCustomerCandidates(opts) {
   // 行ごと まるめ（改定後価格の端数処理）。{ rowKey: "単位|処理" 例 "1|floor" }。無ければ全体のまるめ。
   const rowRound = (opts.rowRound && typeof opts.rowRound === 'object') ? opts.rowRound : {};
   // keep（見積書に載る）/ review（要確認）へ振り分け（理由つき）
+  const itemStatusMap = readItemStatus(); // アイテムの状態（検討中/提出済み）。keep行に status を付ける。
   const byCustomerSplit = new Map(); // name -> { keep:[item], review:[item] }
   for (const [name, m] of byCustomer) {
     const keep = [], review = [];
@@ -985,7 +1077,7 @@ function buildCustomerCandidates(opts) {
       const r = cand.r;
       // 行を一意に識別するキー（得意先|仕入先|商品）。画面の行ルール上書きと突き合わせる。
       const prodKey = (r.productCode != null && String(r.productCode).trim() !== '') ? normName(String(r.productCode)) : ('名:' + normName(r.productName));
-      const rowKey = name + '' + cand.supplier + '' + prodKey;
+      const rowKey = name + '\u0001' + cand.supplier + '\u0001' + prodKey;
       let newSell = fin(r.newSell) ? r.newSell : null;
       let ruleForRow = ruleType;
       // 行ごとの上書き：転嫁ルール（行ルール）と まるめ（端数処理）を、それぞれ全体から差し替え可能。
@@ -1036,6 +1128,9 @@ function buildCustomerCandidates(opts) {
       const effPriceReason = effPriceWarning || (cand.r.costConflict || '');
       if (effPriceReason) { review.push(Object.assign({ reason: effPriceReason, reasonType: 'price' }, item)); continue; } // 価格異常
       if (cand.score < thr) { review.push(Object.assign({ reason: '一致度が低い（' + (r.matchStatus || '') + '）', reasonType: 'match' }, item)); continue; } // 低一致
+      const stEntry = (itemStatusMap[name] && itemStatusMap[name][rowKey]) || null;
+      item.status = (stEntry && stEntry.s) || ''; // ''=対象 / 'hold'=検討中 / 'issued'=提出済み
+      if (item.status === 'issued') { item.issuedAt = stEntry.at || ''; item.issuedQuoteNo = stEntry.quoteNo || ''; }
       keep.push(item);
     }
     byCustomerSplit.set(name, { keep, review });
@@ -1048,15 +1143,18 @@ function buildCustomerCandidates(opts) {
 function aggregateCustomers(opts) {
   const { byCustomer, fileCount, errors, applied } = buildCustomerCandidates(opts);
   const customers = [];
+  const bySupName = (a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.productName).localeCompare(String(b.productName), 'ja');
   for (const [name, { keep, review }] of byCustomer) {
     if (!keep.length) continue;
-    const suppliers = [...new Set(keep.map((p) => p.supplier))].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
-    const products = keep.slice().sort((a, b) =>
-      String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
-      String(a.productName).localeCompare(String(b.productName), 'ja'));
+    // 状態で3分割：対象（見積に載る）／検討中（除外）／提出済み（別枠）
+    const active = keep.filter((p) => !p.status).sort(bySupName);
+    const holdProducts = keep.filter((p) => p.status === 'hold').sort(bySupName);
+    const issuedProducts = keep.filter((p) => p.status === 'issued').sort(bySupName);
+    const suppliers = [...new Set(active.map((p) => p.supplier))].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
     customers.push({
-      name, productCount: products.length, supplierCount: suppliers.length,
-      suppliers, reviewCount: review.length, products,
+      name, productCount: active.length, supplierCount: suppliers.length,
+      suppliers, reviewCount: review.length, products: active,
+      holdProducts, issuedProducts, holdCount: holdProducts.length, issuedCount: issuedProducts.length,
     });
   }
   customers.sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
@@ -1073,8 +1171,10 @@ function exportCustomerQuotes(opts, doIssue) {
   if (opts.scope === 'one' && opts.customer) entries = entries.filter(([n]) => n === opts.customer);
   const reviewAll = [];
   for (const [name, d] of entries) for (const rv of d.review) reviewAll.push(Object.assign({ customer: name }, rv));
-  const issuable = entries.filter(([, d]) => d.keep.length > 0);
-  const issuableRowCount = issuable.reduce((s, [, d]) => s + d.keep.length, 0);
+  // 見積書に載るのは「対象」のみ＝検討中(hold)・提出済み(issued)は除外。
+  const activeOf = (d) => d.keep.filter((p) => !p.status);
+  const issuable = entries.filter(([, d]) => activeOf(d).length > 0);
+  const issuableRowCount = issuable.reduce((s, [, d]) => s + activeOf(d).length, 0);
 
   if (!doIssue) {
     // プレビュー：実際に見積書へ出力される内容（得意先ごとの明細）を、発行時と同じ並び・同じ値で返す。
@@ -1085,7 +1185,7 @@ function exportCustomerQuotes(opts, doIssue) {
     const preview = [];
     for (const [customer, d] of issuable) {
       if (preview.length >= PV_CUST_CAP || rowBudget <= 0) break;
-      const keep = d.keep.slice().sort((a, b) =>
+      const keep = activeOf(d).sort((a, b) =>
         String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
         String(a.productName).localeCompare(String(b.productName), 'ja'));
       const rows = keep.slice(0, rowBudget).map((p) => ({
@@ -1094,7 +1194,7 @@ function exportCustomerQuotes(opts, doIssue) {
         effectiveDate: p.effectiveDate, note: p.note || '',
       }));
       rowBudget -= rows.length;
-      preview.push({ customer, productCount: d.keep.length, rows });
+      preview.push({ customer, productCount: keep.length, rows });
     }
     return {
       ok: true, action: 'check', applied, threshold: thr,
@@ -1117,8 +1217,9 @@ function exportCustomerQuotes(opts, doIssue) {
   const ymd = (() => { const d2 = new Date(); const p = (n) => String(n).padStart(2, '0'); return '' + d2.getFullYear() + p(d2.getMonth() + 1) + p(d2.getDate()); })();
   const files = [];
   const issued = []; // 提出履歴用（得意先・見積No・品数）
+  const atIso = new Date().toISOString();
   for (const [customer, d] of issuable) {
-    const keep = d.keep.slice().sort((a, b) =>
+    const keep = activeOf(d).sort((a, b) =>
       String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
       String(a.productName).localeCompare(String(b.productName), 'ja'));
     const qrows = keep.map((p) => ({
@@ -1129,9 +1230,11 @@ function exportCustomerQuotes(opts, doIssue) {
     writeQuote(customer, qrows, path.join(folder, fname), Object.assign({}, opt, { quoteNo }));
     files.push(fname);
     issued.push({ customer, quoteNo, itemCount: keep.length });
+    // 発行した「対象」アイテムを提出済みへ＝次回から別枠（提出済み）に並び、作業表から外れる。
+    markItemsIssued(customer, keep.map((p) => p.rowKey), quoteNo, atIso);
   }
   // 提出履歴を記録（得意先ページで「提出済み」を表示するため）。価格・照合には無影響。
-  recordIssuance(issued, path.basename(folder), new Date().toISOString());
+  recordIssuance(issued, path.basename(folder), atIso);
   let reviewFile = null;
   if (reviewAll.length) {
     const rows = reviewAll.map((r) => ({
@@ -1161,6 +1264,7 @@ function collectHanbaiExportLines(cutoffIso, issuedOnly) {
   for (const [name, { keep }] of byCustomer) {
     if (issuedOnly && !issued[name]) continue; // 「発行済みのみ」モードでは発行済み得意先だけ
     for (const it of keep) {
+      if (it.status === 'hold') continue;                      // 検討中（除外）は基幹更新にも載せない（提出済みは載せる）
       const eff = String(it.effectiveDate || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;         // 実施日がISOで取れない行は対象外
       if (cutoff && eff > cutoff) continue;                    // まだ実施日が来ていない行は除外
@@ -1207,6 +1311,7 @@ function collectCostUpdateLines(cutoffIso) {
   const byProduct = new Map(); // 商品コード -> line（実施日が新しい方）
   for (const [, sp] of byCustomer) {
     for (const it of sp.keep) {
+      if (it.status === 'hold') continue;                  // 検討中（除外）は基幹更新にも載せない（提出済みは載せる）
       const eff = String(it.effectiveDate || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;     // 実施日がISOで取れない行は対象外
       if (cutoff && eff > cutoff) continue;                // まだ実施日が来ていない行は除外
@@ -1408,7 +1513,18 @@ const server = http.createServer(async (req, res) => {
       const cust = body && body.customer;
       if (cust) { const log = readIssueLog(); delete log[cust]; writeIssueLog(log); } // 1得意先だけ取消
       else { writeIssueLog({}); }                                                     // 全リセット（新サイクル用）
+      clearIssuedStatuses(cust || null); // 提出済みアイテムも対象へ戻す（検討中は残す）＝バッジと別枠を同期
       return sendJson(res, 200, { ok: true, log: readIssueLog() });
+    }
+    if (req.method === 'POST' && url === '/api/item-status') {
+      // 得意先別アイテムの状態：'hold'=検討中（見積から除外）/ ''=対象に戻す（提出済みの戻しにも使う）。
+      const body = await readBody(req);
+      const customer = String((body && body.customer) || '').trim();
+      const rowKey = String((body && body.rowKey) || '').trim();
+      const status = (body && body.status === 'hold') ? 'hold' : '';
+      if (!customer || !rowKey) return sendJson(res, 200, { ok: false, error: 'customer と rowKey は必須です' });
+      setItemStatus(customer, rowKey, status);
+      return sendJson(res, 200, { ok: true });
     }
     if (req.method === 'GET' && url === '/api/suppliers') {
       return sendJson(res, 200, { suppliers: getSuppliers() });
@@ -1481,11 +1597,23 @@ const server = http.createServer(async (req, res) => {
           dbRange = { start: dbCfg.start || r.start, end: dbCfg.end || r.end };
         } catch (e) { /* ignore */ }
       }
+      // 照合に含めるさかのぼり期間（既定12か月）。年間金額(損益)は常に直近約1年なので歪まない。
+      const candidateMonths = Math.max(12, Math.min(60, Math.round(Number((s.hanbai && s.hanbai.candidateMonths)) || 12)));
       return sendJson(res, 200, {
         configured, isDir, dirPath, resolved,
         resolvedName: resolved ? path.basename(resolved) : null,
-        mtime, size, format, source, dbRange,
+        mtime, size, format, source, dbRange, candidateMonths,
       });
+    }
+    if (req.method === 'POST' && url === '/api/hanbai-period') {
+      // 照合に含める「さかのぼり期間（月数）」を保存。12〜60に丸める。年間金額(損益)は直近約1年のまま。
+      const body = await readBody(req);
+      let months = Math.round(Number(body && body.months));
+      if (!Number.isFinite(months)) return sendJson(res, 200, { ok: false, error: '月数が不正です' });
+      months = Math.max(12, Math.min(60, months));
+      saveSettings({ hanbai: { candidateMonths: months } }); // hanbai は浅いマージ＝source/db は保持
+      _hanbaiCache = null; // 自社品検索のキャッシュも破棄（次回 最新期間で読む）
+      return sendJson(res, 200, { ok: true, candidateMonths: months });
     }
     if (req.method === 'POST' && url === '/api/upload-self') {
       const body = await readBody(req);
@@ -1689,6 +1817,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url === '/api/link-context') {
       try { const sp = new URLSearchParams(req.url.split('?')[1] || ''); return sendJson(res, 200, linkContext(sp.get('supplier') || '')); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    if (req.method === 'GET' && url === '/api/self-products') {
+      // 休眠（メーカー品が未マッチ）の手動紐付け用：販売実績の自社品（自社CD）候補を返す。
+      try { const sp = new URLSearchParams(req.url.split('?')[1] || ''); return sendJson(res, 200, selfProducts(sp.get('supplier') || '', sp.get('force') === '1')); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
     }
     if (req.method === 'POST' && url === '/api/export') {
@@ -2266,14 +2399,22 @@ async function runShogo(){
   finally{ btn.disabled=false; }
 }
 
+// 進捗バッジ（実施日カレンダーの横断ビュー用）。得意先別ページの状態を表示＝この実施日の品が
+//  どこまで進んだか（提出済み／検討中で外した／まだ未提出）が一目で分かる。
+function progressBadge(st){
+  if(st==='issued') return '<div style="font-size:10px;font-weight:700;color:#1f6b35;margin-top:1px">✅ 提出済み</div>';
+  if(st==='hold')   return '<div style="font-size:10px;font-weight:700;color:#8a5a12;margin-top:1px">🤔 検討中（除外）</div>';
+  return '<div style="font-size:10px;font-weight:700;color:#b1432f;margin-top:1px">⬜ 未提出</div>';
+}
 // 1行ぶんの <tr> を組み立てて tbody へ。readOnly=true（実施日フィルタの横断ビュー）では
-//  改定後仕入の編集欄・行ルール・紐付けボタンを出さず、仕入先名を商品名の下に小さく添える。
+//  改定後仕入の編集欄・行ルール・紐付けボタンを出さず、仕入先名＋進捗を商品名の下に小さく添える。
 function buildMainRow(r, i, readOnly){
   const tr = document.createElement('tr');
   tr.id='row'+i;
   if(isUnmatched(r)) tr.className='unmatched';
   let prodName = buildProdNameHtml(r);
   if(readOnly && r.supplier) prodName += '<div style="font-size:10px;color:#1f6fb2;margin-top:2px">🏢 '+esc(r.supplier)+'</div>';
+  if(readOnly) prodName += progressBadge(r.itemStatus);
   const costCell = readOnly
     ? '<td class="r">'+num(r.newCost)+'</td>'
     : '<td class="r"><input class="num newcost" data-i="'+i+'" type="number" step="0.01" value="'+(Number.isFinite(r.newCost)?r.newCost:'')+'"></td>';
@@ -2349,7 +2490,11 @@ async function loadByDate(dateIso, label){
   syncHScroll();
   const lab = label || (function(d){ const p=String(d).split('-'); return Number(p[0])+'年'+Number(p[1])+'月'+Number(p[2])+'日'; })(dateIso);
   const bar=$('#dateFilterBar');
-  $('#dateFilterLabel').textContent='📅 '+lab+' の改定 '+res.count+'件（全'+res.supplierCount+'仕入先）';
+  const sc = res.statusCounts || {issued:0,hold:0,todo:0};
+  $('#dateFilterLabel').innerHTML='📅 '+esc(lab)+' の改定 '+res.count+'件（全'+res.supplierCount+'仕入先）'
+    +' ｜ <span style="color:#1f6b35">✅提出済 '+sc.issued+'</span>'
+    +' <span style="color:#8a5a12">🤔検討中 '+sc.hold+'</span>'
+    +' <span style="color:#b1432f">⬜未提出 '+sc.todo+'</span>';
   bar.style.display='flex';
   // 表が見えるようにスクロール
   const w=$('#wrap'); if(w) w.scrollIntoView({behavior:'smooth',block:'start'});
@@ -2373,7 +2518,11 @@ function linkCellHtml(r, i){
   // 確定済み判定：現在ファイルの紐付け辞書 or 行のステータスが「📌 手動紐付け」（横断ビューは辞書が空なので後者で判定）
   const linked = code && (currentLinks[code] === r.makerName || /📌/.test(r.matchStatus||''));
   if (linked) return '<span style="color:#1e7e34;font-weight:600">📌 確定</span> <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
-  if (!code) return '<span class="hint">—</span>';
+  if (!code) {
+    // 休眠（メーカー品が自社品に未マッチ）でも、メーカー商品名があれば「実績のある自社品を選んで紐付け」できる
+    if (r.makerName) return '<button class="linkBtn" data-i="'+i+'" style="font-size:11px;color:#b8860b" title="実績のある自社品を選んで、このメーカー品に紐付けます">✏ 実績と紐付け</button>';
+    return '<span class="hint">—</span>';
+  }
   return '<button class="linkBtn" data-i="'+i+'" style="font-size:11px;color:#6b7785">✏ 紐付け</button>';
 }
 
@@ -2407,28 +2556,38 @@ function linkDecisiveDiff(selfCore, maker){
   return { onlyMaker, onlySelf, hasDiff: onlyMaker.length>0 || onlySelf.length>0 };
 }
 
-// 編集モーダル: 自社CD ⇔ メーカー商品 を選び直す or 解除する
-// 検索/類似度順/決定的トークン警告つきで、007485 のような誤紐付けを防ぐ
+// 編集モーダル: 自社CD ⇔ メーカー商品 を選び直す or 解除する。検索/類似度順/決定的トークン警告つき。
+//  2モード:
+//   ・maker（自社CDがある行）= 従来。自社品に対して「確定するメーカー商品」を選ぶ。
+//   ・self （自社CDが無い休眠行）= 新。メーカー品(固定)に対して「実績のある自社品」を販売実績から選ぶ。
+//     ＝休眠（メーカー品が自社品に1つも当たっていない）を、画面から直接 手動紐付けで救済できる。
 async function openLinkModal(idx){
   const r = baseRows[idx]; if(!r) return;
-  if (!r.productCode){ alert('自社商品コードが空のため紐付けできません（販売実績側で先に紐付けるか、要確認.xlsx を確認してください）'); return; }
-  // 仕入先・候補・既存紐付けを決める。実施日フィルタ（全仕入先 横断・読み取り）中は「行の仕入先(r.supplier)」で引く。
-  let supplier, makerNames, links;
-  if (dateFilter){
-    supplier = r.supplier || '';
-    if (!supplier){ alert('この行は仕入先が不明で紐付けできません'); return; }
-    const ctx = await fetch('/api/link-context?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
-    if (!ctx || !ctx.ok){ alert('紐付け候補の取得に失敗しました'); return; }
-    makerNames = ctx.makerNames || []; links = ctx.links || {};
-  } else {
-    if (!currentSupplier){ alert('仕入先が確定できないファイルです（紐付けは保存できません）'); return; }
-    supplier = currentSupplier; makerNames = allMakerNames; links = currentLinks;
-  }
-  const cur = links[r.productCode] || '';
+  // 仕入先の確定（横断ビューは行の仕入先、通常は選択中ファイルの仕入先）
+  const supplier = dateFilter ? (r.supplier || '') : (currentSupplier || '');
+  if (!supplier){ alert('仕入先が確定できない行です（紐付けは保存できません）'); return; }
+  const mode = r.productCode ? 'maker' : 'self';
+  if (mode === 'self' && !r.makerName){ alert('この行はメーカー商品名が無いため紐付けできません'); return; }
+
+  // モード別: 固定側の表示・選ぶ側のタイトル・類似度の比較基準・保存ペイロード
   const selfCore = r.productNameCore || r.productName || '';
-  // 候補を類似度でスコアリング・降順ソート
-  const scored = makerNames.map((n) => ({ name:n, score:linkSim(selfCore, n) }))
-    .sort((a,b) => b.score - a.score);
+  let fixedHtml, pickTitle, baseName, savePayload;
+  if (mode === 'maker'){
+    fixedHtml = '<b>自社商品:</b> '+esc(r.productCode||'')+' <span style="color:#1f4e78">'+esc(selfCore)+'</span>';
+    pickTitle = '確定するメーカー商品';
+    baseName = selfCore;
+    savePayload = (val)=>({ supplier: supplier, productCode: r.productCode, makerName: val });
+  } else {
+    const mk = (r.makerCode? '['+r.makerCode+'] ':'') + (r.makerName||'');
+    fixedHtml = '<b>メーカー商品（休眠＝未マッチ）:</b> <span style="color:#8a5a00">'+esc(mk)+'</span>';
+    pickTitle = '紐付ける自社商品（販売実績から選ぶ）';
+    baseName = r.makerName || '';
+    savePayload = (val)=>({ supplier: supplier, productCode: val, makerName: r.makerName });
+  }
+
+  const noteHtml = (mode === 'maker')
+    ? '⚠ 保存すると、その自社商品はこのメーカー品に固定されます。次回の照合(↻ボタン)から優先適用されます。先頭の「— 解除」を選ぶと自動マッチに戻ります。'
+    : '⚠ 保存すると、その自社品（販売実績）がこのメーカー品に固定されます。<b>休眠の解消は「↻ 照合を実行」で反映</b>されます（保存後にそのまま実行できます）。';
 
   const wrap = document.createElement('div');
   wrap.innerHTML =
@@ -2436,34 +2595,63 @@ async function openLinkModal(idx){
     '<div id="linkDlg" style="position:fixed;top:6%;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;padding:18px;width:640px;max-width:95%;z-index:9001;box-shadow:0 10px 40px rgba(0,0,0,.2)">'+
       '<h3 style="margin:0 0 12px">📌 商品紐付けの編集</h3>'+
       '<div style="margin-bottom:6px"><b>仕入先:</b> '+esc(supplier)+'</div>'+
-      '<div style="margin-bottom:6px"><b>自社商品:</b> '+esc(r.productCode||'')+' <span style="color:#1f4e78">'+esc(selfCore)+'</span></div>'+
-      '<div style="margin-bottom:10px;font-size:12px;color:#6b7785"><b>現在の照合:</b> '+esc(r.matchStatus||'')+' / '+esc(r.makerName||'(未マッチ)')+'</div>'+
-      '<div style="margin-bottom:4px"><b>確定するメーカー商品</b> <span style="font-size:11px;color:#6b7785">（自社商品との類似度順。✓=80%以上）</span></div>'+
-      '<input id="linkSearch" placeholder="🔍 商品名で絞り込み（部分一致）" style="width:100%;padding:6px;margin-bottom:4px;border:1px solid #c7ced8;border-radius:4px;font:inherit;box-sizing:border-box">'+
+      '<div style="margin-bottom:6px">'+fixedHtml+'</div>'+
+      '<div style="margin-bottom:10px;font-size:12px;color:#6b7785"><b>現在の照合:</b> '+esc(r.matchStatus||(mode==='self'?'休眠':''))+' / '+esc(r.makerName||'(未マッチ)')+'</div>'+
+      '<div style="margin-bottom:4px"><b>'+pickTitle+'</b> <span style="font-size:11px;color:#6b7785">（類似度順。✓=80%以上）</span></div>'+
+      '<input id="linkSearch" placeholder="🔍 商品名・コードで絞り込み（部分一致）" style="width:100%;padding:6px;margin-bottom:4px;border:1px solid #c7ced8;border-radius:4px;font:inherit;box-sizing:border-box">'+
       '<select id="linkPick" size="8" style="width:100%;padding:4px;font:inherit;border:1px solid #c7ced8;border-radius:4px;box-sizing:border-box"></select>'+
       '<div id="linkWarn" style="margin-top:8px;padding:8px;background:#fdecea;border:1px solid #f3c0c0;border-radius:4px;font-size:12px;color:#8a3a3a;display:none"></div>'+
-      '<div style="margin-top:10px;background:#fff8e1;border:1px solid #ffe082;padding:8px;border-radius:4px;font-size:11px;color:#5a4a1a">'+
-        '⚠ 保存すると、その自社商品はこのメーカー品に固定されます。次回の照合(↻ボタン)から優先適用されます。先頭の「— 解除」を選ぶと自動マッチに戻ります。'+
-      '</div>'+
+      '<div style="margin-top:10px;background:#fff8e1;border:1px solid #ffe082;padding:8px;border-radius:4px;font-size:11px;color:#5a4a1a">'+noteHtml+'</div>'+
       '<div style="text-align:right;margin-top:12px">'+
         '<button id="linkCancel" style="margin-right:8px;padding:6px 14px">キャンセル</button>'+
         '<button id="linkSave" style="padding:6px 14px;background:#1976d2;color:#fff;border:none;border-radius:4px;cursor:pointer">保存</button>'+
       '</div>'+
     '</div>';
   document.body.appendChild(wrap);
-  const sel = $('#linkPick'), search = $('#linkSearch'), warn = $('#linkWarn');
+  const sel = $('#linkPick'), search = $('#linkSearch'), warn = $('#linkWarn'), saveBtn = $('#linkSave');
+
+  // 候補の読み込み（maker=メーカー商品名 / self=販売実績の自社品）。self は非同期取得なので先に「読込中」を出す。
+  //  各候補: { value(保存値), simName(類似度の比較名), label(表示), samePc(同じ発注先) }
+  sel.innerHTML = '<option>読込中…</option>'; saveBtn.disabled = true;
+  let cur = '';
+  let list = [];
+  if (mode === 'maker'){
+    let makerNames, links;
+    if (dateFilter){
+      const ctx = await fetch('/api/link-context?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
+      if (!ctx || !ctx.ok){ warn.style.display='block'; warn.textContent='⚠ 紐付け候補の取得に失敗しました'; return; }
+      makerNames = ctx.makerNames || []; links = ctx.links || {};
+    } else { makerNames = allMakerNames; links = currentLinks; }
+    cur = links[r.productCode] || '';
+    list = makerNames.map((n)=>({ value:n, simName:n, label:n, samePc:false }));
+  } else {
+    const ctx = await fetch('/api/self-products?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
+    if (!ctx || !ctx.ok){ warn.style.display='block'; warn.innerHTML='⚠ 自社品（販売実績）の取得に失敗しました'+(ctx&&ctx.error?'：'+esc(ctx.error):'（DB/ファイルに接続できません）'); return; }
+    const supPC = ctx.supplierPurchaseCode || '';
+    list = (ctx.products||[]).map((p)=>{
+      const same = !!(supPC && p.purchaseCode === supPC);
+      const pcTag = p.purchaseCode ? (' 〔'+p.purchaseCode+(same?' 🏢同発注先':'')+'〕') : '';
+      const sellTag = (p.currentSell!=null) ? (' ¥'+p.currentSell) : '';
+      return { value:p.code, simName:p.name, label:'['+p.code+'] '+p.name+pcTag+sellTag, samePc:same };
+    });
+  }
+  // 類似度でスコアリング・降順（self は同じ発注先を少し優先）
+  const scored = list.map((c)=>({ ...c, score: linkSim(baseName, c.simName) + (c.samePc?0.15:0) }))
+    .sort((a,b)=> b.score - a.score);
+  const byValue = {}; scored.forEach((c)=>{ byValue[c.value] = c; });
+  saveBtn.disabled = false;
 
   function renderOptions(filter){
     const flt = String(filter||'').toLowerCase();
     const head = '<option value="">— （自動マッチに任せる／紐付け解除）</option>';
     const opts = scored
-      .filter((x) => !flt || x.name.toLowerCase().includes(flt))
+      .filter((x) => !flt || x.label.toLowerCase().includes(flt) || x.value.toLowerCase().includes(flt))
       .map((x) => {
-        const pct = Math.round(x.score*100);
+        const pct = Math.min(100, Math.round(x.score*100));
         const mark = x.score >= 0.8 ? '✓' : (x.score >= 0.5 ? '·' : ' ');
-        const selAttr = x.name === sel.value ? ' selected' : '';
+        const selAttr = x.value === sel.value ? ' selected' : '';
         const padPct = (pct<10?'  ':(pct<100?' ':''))+pct;
-        return '<option value="'+esc(x.name)+'"'+selAttr+'>'+mark+' ['+padPct+'%] '+esc(x.name)+'</option>';
+        return '<option value="'+esc(x.value)+'"'+selAttr+'>'+mark+' ['+padPct+'%] '+esc(x.label)+'</option>';
       }).join('');
     const prev = sel.value;
     sel.innerHTML = head + opts;
@@ -2472,19 +2660,20 @@ async function openLinkModal(idx){
   function updateWarning(){
     const v = sel.value;
     if (!v){ warn.style.display='none'; return; }
-    const d = linkDecisiveDiff(selfCore, v);
+    const cand = byValue[v]; const candName = cand ? cand.simName : v;
+    const d = linkDecisiveDiff(baseName, candName);
     if (!d.hasDiff){ warn.style.display='none'; return; }
     const lines = [];
     if (d.onlyMaker.length) lines.push('メーカー側にだけ含まれる語: <b>'+d.onlyMaker.map(esc).join(' / ')+'</b>');
-    if (d.onlySelf.length)  lines.push('自社側にだけ含まれる語: <b>'+d.onlySelf.map(esc).join(' / ')+'</b>');
-    warn.innerHTML = '⚠ 自社商品と決定的な語（蓋・身・サイズ等）が違います。別の品の可能性があります。<br>'+lines.join('<br>');
+    if (d.onlySelf.length)  lines.push((mode==='self'?'自社品':'自社')+'側にだけ含まれる語: <b>'+d.onlySelf.map(esc).join(' / ')+'</b>');
+    warn.innerHTML = '⚠ 決定的な語（蓋・身・サイズ等）が違います。別の品の可能性があります。<br>'+lines.join('<br>');
     warn.style.display = 'block';
   }
 
-  // 初期表示: 候補リスト → 既存の紐付け or トップ候補を選択
-  sel.value = cur || (scored[0] && scored[0].name) || '';
+  // 初期表示: 既存の紐付け or トップ候補を選択
+  const initVal = cur || (scored[0] && scored[0].value) || '';
   renderOptions('');
-  sel.value = cur || (scored[0] && scored[0].name) || '';
+  sel.value = initVal;
   updateWarning();
 
   search.addEventListener('input', () => { renderOptions(search.value); updateWarning(); });
@@ -2494,14 +2683,20 @@ async function openLinkModal(idx){
   const close = () => wrap.remove();
   $('#linkBack').addEventListener('click', close);
   $('#linkCancel').addEventListener('click', close);
-  $('#linkSave').addEventListener('click', async () => {
+  saveBtn.addEventListener('click', async () => {
     const v = sel.value;
+    // self モードは「解除（空）」を選んでも紐付け先(自社CD)が無いので無意味＝メーカー品単独では消せない
+    if (mode === 'self' && !v){ alert('紐付ける自社商品を選んでください（解除する紐付けはまだありません）'); return; }
     try {
       const res = await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ supplier: supplier, productCode: r.productCode, makerName: v })}).then(x=>x.json());
+        body: JSON.stringify(savePayload(v))}).then(x=>x.json());
       if (!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
       close();
-      if (dateFilter) await loadByDate(dateFilter); else await loadFile(); // 横断ビューはその日を再描画
+      if (mode === 'self'){
+        // 休眠の解消は再照合が必要（紐付けた自社品は今のCSVに居ないため、その場再描画では出ない）
+        $('#msg').textContent='📌 紐付けを保存しました（'+v+' ⇔ '+(r.makerName||'')+'）。「↻ 照合を実行」で休眠が解消されます。';
+        if (confirm('📌 紐付けを保存しました。\\n今すぐ照合して反映しますか？（販売実績の読み込みに数秒かかります）')) await runShogo();
+      } else if (dateFilter) { await loadByDate(dateFilter); } else { await loadFile(); } // 横断ビューはその日を再描画
     } catch (e) { alert('保存に失敗: '+e); }
   });
 }
