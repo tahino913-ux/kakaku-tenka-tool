@@ -8,14 +8,16 @@
 // 1行の価格を見て、異常があれば理由文字列、無ければ '' を返す。
 //   ① 売単価が無い/0      … 社内消費分・データ欠落（見積書に載せられない）
 //   ② 値上げなのに改定単価が下がる/同じ … メーカー見積の食い違い（例: 同一品番に新単価2種）
-function priceRowAnomaly(currentSell, newSell, ruleType) {
+function priceRowAnomaly(currentSell, newSell, ruleType, selfMade) {
   const cur = Number(currentSell), nw = Number(newSell);
   if (!(cur > 0) || !(nw > 0)) return '売単価が無い/0（社内消費・データ欠落の可能性）';
   // 据置(keep_sell)は「改定単価＝現単価」が正常仕様なので ② は判定しない。
   //  （これを判定すると 据置選択時に全行が要確認になり一覧が0件になる）
   // manual（得意先ページで売価を手入力）は利用者が意図的に決めた固定価格なので ② は判定しない
   //  （手入力で値下げ等をしても要確認に落とさない＝発行から除外しない）。①(0/欠落)は引き続き検知。
-  if (ruleType === 'keep_sell' || ruleType === 'manual') return '';
+  // selfMade（自社製造＝メーカーコード9000）は原価0で値上げは利用者が決める（掛率/手入力）。
+  //  メーカー見積の食い違いという概念が無いので ② は判定しない（同額でも要確認に落とさない）。①は検知。
+  if (ruleType === 'keep_sell' || ruleType === 'manual' || selfMade) return '';
   if (nw <= cur) return '値上げなのに改定単価が下がる/同じ（メーカー見積の食い違いの可能性）';
   return '';
 }

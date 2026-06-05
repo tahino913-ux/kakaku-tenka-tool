@@ -298,7 +298,31 @@ async function loadHanbaiSource(){
         +   ' <span id="candMsg" style="font-size:12px"></span><br>'
         +   '<span style="color:#4a7a55;font-size:12px">この期間に売上がある商品を照合の<b>候補</b>に含めます（既定12か月）。長くすると、1年以上ご無沙汰の商品も見積で拾えます。'
         +   '<b>年間金額・損益は上記のとおり直近約1年で計算</b>するので、延ばしても損益は歪みません。変更は次回の「↻ 照合を実行」から有効。</span></div>'
+        + (r.selfManufacture && r.selfManufacture.enabled
+          ? ('<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #b7e0c0">'
+            + '🏭 <b>自社製造品（折箱）をDBから取り込む</b>　'
+            + '<button id="selfDbBtn" style="padding:4px 12px;background:#1f6b35;color:#fff;border:none;border-radius:4px;cursor:pointer">DBから取り込んで照合</button>'
+            + ' <span id="selfDbMsg" style="font-size:12px"></span><br>'
+            + '<span style="color:#4a7a55;font-size:12px">商品マスタの<b>商品分類（自社製造の折箱）</b>から自動抽出します（手入力CSV不要・自社コードの入れ忘れや重複の心配なし）。価格・得意先はDBから、値上げは得意先別ページで手入力。既存の自社製造取込はDB版に置き換え（退避）。</span></div>')
+          : '')
         + '<div style="margin-top:6px"><span style="color:#4a7a55">↓ 下の「ファイル」設定は、DBが無いPC（自宅など）や他社運用のための予備です。会社PCでは使われません。</span></div></div>';
+    }
+    // 「自社製造品をDBから取り込む」ボタンの配線（selfManufacture.enabled のときだけ要素が存在）。
+    function bindSelfDb(){
+      const b = $('#selfDbBtn'); if(!b) return;
+      b.addEventListener('click', async ()=>{
+        const msg = $('#selfDbMsg');
+        if(!confirm('自社製造品をDBの商品分類から取り込み直します。\\n既存の自社製造の取込CSVはDB版に置き換わります（_old へ退避＝戻せます）。よろしいですか？')) return;
+        b.disabled=true; msg.style.color='#6b7785'; msg.textContent='DBから抽出して照合中…（数秒かかります）';
+        try{
+          const res = await fetch('/api/self-from-db',{method:'POST'}).then(x=>x.json());
+          if(res.ok){
+            const sh = (res.shogo && res.shogo.ok) ? '・照合を更新しました' : (res.shogo ? '・⚠ 照合失敗:'+(res.shogo.error||'') : '');
+            msg.style.color='#1f6b35'; msg.textContent='✓ '+res.count+'品をDBから取り込み（'+esc(res.supplier)+'／旧'+res.retired+'本を退避）'+sh+'。シミュレーション画面の「対象」で確認できます。';
+          } else { msg.style.color='#c0392b'; msg.textContent='失敗: '+(res.error||''); }
+        }catch(e){ msg.style.color='#c0392b'; msg.textContent='失敗: '+e; }
+        finally{ b.disabled=false; }
+      });
     }
     // 「照合に含める期間」保存ボタンを配線（DB案内バナーがあるときだけ要素が存在）
     function bindPeriod(){
@@ -317,7 +341,7 @@ async function loadHanbaiSource(){
       target.innerHTML = banner + (usesDb
         ? '<div class="hint" style="padding:4px 8px">ファイルパスは未設定ですが、DB直結のため問題ありません。</div>'
         : '<span class="err">⚠ config.js の hanbai.path が未設定です</span>');
-      bindPeriod();
+      bindPeriod(); bindSelfDb();
       return;
     }
     let html = banner;
@@ -337,7 +361,7 @@ async function loadHanbaiSource(){
       html += '<div class="info-box" style="margin-top:8px">⚠ パスは設定されていますが、その場所にファイル(または.xls/.xlsx/.csv) が存在しません。config.js を確認するか、フォルダに販売実績ファイルを置いてください。</div>';
     }
     target.innerHTML = html;
-    bindPeriod();
+    bindPeriod(); bindSelfDb();
   } catch (e) {
     target.innerHTML = '<span class="err">読込失敗: '+esc(String(e))+'</span>';
   }

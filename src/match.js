@@ -260,6 +260,30 @@ function codeHit(cands, recNorm) {
   return false;
 }
 
+// 自社商品コードの正規化：純数字は6桁ゼロ詰め（販売大臣 SHOHIN.CODE 形式に合わせる）。
+//  例 62→000062 / 5071→005071。英数字混在はそのまま小文字化（前後空白除去）。
+function padSelfCode(c) {
+  const t = String(c == null ? '' : c).trim();
+  if (!t) return '';
+  return /^\d+$/.test(t) ? t.padStart(6, '0') : t.toLowerCase();
+}
+// 自社製造（メーカーコード9000＝日野折箱店）専用の照合。
+//  取り込んだメーカー品番＝自社商品コードとして、販売実績の商品コードに「完全一致」で当てる。
+//  ＝自社の折箱は過去伝票が発注先0000/別コードで切られており、仕入先フィルタ9000では全滅するため、
+//    名前一致でもなく仕入先フィルタでもなく、自社コードの完全一致だけで確実に拾う。
+//  1メーカー品 → 該当する全(得意先×自社商品)へ展開（販売実績は得意先×商品で集約済み＝1得意先1行）。
+function matchSelf(item, hanbai) {
+  const code = padSelfCode(item.makerCode);
+  if (!code) return [];
+  const best = new Map();
+  for (const r of hanbai) {
+    if (String(r.productCode == null ? '' : r.productCode).trim() !== code) continue;
+    const key = (r.customerCode || '') + '' + (r.productCode || '');
+    if (!best.has(key)) best.set(key, { rec: r, score: 1000, cd: true, ns: 100, link: false, self: true, pm: false });
+  }
+  return [...best.values()];
+}
+
 // 自社原単価 vs メーカー現単価 の一致判定（許容差 tol 以内なら true）。
 // 両方とも 0 超でないと判定不能 → null（=「比較せず」、後段では false 同様にスルー）。
 function pricesEqual(a, b, tol) {
@@ -287,6 +311,12 @@ function pricesEqual(a, b, tol) {
 //     - 67-79% で要確認に落ちていた真の組合せを 80%以上に押し上げる救済信号。
 //     - 価格不一致や片方未設定でも減点はしない（後方互換）。
 function matchOne(item, hanbai, opts = {}) {
+  // 自社製造（メーカーコード9000＝日野折箱店）専用モード：自社コード完全一致だけで照合する。
+  //  opts.selfMatch=true、または 仕入先コード(=opts.purchaseCode)が '9000' のとき有効。
+  //  仕入先フィルタ・名前一致・価格判定はすべて使わない（自社品は名前にゴミが付き名前一致では拾えず、
+  //  発注先コードも9000では切られていないため）。他メーカーの照合には一切影響しない。
+  const selfMatch = opts.selfMatch === true || String(opts.purchaseCode || '').trim() === '9000';
+  if (selfMatch) return matchSelf(item, hanbai);
   const nameFloor = Number.isFinite(opts.nameFloor) ? opts.nameFloor : 60;
   const priceBoost = Number.isFinite(opts.priceBoost) ? opts.priceBoost : 20;
   const priceTol   = Number.isFinite(opts.priceTolerance) ? opts.priceTolerance : 0.02;
@@ -295,9 +325,15 @@ function matchOne(item, hanbai, opts = {}) {
   const cands = codeCandidates(item.makerCode);
   const supLinks = (opts.productLinks && opts.productLinks[item.supplier]) || {};
   const filterCode = String(opts.purchaseCode || '').trim();
+  // 自社製造（9000分類）の自社CD集合。これらは「自社で作る品＝原価0」なので、他の仕入先の照合候補からは除外。
+  //  例 008080「ﾄﾚｰ279-1」は自社製造分類だが過去伝票の発注先が0014(北原)のため、除外しないと北原の値上げ
+  //  「トレー279-1」に名前一致して二重計上になる（自社製造品は9000側だけに出すのが正）。
+  const excludeSelf = opts.excludeSelfCodes;
   // (得意先CD + 自社商品CD) ごとに最良の1件へ集約
   const best = new Map();
   for (const r of hanbai) {
+    // 自社製造分類の自社CDは他の仕入先には出さない（名前一致・CD一致・手動紐付けすべてに優先して除外）
+    if (excludeSelf && excludeSelf.size && excludeSelf.has(padSelfCode(r.productCode))) continue;
     // 手動紐付けチェック: その自社CDが他メーカー品に予約されているならスキップ（取り合い防止）
     const linkedMakerName = supLinks[r.productCode];
     const linkSelf = linkedMakerName && linkedMakerName === item.makerName;
@@ -358,12 +394,18 @@ function matchOne(item, hanbai, opts = {}) {
 // 全メーカー品を照合し、照合結果レコード配列を返す
 function matchAll(items, hanbai, opts = {}) {
   const out = [];
+  // 自社製造（メーカーコード9000）モードでは 仕入(原価)＝材料費なので 0 で扱う。
+  //  取り込んだ「現単価」は販売単価の意味（＝下流では販売実績の現売単価をそのまま使う）であり、
+  //  仕入原価ではないため、現行仕入単価・新仕入単価をどちらも 0 にする（値上げは得意先別で手入力）。
+  const selfMode = opts.selfMatch === true || String(opts.purchaseCode || '').trim() === '9000';
   for (const item of items) {
     const hits = matchOne(item, hanbai, opts);
-    const costInc = (Number.isFinite(item.newCost) && Number.isFinite(item.currentCost))
-      ? item.newCost - item.currentCost : NaN;
-    const costRate = (Number.isFinite(costInc) && item.currentCost > 0)
-      ? Math.round((costInc / item.currentCost) * 1000) / 10 : NaN;
+    const cCost = selfMode ? 0 : item.currentCost;
+    const nCost = selfMode ? 0 : item.newCost;
+    const costInc = (Number.isFinite(nCost) && Number.isFinite(cCost))
+      ? nCost - cCost : NaN;
+    const costRate = (Number.isFinite(costInc) && cCost > 0)
+      ? Math.round((costInc / cCost) * 1000) / 10 : NaN;
     if (!hits.length) {
       out.push({
         status: '✗ 未一致（休眠）',
@@ -371,7 +413,7 @@ function matchAll(items, hanbai, opts = {}) {
         makerCode: item.makerCode, makerName: item.makerName,
         productCode: '', productName: '【販売実績なし or 商品名不一致】',
         customerCode: '', customerName: '',
-        currentSell: '', currentCost: item.currentCost, newCost: item.newCost,
+        currentSell: '', currentCost: cCost, newCost: nCost,
         costInc, costRate, annualAmount: '',
       });
       continue;
@@ -380,12 +422,14 @@ function matchAll(items, hanbai, opts = {}) {
       const r = h.rec;
       const pmTag = h.pm ? '+価格' : '';
       out.push({
-        status: h.link ? ('📌 手動紐付け' + pmTag) : (h.cd ? ('✓ CD一致' + pmTag) : ('✓ 名前一致(' + h.ns + '%)' + pmTag)),
+        status: h.link ? ('📌 手動紐付け' + pmTag)
+          : (h.self ? '✓ CD一致（自社品）'
+            : (h.cd ? ('✓ CD一致' + pmTag) : ('✓ 名前一致(' + h.ns + '%)' + pmTag))),
         supplier: item.supplier, switchDate: item.switchDate,
         makerCode: item.makerCode, makerName: item.makerName,
         productCode: r.productCode, productName: r.productName,
         customerCode: r.customerCode, customerName: r.customerName,
-        currentSell: r.currentSell, currentCost: item.currentCost, newCost: item.newCost,
+        currentSell: r.currentSell, currentCost: cCost, newCost: nCost,
         costInc, costRate, annualAmount: r.annualAmount,
       });
     }
@@ -417,4 +461,4 @@ function toCsv(rows) {
   return '﻿' + lines.join('\r\n');
 }
 
-module.exports = { matchAll, matchOne, nameScore, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER };
+module.exports = { matchAll, matchOne, nameScore, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER, padSelfCode };

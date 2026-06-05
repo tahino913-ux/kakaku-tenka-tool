@@ -13,7 +13,7 @@ const path = require('path');
 const { loadCsv } = require('./csv');
 const { toNum } = require('./rules');
 const { loadHanbai } = require('./hanbai');
-const { matchAll, toCsv } = require('./match');
+const { matchAll, toCsv, padSelfCode } = require('./match');
 const { xlsToCsv, isXls } = require('./xls2csv');
 const { convert: convertMakerXlsx } = require('./makerXlsx');
 const { getSettings, getMakers } = require('./settings');
@@ -131,8 +131,12 @@ function loadHanbaiRecords(opts) {
       log('販売実績を 販売大臣DB から直接取得中…（読み取り専用・書き込みなし）');
       const { loadHanbaiFromDb } = require('./db_hanbai');
       // candidateMonths（照合に含める さかのぼり期間・/self で変更）を db 設定に載せて渡す。
-      hanbai = loadHanbaiFromDb(Object.assign({}, (s.hanbai && s.hanbai.db) || {}, { candidateMonths: (s.hanbai && s.hanbai.candidateMonths) }));
-      log('販売実績レコード: ' + hanbai.length + ' 件（DB: ' + ((s.hanbai.db && s.hanbai.db.database) || '') + '）');
+      //  opts.fullHistory=true（自社製造9000 専用）のときは候補起点を全期間へ＝遡れるだけ遡る。
+      //   年間金額(損益)の窓は db_hanbai 側で直近1年のまま据え置く（候補だけ広げる）。
+      const dbExtra = { candidateMonths: (s.hanbai && s.hanbai.candidateMonths) };
+      if (opts.fullHistory) dbExtra.candidateStart = '2000-01-01';
+      hanbai = loadHanbaiFromDb(Object.assign({}, (s.hanbai && s.hanbai.db) || {}, dbExtra));
+      log('販売実績レコード: ' + hanbai.length + ' 件（DB: ' + ((s.hanbai.db && s.hanbai.db.database) || '') + (opts.fullHistory ? ' / 全期間' : '') + '）');
     } catch (e) {
       if (mode === 'db') throw e; // 'db'(厳格)は失敗＝中断（古いファイルで黙って続行しない）
       log('⚠ DB直結に失敗→販売実績ファイルにフォールバックします: ' + String(e && e.message || e).split('\n')[0]);
@@ -212,12 +216,32 @@ function run(argv) {
   // 案A：仕入先ごとに統合（同じ商品は最新の取り込みで上書き）してから1仕入先1本で照合・出力する。
   //  さらに makerChannel で「問屋経由のメーカー」を実際の仕入先に寄せる（エフピコ→朝日 等）＝二重計上の防止。
   const merged = mergeMakerFiles(makerFiles, s.makerChannel || {});
+  // 自社製造（メーカーコード9000）専用の「全期間」販売実績プール（必要時だけ1回ロード＝重いDB照会を節約）。
+  let selfHanbai = null;
+  const getSelfHanbai = () => {
+    if (!selfHanbai) selfHanbai = loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: true, log: console.log });
+    return selfHanbai;
+  };
+  // 自社製造（9000分類）に取り込まれた自社CDの集合。これらは「自社で作る品＝原価0」なので、
+  //  他の仕入先の照合候補から除外する（過去伝票の発注先が他社でも、自社製造品は9000側だけに出すのが正）。
+  //  例 008080「ﾄﾚｰ279-1」＝自社製造分類だが発注先0014(北原)。除外しないと北原の値上げに名前一致し二重計上。
+  const selfMadeCodes = new Set();
+  for (const [supplier, items] of merged) {
+    const pc = (makersProfile[supplier] && makersProfile[supplier].purchaseCode) || '';
+    if (String(pc).trim() !== '9000') continue;
+    for (const it of items) { const c = padSelfCode(it.makerCode); if (c) selfMadeCodes.add(c); }
+  }
   for (const [supplier, items] of merged) {
     if (!items.length) continue;
     // 仕入先コードフィルタ: 各メーカー見積に紐づく 4桁仕入先コードを settings.makers から拾う。
     // 設定済なら自社末尾コードと一致する自社品だけが候補に。未設定なら従来通り全件候補。
     const purchaseCode = (makersProfile[supplier] && makersProfile[supplier].purchaseCode) || '';
-    const rows = matchAll(items, hanbai, { nameFloor, productLinks, purchaseCode, priceVetoBelow });
+    // 自社製造(9000)は自社コード完全一致で、かつ過去実績を遡れるだけ遡る（全期間プール）。他メーカーは従来の窓。
+    const isSelf = String(purchaseCode).trim() === '9000';
+    const pool = isSelf ? getSelfHanbai() : hanbai;
+    // 非9000の照合だけ、自社製造分類の自社CDを候補から除外（9000自身の照合には渡さない＝自社製造品はそのまま拾う）。
+    const excludeSelfCodes = isSelf ? null : selfMadeCodes;
+    const rows = matchAll(items, pool, { nameFloor, productLinks, purchaseCode, priceVetoBelow, excludeSelfCodes });
     const matched = rows.filter((r) => /^✓/.test(r.status)).length;
     const dormant = rows.length - matched;
     const out = uniqueOutPath(INPUT_DIR, supplier, usedOut);

@@ -199,7 +199,9 @@ function loadHanbaiFromDb(dbCfg) {
   const annualStart = dbCfg.start || range.start; // 年間金額(損益)の起点＝直近約1年（明示startがあれば優先）
   const end = dbCfg.end || range.end;
   // 候補に含める期間（さかのぼり月数・既定12）。明示の start があるときはそれを候補起点にも使う。
-  const candidateStart = dbCfg.start ? annualStart : monthsBackStart(dbCfg.candidateMonths);
+  //  dbCfg.candidateStart（ISO・明示）があれば候補起点だけをそれに上書き＝年間金額(損益)の窓は直近1年のまま。
+  //   自社製造(メーカーコード9000)を「遡れるだけ遡って」照合する用途で使う（損益は歪ませない）。
+  const candidateStart = dbCfg.candidateStart || (dbCfg.start ? annualStart : monthsBackStart(dbCfg.candidateMonths));
   const sql = buildSql(candidateStart, end, annualStart, dbCfg.scale);
   const csv = runQueryToCsv(dbCfg, sql);
   try { return csvToRecords(csv); }
@@ -235,4 +237,42 @@ function lookupShohinTax(dbCfg, codes) {
   } finally { try { fs.unlinkSync(csv); } catch (_) {} }
 }
 
-module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax };
+// 自社製造品（日野折箱店）を 商品分類(BUN1/BUN2) で SHOHIN から抽出する（読み取り専用）。
+//  ＝「どれが自社製か」を販売大臣の商品分類で持っているので、手入力CSVの代わりにDBから直接拾う。
+//  opts.bun1=[1,5]（商品分類1の対象値・配列）、opts.bun2=1（商品分類2の対象値）。
+//  onlySold=true（既定）＝販売実績(URIMEI)が1件でもある品だけ（得意先なし＝休眠の乱立を防ぐ）。
+//  戻り値: [{ code:自社商品コード(SHOHIN.CODE), name:商品名(NM1) }]。価格は照合時に販売実績から取る（原価0）。
+function loadSelfProductsFromDb(dbCfg, opts) {
+  dbCfg = dbCfg || {}; opts = opts || {};
+  // 分類値は整数だけ許可（SQL安全）。既定 BUN1∈{1,5}・BUN2=1。
+  const bun1 = (Array.isArray(opts.bun1) ? opts.bun1 : [1, 5])
+    .map((v) => parseInt(v, 10)).filter((v) => Number.isInteger(v));
+  const bun2 = Number.isInteger(parseInt(opts.bun2, 10)) ? parseInt(opts.bun2, 10) : 1;
+  if (!bun1.length) return [];
+  const onlySold = opts.onlySold !== false;
+  const in1 = bun1.join(',');
+  const soldCond = onlySold ? ' AND EXISTS (SELECT 1 FROM dbo.URIMEI u WHERE u.SHO = s.ICODE)' : '';
+  const sql =
+    'SELECT DISTINCT RTRIM(s.CODE) AS code, RTRIM(ISNULL(s.NM1,\'\')) AS name ' +
+    'FROM dbo.SHOHIN s ' +
+    'WHERE s.BUN1 IN (' + in1 + ') AND s.BUN2 = ' + bun2 +
+    ' AND RTRIM(ISNULL(s.CODE,\'\')) <> \'\'' + soldCond +
+    ' ORDER BY code';
+  const csv = runQueryToCsv(dbCfg, sql);
+  try {
+    const { parseCsvText } = require('./csv');
+    const rows = parseCsvText(fs.readFileSync(csv, 'utf8').replace(/^﻿/, ''));
+    if (!rows.length) return [];
+    const head = rows[0]; const ix = {}; head.forEach((h, i) => { ix[String(h).trim().toLowerCase()] = i; });
+    const out = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i]; if (!r || !r.length) continue;
+      const code = String(r[ix.code] == null ? '' : r[ix.code]).trim();
+      const name = String(r[ix.name] == null ? '' : r[ix.name]).trim();
+      if (code) out.push({ code, name });
+    }
+    return out;
+  } finally { try { fs.unlinkSync(csv); } catch (_) {} }
+}
+
+module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax, loadSelfProductsFromDb };

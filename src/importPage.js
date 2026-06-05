@@ -100,6 +100,15 @@ const IMPORT_PAGE = `<!doctype html>
     <button class="go" id="parseBtn" disabled>貼り付けを読み取る</button>
   </div>
 
+  <div class="row" id="aiRow" style="display:none;margin-top:8px;padding:8px 10px;background:#eef6ff;border:1px solid #cfe0f4;border-radius:8px;flex-wrap:wrap;gap:8px;align-items:center">
+    <span style="font-weight:700;color:#1f4e78">🤖 AIで読み取る</span>
+    <button class="go" id="aiTextBtn" type="button" disabled style="background:#5b6cb5" title="上の貼り付け欄/表の内容をAIが商品明細に整理して下の③へ入れます">貼り付け・表から</button>
+    <button class="go" id="aiPdfBtn" type="button" disabled style="background:#5b6cb5" title="PDF（手紙形式の値上げ通知でもOK）をAIが読み取って下の③へ入れます">PDFから</button>
+    <input type="file" id="aiPdf" accept=".pdf" style="display:none">
+    <span id="aiMsg" style="font-size:11px;color:#6b7785"></span>
+    <span style="font-size:10px;color:#8a93a0;flex-basis:100%;line-height:1.6">※ AIは読み取りの<b>下書き</b>です。③の表で<b>単価・実施日を必ず確認</b>してから保存してください（外部のAIに商品名・数字を送信します）。</span>
+  </div>
+
   <div style="margin-top:12px;border-top:1px dashed #d8dee6;padding-top:10px">
     <div class="lbl" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       方法C：1件ずつ手入力（項目ごとに直接入力）
@@ -302,7 +311,7 @@ function onSupplierPick(){
 function updateStep2Lock(){
   // 仕入先名が入っていれば解放（マスタ選択／登録済み選択／手入力のいずれでも名前が入る）。
   const ok = $('#supplier').value.trim().length > 0;
-  const ids=['fileBtn','src','delim','hasHeader','parseBtn','manualToggle'];
+  const ids=['fileBtn','src','delim','hasHeader','parseBtn','manualToggle','aiTextBtn','aiPdfBtn'];
   ids.forEach(id=>{ const el=$('#'+id); if(el) el.disabled = !ok; });
   $('#step2').classList.toggle('locked', !ok);
 }
@@ -684,6 +693,64 @@ $('#bulkDateBtn').addEventListener('click',()=>{
 });
 $('#fileBtn').addEventListener('click',()=>{ if($('#fileBtn').disabled) return; $('#file').click(); });
 $('#file').addEventListener('change',onFilePicked);
+
+// ── AI取り込みアシスト（任意・/api/ai-status が enabled のときだけ表示）──
+let aiEnabled=false;
+async function initAi(){
+  try{
+    const s=await fetch('/api/ai-status').then(x=>x.json());
+    if(s && s.enabled){ aiEnabled=true; $('#aiRow').style.display='flex'; updateStep2Lock(); }
+  }catch(_){ /* AI状態が取れなくても通常機能は動く */ }
+}
+function aiBusy(on,label){
+  $('#aiTextBtn').disabled=on; $('#aiPdfBtn').disabled=on;
+  $('#aiMsg').style.color='#6b7785';
+  $('#aiMsg').textContent = on ? ('🤖 '+(label||'読み取り中')+'…（数十秒かかることがあります）') : '';
+}
+function aiApply(res){
+  if(!res || !res.ok){
+    $('#aiMsg').style.color='#c0392b';
+    $('#aiMsg').textContent='AI読み取り失敗: '+((res&&res.error)||'不明なエラー');
+    return false;
+  }
+  loadRows(res.rows); // 既存の確認グリッドへ流し込む（以降は手動取り込みと同じ：列対応→確認→保存）
+  let m='✓ AIが '+res.count+' 件を読み取りました（'+esc(res.model||'')+'）。③の表で単価・実施日を確認して保存してください。';
+  if(res.warnings && res.warnings.length){ m += '<br>⚠ '+res.warnings.map(esc).join('<br>⚠ '); }
+  showTop(m);
+  $('#aiMsg').style.color='#2e7d32';
+  $('#aiMsg').textContent='✓ 読み取り完了（'+res.count+'件）';
+  return true;
+}
+async function aiFromText(){
+  const supplier=$('#supplier').value.trim();
+  if(!supplier){ $('#aiMsg').style.color='#c0392b'; $('#aiMsg').textContent='① 仕入先名を入れてください'; return; }
+  const text=$('#src').value.trim();
+  if(!text){ $('#aiMsg').style.color='#c0392b'; $('#aiMsg').textContent='上の欄に貼り付け（または表を貼り付け）してから押してください'; return; }
+  aiBusy(true,'AIが読み取り中');
+  try{
+    const res=await fetch('/api/ai-extract',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,text})}).then(x=>x.json());
+    aiBusy(false); aiApply(res);
+  }catch(e){ aiBusy(false); $('#aiMsg').style.color='#c0392b'; $('#aiMsg').textContent='通信失敗: '+(e&&e.message||e); }
+}
+async function aiFromPdfFile(ev){
+  const f=ev.target.files && ev.target.files[0];
+  ev.target.value=''; // 同じファイル再選択でも発火するように
+  if(!f) return;
+  const supplier=$('#supplier').value.trim();
+  if(!supplier){ $('#aiMsg').style.color='#c0392b'; $('#aiMsg').textContent='① 仕入先名を入れてください'; return; }
+  aiBusy(true,'PDFをAIが読み取り中');
+  try{
+    const buf=await f.arrayBuffer();
+    const b64=bufToB64(buf);
+    const res=await fetch('/api/ai-extract',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,pdfB64:b64})}).then(x=>x.json());
+    aiBusy(false); aiApply(res);
+  }catch(e){ aiBusy(false); $('#aiMsg').style.color='#c0392b'; $('#aiMsg').textContent='読み込み失敗: '+(e&&e.message||e); }
+}
+$('#aiTextBtn').addEventListener('click',aiFromText);
+$('#aiPdfBtn').addEventListener('click',()=>{ if($('#aiPdfBtn').disabled) return; $('#aiPdf').click(); });
+$('#aiPdf').addEventListener('change',aiFromPdfFile);
+initAi();
+
 loadMakers();
 loadSuppliersMaster();
 updateStep2Lock(); // 初期状態（仕入先未選択）でロック
@@ -719,6 +786,12 @@ $('#saveBtn').addEventListener('click',async()=>{
         kind='warn';
         const ex=(dw.items||[]).slice(0,5).map(d=>'　・'+esc(d.name||d.code)+'（'+d.suppliers.map(s=>esc(s)).join(' / ')+'）').join('<br>');
         okMsg+='<br><br>⚠ <b>二重登録の疑い '+dw.count+'件</b>：取り込んだ商品が <b>別の仕入先にも</b>登録されています。同じ商品を2つの仕入先名で取り込むと、損益・見積・取込CSVが二重になります。正しい仕入先名で取り込み直すか、片方を整理してください。<br>'+ex+(dw.count>5?'<br>　…ほか':'');
+      }
+      // 自社製造（日野折箱店・コード9000）で自社コードが空の商品の警告（照合されず休眠＝重複の原因）。
+      const sw=res.selfCodeWarning;
+      if(sw && sw.missing){
+        kind='warn';
+        okMsg+='<br><br>⚠ <b>自社コードが空の商品 '+sw.missing+'/'+sw.total+'件</b>：自社製造（日野折箱店）は<b>自社コードで照合</b>します。コードが無い商品は<b>照合されず休眠</b>になり、重複の原因になります。③で「自社コード」列を割り当ててから取り込み直してください。';
       }
       // 保存できたら入力を全クリア（A社→B社の取り違え事故を防ぐ）。成功メッセージは消えない上部バナーに出す。
       resetImport();

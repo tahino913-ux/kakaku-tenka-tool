@@ -106,6 +106,24 @@ const CUSTOMERS_PAGE = `<!doctype html>
   /* 検討中タグ（得意先一覧）／アイテム状態ボタン／別枠セクション */
   .cust .holdm{color:#8a5a12;font-size:11px;font-weight:700;margin-left:6px}
   td.actcell{white-space:nowrap}
+  /* チェックボックス一括移動バー */
+  .bulkbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0;padding:6px 10px;background:#f4f7fb;border:1px solid #d8e0ea;border-radius:8px}
+  .bulkbar .bulkinfo{font-size:12px;color:#1f4e78;font-weight:700}
+  .bulkbtn{border:none;border-radius:7px;padding:5px 12px;font-size:12px;font-weight:700;cursor:pointer}
+  .bulkbtn:disabled{opacity:.45;cursor:default}
+  .bulkbtn.hold{background:#f0c14b;color:#5c3d00}
+  .bulkbtn.hold:not(:disabled):hover{background:#e8b430}
+  .bulkbtn.back{background:#1f6b35;color:#fff}
+  .bulkbtn.back:not(:disabled):hover{background:#175a2b}
+  label.selall{font-size:11px;color:#6b7785;font-weight:400;white-space:nowrap;cursor:pointer}
+  input.selchk-target,input.selchk-hold,input.selchk-issued{cursor:pointer;vertical-align:middle}
+  /* 行ルール（ラジオボタン） */
+  td.rrcell{min-width:190px}
+  .rrradios{display:flex;flex-wrap:wrap;gap:1px 8px;align-items:center}
+  .rrradios label.rr{font-size:11px;color:#33405a;white-space:nowrap;cursor:pointer;display:inline-flex;align-items:center;gap:2px;padding:1px 0}
+  .rrradios input[type=radio]{margin:0;cursor:pointer}
+  .rrradios.ov{background:#eafaef;border-radius:6px;padding:2px 4px}
+  input.rowfactor{vertical-align:middle}
   button.hold-btn{background:#fff;border:1px solid #e0c48a;color:#8a5a12;border-radius:6px;padding:2px 7px;font-size:11px;cursor:pointer}
   button.hold-btn:hover{background:#fff8ec}
   button.back-btn{background:#fff;border:1px solid #9fcbab;color:#1f6b35;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer}
@@ -133,6 +151,8 @@ const CUSTOMERS_PAGE = `<!doctype html>
   input.effinp{width:108px;text-align:left}
   input.noteinp{width:180px;text-align:left}
   input.cellinp.man{border-color:#1b6b3a;background:#eef7ef;font-weight:700;color:#1b6b3a}
+  input.effinp.effmissing{border-color:#c0392b;background:#fdecea}
+  .effnote{margin:8px 16px;padding:8px 12px;border-radius:8px;background:#fdecea;border:1px solid #f5b7b1;color:#922b21;font-size:12px;font-weight:700}
 </style></head><body>
 <header>
   <h1>👥 得意先別 商品一覧</h1>
@@ -155,7 +175,7 @@ const CUSTOMERS_PAGE = `<!doctype html>
   <button class="go" id="resetIssuedBtn" style="background:#8a6d3b" title="提出済みマークをすべて消します（新しい改定サイクルの開始時に使用）。見積書ファイルは消えません">提出履歴をリセット</button>
 </div>
 
-<div class="calcbar">
+<div id="calcbarHome" style="display:none"><div class="calcbar" id="calcbar">
   <div class="fld"><label>転嫁ルール（全体）<span class="h">メインの全体方針が初期値</span></label>
     <select id="cRule">
       <option value="add_increase">値上げ分を上乗せ（利益額キープ）</option>
@@ -196,7 +216,7 @@ const CUSTOMERS_PAGE = `<!doctype html>
   <div class="fld"><label>&nbsp;</label>
     <button class="recalc" id="reloadPolicyBtn" style="background:#5b6b8b" title="メインで保存した『全体方針』を取り込んで、全体の各設定を初期値に戻します（行ごとの上書きは残ります）">↻ 全体方針を取込</button></div>
   <span class="applied" id="appliedMsg"></span>
-</div>
+</div></div>
 
 <div class="exportbar">
   <button class="exp" id="exportAllBtn">📄 全得意先の見積書を作成</button>
@@ -273,6 +293,7 @@ let rowSell={};   // 行ごと 改定後売価 の手入力 { rowKey: 入力文�
 let rowEff={};    // 行ごと 実施日 の手入力 { rowKey: 入力文字列 }
 let rowNote={};   // 行ごと 備考 の手入力 { rowKey: 入力文字列 }（見積書の備考列に転記）
 let rowRound={};  // 行ごと まるめ の上書き { rowKey: "単位|処理" 例 "1|floor" }（空=全体のまるめ）
+let rowFactor={}; // 行ごと 掛率（行ルール=掛率×のとき）{ rowKey: 数値 }（未設定=上の全体「掛率」を使う）
 let lowMarginPct=15; // 低マージン警告のしきい値（%）。改定後粗利率がこの値未満なら警告。画面で調整可。
 // 数値を表示用にクリーン化（¥・円・カンマ無し、最大2桁）。空/非数は''。
 function numStr(v){ return (v==null||isNaN(v))?'':String(Math.round(Number(v)*100)/100); }
@@ -285,15 +306,23 @@ function fmtPct1(v){ return v==null?'—':v.toFixed(1)+'%'; }
 function isLowMargin(m){ return m!=null && m < lowMarginPct; }
 // 得意先の「改定後粗利率がしきい値未満」の商品数
 function lowMarginCount(c){ let n=0; for(const p of (c.products||[])){ if(isLowMargin(marginRate(p.newSell,p.newCost))) n++; } return n; }
+// 対象アイテムのうち実施日が未設定（サーバが noEff を付与）の件数。発行には実施日が必須。
+function effMissingCount(c){ let n=0; for(const p of (c.products||[])){ if(p.noEff) n++; } return n; }
 // 別枠セクション（検討中／提出済み）の表。kind: 'hold'|'issued'
 function sectionHtml(title, items, kind){
   if(!items || !items.length) return '';
   const open = kind==='hold' ? ' open' : ''; // 検討中は開いて見せる／提出済みは畳む
   const issuedTh = kind==='issued' ? '<th>提出</th>' : '';
+  // 検討中(hold)・提出済み(issued) どちらも「チェックでまとめて対象へ戻す」を出す。
+  const hasChk = (kind==='hold' || kind==='issued');
+  const chkCls = 'selchk-'+kind;          // selchk-hold / selchk-issued
+  const chkTh = hasChk ? '<th><label class="selall"><input type="checkbox" id="selAll-'+kind+'"> 全</label></th>' : '';
   let rows='';
   for(const p of items){
     const info = kind==='issued' ? (issuedShort(p.issuedAt)+(p.issuedQuoteNo?'（'+esc(p.issuedQuoteNo)+'）':'')) : '';
+    const chkTd = hasChk ? '<td><input type="checkbox" class="'+chkCls+'" data-key="'+esc(p.rowKey)+'" title="まとめて移動するチェック"></td>' : '';
     rows+='<tr>'
+      + chkTd
       +'<td><span class="sup-badge">'+esc(p.supplier)+'</span></td>'
       +'<td class="pcode">'+esc(p.productCode||'')+'</td>'
       +'<td>'+esc(p.productName)+'</td>'
@@ -304,9 +333,24 @@ function sectionHtml(title, items, kind){
       +'<td><button class="back-btn" data-key="'+esc(p.rowKey)+'" title="この商品を見積の「対象」に戻します">↩ 対象へ戻す</button></td>'
       +'</tr>';
   }
+  const bulkBar = hasChk
+    ? ('<div class="bulkbar"><span class="bulkinfo">☑ 選択 <b id="cnt-'+kind+'">0</b> 件</span>'
+       +'<button class="bulkbtn back" id="bulkBack-'+kind+'" disabled>↩ 選択をまとめて対象へ戻す</button>'
+       +'<span class="muted">チェックした商品を見積の「対象」に戻します。</span></div>')
+    : '';
   return '<details class="itemsec sec-'+kind+'"'+open+'><summary>'+title+' <b>'+items.length+'</b> 件</summary>'
-    +'<div class="table-pad"><table><thead><tr><th>仕入先</th><th>商品コード</th><th>商品名</th><th class="num">現売価</th><th class="num">改定後売価</th><th>実施日</th>'+issuedTh+'<th>操作</th></tr></thead><tbody>'
+    +'<div class="table-pad">'+bulkBar+'<table><thead><tr>'+chkTh+'<th>仕入先</th><th>商品コード</th><th>商品名</th><th class="num">現売価</th><th class="num">改定後売価</th><th>実施日</th>'+issuedTh+'<th>操作</th></tr></thead><tbody>'
     +rows+'</tbody></table></div></details>';
+}
+// チェックした複数アイテムをまとめて移動（cls=チェック対象クラス, status='hold'|''）。
+async function bulkMove(cls, status){
+  const keys = Array.from(document.querySelectorAll('#detailCol input.'+cls+':checked')).map(c=> c.getAttribute('data-key')).filter(Boolean);
+  if(!selName || !keys.length) return;
+  try{
+    const res=await fetch('/api/item-status-bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:selName,rowKeys:keys,status:status})}).then(x=>x.json());
+    if(!res.ok){ alert('一括変更に失敗: '+(res.error||'')); return; }
+    await load(); // 再計算＋再描画（3区分が更新される）
+  }catch(e){ alert('一括変更に失敗: '+e); }
 }
 // アイテムの状態変更（hold=検討中へ／''=対象へ戻す）→ 保存して再取得（3区分が更新される）
 async function setItemState(rowKey, status){
@@ -323,6 +367,25 @@ function rowRuleSelect(p){
   const cur = rowRules[p.rowKey]||'';
   const opts = ROW_RULE_OPTS.map(o=>'<option value="'+o[0]+'"'+(o[0]===cur?' selected':'')+'>'+o[1]+'</option>').join('');
   return '<select class="rowrule'+(cur?' ov':'')+'" data-key="'+esc(p.rowKey)+'">'+opts+'</select>';
+}
+// 行ルールをラジオボタンで表示（プルダウンの代わり）。全選択肢をその場でクリックできる。
+//  行ごとに独立した name（連番）でグループ化。先頭「（全体）」は value=''＝上の全体ルールを継承。
+let _rrSeq=0;
+function rowRuleRadios(p){
+  const cur = rowRules[p.rowKey]||'';
+  const name = 'rr'+(_rrSeq++); // 行ごとに一意のグループ名
+  let h='<div class="rrradios'+(cur?' ov':'')+'">';
+  for(const o of ROW_RULE_OPTS){
+    h+='<label class="rr"><input type="radio" class="rowrule-radio" name="'+name+'" data-key="'+esc(p.rowKey)+'" value="'+esc(o[0])+'"'+(o[0]===cur?' checked':'')+'>'+esc(o[1])+'</label>';
+  }
+  return h+'</div>';
+}
+// 行ルールが「掛率×」のときだけ、その行の掛率入力欄を出す（未入力なら上の全体「掛率」を使う）。
+function rowFactorInput(p){
+  if((rowRules[p.rowKey]||'')!=='markup') return '';
+  const gf = parseFloat(($('#cFactor')||{}).value)||1.25; // 既定＝全体の掛率
+  const v = (rowFactor[p.rowKey]!=null && rowFactor[p.rowKey]!=='') ? rowFactor[p.rowKey] : gf;
+  return ' ×<input class="rowfactor" type="text" inputmode="decimal" data-key="'+esc(p.rowKey)+'" value="'+esc(v)+'" title="この行の掛率（現売価 × この値）。空欄なら上の全体「掛率」を使います" style="width:52px">';
 }
 // 行ごと まるめ（改定後価格の端数処理）の選択肢。先頭＝全体のまるめを継承。値="単位|処理"。
 const ROW_ROUND_GROUPS=[
@@ -352,7 +415,7 @@ function calcOpts(){
     roundingMode: rp[1]||'round',
     selfUplift: parseFloat($('#cUplift').value)||0,
     forceEffectiveDate: ($('#cEff').value||'').trim(),
-    rowRules, rowSell, rowEff, rowNote, rowRound,
+    rowRules, rowSell, rowEff, rowNote, rowRound, rowFactor,
   };
 }
 const RULE_LABEL={add_increase:'上乗せ',keep_margin_rate:'粗利維持',markup:'掛率×',sell_cost_rate:'売価×仕入率',keep_sell:'据置'};
@@ -465,6 +528,10 @@ function renderList(){
 }
 function selectCust(name){
   selName=name;
+  // 転嫁ルールバーは社名の下（該当商品〜提出済の間）へ移す。innerHTML再描画で消えないよう、
+  //  まずホルダーへ退避（ノードを保持＝設定値・配線をそのまま維持）→描画後にスロットへ差し込む。
+  const __bar=document.getElementById('calcbar'), __home=document.getElementById('calcbarHome');
+  if(__bar && __home) __home.appendChild(__bar);
   const oneBtn=$('#exportOneBtn');
   if(oneBtn){ oneBtn.disabled=false; oneBtn.textContent='📄 「'+(name.length>12?name.slice(0,12)+'…':name)+'」だけ作成'; }
   renderList();
@@ -472,7 +539,8 @@ function selectCust(name){
   if(!c){ $('#detailCol').innerHTML='<div class="empty">データがありません。</div>'; return; }
   const supChips=c.suppliers.map(s=>'<span class="sup-badge">'+esc(s)+'</span>').join(' ');
   let html='<div class="detail-head"><h2>'+esc(c.name)+'</h2>'
-    +'<div class="sum">該当商品 <b>'+c.productCount+'</b> 品／仕入先 <b>'+c.supplierCount+'</b> 社　'+supChips+'</div></div>';
+    +'<div class="sum">該当商品 <b>'+c.productCount+'</b> 品／仕入先 <b>'+c.supplierCount+'</b> 社　'+supChips+'</div></div>'
+    +'<div id="calcbarSlot"></div>';  // ← ここに転嫁ルールバーを差し込む（社名の下・提出済の上）
   // 提出（発行）状況
   const iss=ISSUED[c.name];
   if(iss){
@@ -492,8 +560,17 @@ function selectCust(name){
     html+='<div class="lowmnote">⚠ 低マージン '+lowN+' 件（改定後粗利率が '+lowMarginPct+'% 未満）。値上げ後も粗利が薄い行です。'
       +'行ルールや改定後売価を見直すと、表の「改定後粗利率」がオレンジから外れます。</div>';
   }
+  const effN=effMissingCount(c);
+  if(effN){
+    html+='<div class="effnote">⚠ 実施日が未設定 '+effN+' 件（赤い欄）。<b>実施日は発行に必須</b>です。各行の実施日を入力するか、上の「実施日 一括」で統一してから発行してください。</div>';
+  }
+  html+='<div class="bulkbar" id="bulkTargetBar">'
+    +'<span class="bulkinfo">☑ 選択 <b id="cntTarget">0</b> 件</span>'
+    +'<button class="bulkbtn hold" id="bulkHoldBtn" disabled>🤔 選択をまとめて検討中へ</button>'
+    +'<span class="muted">チェックした商品を今回の見積から外します（検討中へ）。</span>'
+    +'</div>';
   html+='<div class="table-pad"><table><thead>'
-    +'<tr><th rowspan="2">操作</th><th rowspan="2">仕入先</th><th rowspan="2">商品コード</th><th rowspan="2">商品名</th>'
+    +'<tr><th rowspan="2">操作<br><label class="selall"><input type="checkbox" id="selAllTarget"> 全</label></th><th rowspan="2">仕入先</th><th rowspan="2">商品コード</th><th rowspan="2">商品名</th>'
     +'<th class="grp" colspan="3">仕入（現→改定後）</th>'
     +'<th class="grp" colspan="5">売価・粗利率（現→改定後）</th>'
     +'<th rowspan="2">行ルール<br><span class="muted">(全体=メイン設定)</span></th>'
@@ -510,7 +587,7 @@ function selectCust(name){
     const newM = marginRate(p.newSell, p.newCost);         // 改定後粗利率
     const lowCls = isLowMargin(newM) ? ' lowmargin' : '';
     html+='<tr>'
-      +'<td class="actcell"><button class="hold-btn" data-key="'+esc(p.rowKey)+'" title="この商品を今回の見積から外して「検討中（除外）」へ移します">🤔 検討中</button></td>'
+      +'<td class="actcell"><input type="checkbox" class="selchk-target" data-key="'+esc(p.rowKey)+'" title="まとめて移動するチェック"> <button class="hold-btn" data-key="'+esc(p.rowKey)+'" title="この商品を今回の見積から外して「検討中（除外）」へ移します">🤔 検討中</button></td>'
       +'<td><span class="sup-badge">'+esc(p.supplier)+'</span></td>'
       +'<td class="pcode">'+esc(p.productCode||'')+'</td>'
       +'<td>'+prodLink(c.name, p.supplier, p.productCode, p.productName)+'</td>'
@@ -522,9 +599,9 @@ function selectCust(name){
       +'<td class="num"><input class="cellinp sellinp'+(p.sellManual?' man':'')+'" data-key="'+esc(p.rowKey)+'" value="'+esc(numStr(p.newSell))+'" title="直接入力できます（¥や円・カンマ・全角でもOK→数値に揃います）"></td>'
       +'<td class="num'+lowCls+'"'+(lowCls?' title="改定後粗利率が '+lowMarginPct+'% 未満（低マージン）"':'')+'>'+fmtPct1(newM)+'</td>'
       +'<td class="num '+sr.cls+'">'+sr.txt+'</td>'
-      +'<td>'+rowRuleSelect(p)+'</td>'
+      +'<td class="rrcell">'+rowRuleRadios(p)+rowFactorInput(p)+'</td>'
       +'<td>'+rowRoundSelect(p)+'</td>'
-      +'<td><input class="cellinp effinp'+(p.effManual?' man':'')+'" data-key="'+esc(p.rowKey)+'" value="'+esc(p.effectiveDate||'')+'" placeholder="例: 2026-07-01" title="直接入力できます（2026/7/1・7月1日 等でもISO表記に揃います）"></td>'
+      +'<td><input class="cellinp effinp'+(p.effManual?' man':'')+(p.noEff?' effmissing':'')+'" data-key="'+esc(p.rowKey)+'" value="'+esc(p.effectiveDate||'')+'" placeholder="例: 2026-07-01" title="'+(p.noEff?'実施日が未設定です（発行には必須）。例: 2026-07-01':'直接入力できます（2026/7/1・7月1日 等でもISO表記に揃います）')+'"></td>'
       +'<td><input class="cellinp noteinp'+(p.note?' man':'')+'" data-key="'+esc(p.rowKey)+'" value="'+esc(p.note||'')+'" placeholder="（任意）" title="ここに入力すると見積書の「備考」列に転記されます"></td>'
       +'</tr>';
   }
@@ -533,9 +610,36 @@ function selectCust(name){
   html+=sectionHtml('🤔 検討中（見積から除外）', c.holdProducts, 'hold');
   html+=sectionHtml('✅ 提出済み（発行したアイテム）', c.issuedProducts, 'issued');
   $('#detailCol').innerHTML=html;
-  // 「🤔 検討中へ」「↩ 対象へ戻す」の配線
+  // 退避していた転嫁ルールバーを、社名の下のスロットへ差し込む（該当商品 と 提出済 の間）。
+  const __slot=document.getElementById('calcbarSlot');
+  if(__bar && __slot) __slot.appendChild(__bar);
+  // 「🤔 検討中へ」「↩ 対象へ戻す」の配線（1件ずつ）
   $('#detailCol').querySelectorAll('button.hold-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'hold')));
   $('#detailCol').querySelectorAll('button.back-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'')));
+  // チェックボックスでまとめて移動（対象→検討中 ／ 検討中→対象 ／ 提出済み→対象）の配線
+  const bulkRoot = $('#detailCol');
+  const BULK_GROUPS = [
+    { cls:'selchk-target', cnt:'#cntTarget',    btn:'#bulkHoldBtn',     all:'#selAllTarget',  status:'hold' },
+    { cls:'selchk-hold',   cnt:'#cnt-hold',     btn:'#bulkBack-hold',   all:'#selAll-hold',   status:''     },
+    { cls:'selchk-issued', cnt:'#cnt-issued',   btn:'#bulkBack-issued', all:'#selAll-issued', status:''     },
+  ];
+  function bulkUpdate(){
+    for(const g of BULK_GROUPS){
+      const all = bulkRoot.querySelectorAll('input.'+g.cls);
+      const n = bulkRoot.querySelectorAll('input.'+g.cls+':checked').length;
+      const cnt=$(g.cnt), btn=$(g.btn), sa=$(g.all);
+      if(cnt) cnt.textContent=n;
+      if(btn) btn.disabled=!n;
+      if(sa) sa.checked = all.length>0 && n===all.length;
+    }
+  }
+  bulkRoot.querySelectorAll('input.selchk-target, input.selchk-hold, input.selchk-issued').forEach(c=> c.addEventListener('change', bulkUpdate));
+  for(const g of BULK_GROUPS){
+    const sa=$(g.all);
+    if(sa) sa.addEventListener('change',()=>{ bulkRoot.querySelectorAll('input.'+g.cls).forEach(c=>{c.checked=sa.checked;}); bulkUpdate(); });
+    const btn=$(g.btn);
+    if(btn) btn.addEventListener('click',()=> bulkMove(g.cls, g.status));
+  }
   // 行まるめの変更 → その行だけ別のまるめで再計算（サーバ集計＝見積書と同じ計算）。
   //  ※ rowround も .rowrule クラスを持つので、行ルールの配線が拾わないよう先に処理して除外する。
   $('#detailCol').querySelectorAll('select.rowround').forEach(sel=>{
@@ -545,11 +649,21 @@ function selectCust(name){
       load();
     });
   });
-  // 行ルールの変更 → その行だけ別ルールで再計算（サーバ集計＝見積書と同じ計算）。rowround は除外。
-  $('#detailCol').querySelectorAll('select.rowrule:not(.rowround)').forEach(sel=>{
-    sel.addEventListener('change',()=>{
-      const k=sel.getAttribute('data-key');
-      if(sel.value) rowRules[k]=sel.value; else delete rowRules[k];
+  // 行ごと掛率（掛率×のときだけ表示）の変更 → その行を再計算。
+  $('#detailCol').querySelectorAll('input.rowfactor').forEach(inp=>{
+    inp.addEventListener('change',()=>{
+      const k=inp.getAttribute('data-key');
+      const v=parseFloat(inp.value);
+      if(Number.isFinite(v) && v>0) rowFactor[k]=v; else delete rowFactor[k];
+      load();
+    });
+  });
+  // 行ルール（ラジオボタン）の変更 → その行だけ別ルールで再計算（サーバ集計＝見積書と同じ計算）。
+  $('#detailCol').querySelectorAll('input.rowrule-radio').forEach(rb=>{
+    rb.addEventListener('change',()=>{
+      if(!rb.checked) return;
+      const k=rb.getAttribute('data-key');
+      if(rb.value) rowRules[k]=rb.value; else delete rowRules[k];
       load();
     });
   });
@@ -597,15 +711,31 @@ function openGate(res,opts){
   gateOpts=opts;
   const who=opts.scope==='all'?'全得意先':opts.customer;
   const hasReview=res.reviewCount>0;
-  const canIssue=res.issuableRowCount>0;
+  const missEff=res.missingEffCount||0;
+  // 実施日が未設定の対象があるあいだは発行できない（実施日は必須）。
+  const canIssue=res.issuableRowCount>0 && missEff===0;
   $('#gateTitle').textContent=who+' の発行プレビュー ― '+res.issuableCustomerCount+'得意先 / '+res.issuableRowCount+'品'+(hasReview?'（要確認 '+res.reviewCount+'件は除外）':'');
-  if(!canIssue){
+  if(missEff>0){
+    $('#gateNote').innerHTML='<b style="color:#c0392b">⚠ 実施日が未設定の商品が '+missEff+' 件あります。実施日は発行に必須です。</b><br>'
+      +'「戻る」で表に戻り、赤い実施日欄を入力（または上の「実施日 一括」で統一）してから、もう一度この画面を開いて発行してください。';
+  } else if(!canIssue){
     $('#gateNote').innerHTML='発行できる明細がありません'+(hasReview?'（'+res.reviewCount+'件すべてが要確認のため除外）':'')+'。「戻る」で設定や紐付けを見直してください。';
   } else {
     $('#gateNote').innerHTML='以下が<b>見積書に出力される内容</b>です（得意先ごとに1枚）。確認して問題なければ下の「'+(hasReview?'要確認を除外して発行':'この内容で発行')+'」を押してください。'
       +(hasReview?' 価格異常・低一致の <b>'+res.reviewCount+'</b> 件は見積書に載りません（下部の「要確認」一覧）。':'');
   }
   let body='';
+  // ⓪ 実施日が未設定（必須）の一覧 ― あれば発行ブロック。最初に目立たせる。
+  if(missEff>0){
+    body+='<div class="pv-sec-rev" style="background:#fdecea;color:#922b21">⚠ 実施日が未設定（発行に必須）'+missEff+'件</div>';
+    body+='<table><thead><tr><th>得意先</th><th>仕入先</th><th>商品コード</th><th>商品名</th></tr></thead><tbody>';
+    for(const r of (res.missingEff||[])){
+      body+='<tr class="price"><td>'+esc(r.customer)+'</td><td><span class="sup-badge">'+esc(r.supplier)+'</span></td>'
+        +'<td class="pcode">'+esc(r.productCode||'')+'</td><td>'+esc(r.productName)+'</td></tr>';
+    }
+    body+='</tbody></table>';
+    if((res.missingEff||[]).length<missEff) body+='<div class="muted" style="padding:8px">…ほか '+(missEff-res.missingEff.length)+' 件</div>';
+  }
   // ① プレビュー（実際に発行される内容）
   for(const c of (res.preview||[])){
     body+='<div class="pv-cust"><div class="pv-head">'+esc(c.customer)+' <span class="pv-cnt">'+c.productCount+'品</span></div>';
@@ -636,7 +766,7 @@ function openGate(res,opts){
   $('#gateBody').innerHTML=body;
   $('#gateSummary').textContent='発行: '+res.issuableCustomerCount+' 得意先 / '+res.issuableRowCount+' 品'+(hasReview?'　／　除外（要確認）: '+res.reviewCount+' 件':'');
   const issueBtn=$('#gateIssue');
-  issueBtn.textContent=hasReview?'要確認を除外して発行':'この内容で発行';
+  issueBtn.textContent=missEff>0?'実施日を入力してください（発行不可）':(hasReview?'要確認を除外して発行':'この内容で発行');
   issueBtn.disabled=!canIssue;
   $('#gateOverlay').classList.add('show');
 }
@@ -645,8 +775,13 @@ function doIssue(opts){
   setExpBusy(true);
   fetch('/api/customers-export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:'issue'},opts))})
     .then(x=>x.json()).then(res=>{
-      setExpBusy(false); showExportMsg(''); closeGate();
-      if(!res.ok){ showExportMsg('発行に失敗: '+(res.error||''),true); return; }
+      setExpBusy(false); showExportMsg('');
+      if(!res.ok){
+        // 実施日未設定など、サーバ側で発行をブロックした場合はメッセージを出してゲートは閉じない（戻って直せる）。
+        if(res.reason==='missing_eff'){ showExportMsg(res.message||'実施日が未設定の商品があります。',true); if(selName) load(); return; }
+        closeGate(); showExportMsg('発行に失敗: '+(res.message||res.error||''),true); return;
+      }
+      closeGate();
       // 提出履歴を更新（今回提出した得意先に「✅ 提出済」を付ける）
       if(res.issuedCustomers && res.issuedCustomers.length){
         const now=new Date().toISOString();

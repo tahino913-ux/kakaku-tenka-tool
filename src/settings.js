@@ -52,6 +52,10 @@ function getSettings() {
     selfProfile:    u.selfProfile || null,
     // 任意のアクセスパスワード（共用PC向け簡易ロック）。空＝認証なし（既定）。
     accessPassword: u.accessPassword || '',
+    // 自社製造品をDBの商品分類から抽出する設定（config.js 既定 ＋ settings.json 上書き）。
+    selfManufacture: Object.assign({}, base.selfManufacture, u.selfManufacture),
+    // AI取り込みアシスト設定（config.js 既定 ＋ settings.json 上書き）。既定OFF。
+    ai: Object.assign({}, base.ai, u.ai),
   };
 }
 
@@ -73,6 +77,9 @@ function saveSettings(patch) {
     suppliers:      patch.suppliers !== undefined ? patch.suppliers : (cur.suppliers || {}),
     selfProfile:    patch.selfProfile !== undefined ? patch.selfProfile : (cur.selfProfile || null),
     accessPassword: patch.accessPassword !== undefined ? patch.accessPassword : (cur.accessPassword || ''),
+    selfManufacture: patch.selfManufacture !== undefined ? patch.selfManufacture : cur.selfManufacture,
+    // AI設定はマージで保持（UI保存で消えないように）。部分patchでも既存を残す。
+    ai:             patch.ai !== undefined ? Object.assign({}, cur.ai, patch.ai) : cur.ai,
     _savedAt:       new Date().toISOString(),
   };
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2), 'utf8');
