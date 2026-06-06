@@ -586,6 +586,35 @@ function buildCdCandidatesCsv() {
   for (const it of items) lines.push([it.selfCode, it.makerCode, it.selfName, it.supplier, it.pct].map(cell).join(','));
   return '﻿' + lines.join('\r\n');
 }
+// 1つの自社商品コードが「複数の異なるメーカー品（品番）」に名前一致し、新仕入単価が食い違う品を検出。
+//  ＝仕入原価CSV/単価履歴CSVがどれか1件を選ぶため「照合で取り込んだ単価と違う」と見える原因（取り違え）。
+//  正しいメーカー品番を商品マスタ(商品名3)に登録してCD一致にすれば1つに確定する（CD一致/手動紐付け済みは確定＝対象外）。
+//  戻り値: [{ code, name, variants:[{makerCode, makerName, cost, supplier}] }]（コストが2種以上のものだけ）。
+function multiMatchCheck() {
+  const files = listLatestCsv();
+  const byCode = new Map(); // code -> { name, byMaker:Map(makerCode -> {makerCode, makerName, cost, supplier}) }
+  for (const f of files) {
+    const sup = String(f).split('_照合結果_')[0];
+    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    for (const r of recs) {
+      if (!/名前一致/.test(r['照合'] || '')) continue; // CD一致・手動紐付けは確定＝対象外
+      const code = String(r['販売実績商品コード'] || '').trim();
+      if (!code || /^0+$/.test(code)) continue;
+      const mc = String(r['メーカー商品CD'] || '').trim();
+      const cost = String(r['新仕入単価'] || '').trim();
+      if (!byCode.has(code)) byCode.set(code, { name: String(r['販売実績商品名'] || '').replace(/\s+/g, ' ').slice(0, 28), byMaker: new Map() });
+      byCode.get(code).byMaker.set(mc, { makerCode: mc, makerName: String(r['メーカー商品名'] || '').replace(/\s+/g, ' ').slice(0, 24), cost, supplier: sup });
+    }
+  }
+  const out = [];
+  for (const [code, e] of byCode) {
+    const vs = [...e.byMaker.values()];
+    const costs = new Set(vs.map((v) => v.cost));
+    if (vs.length > 1 && costs.size > 1) out.push({ code, name: e.name, variants: vs });
+  }
+  out.sort((a, b) => String(a.code).localeCompare(String(b.code)));
+  return out;
+}
 
 // 紐付けモーダル用：指定仕入先の「メーカー商品名の候補」と既存の手動紐付けを返す。
 //  実施日フィルタ（横断）ビューでは行ごとに仕入先が違うので、行の仕入先でこれを引いて候補を出す。
@@ -1964,7 +1993,7 @@ const server = http.createServer(async (req, res) => {
         const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(String(body && body.cutoff)) ? body.cutoff : todayIso();
         const issuedOnly = !!(body && body.issuedOnly);
         const r = buildHanbaiExport(cutoff, issuedOnly);
-        return sendJson(res, 200, { ok: true, cutoff, issuedOnly, count: r.count, customerCount: r.customerCount, missingTax: r.missingTax, dbError: r.dbError });
+        return sendJson(res, 200, { ok: true, cutoff, issuedOnly, count: r.count, customerCount: r.customerCount, missingTax: r.missingTax, dbError: r.dbError, ambiguous: multiMatchCheck().length });
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
       }
@@ -1995,7 +2024,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(String(body && body.cutoff)) ? body.cutoff : todayIso();
         const r = buildCostExport(cutoff);
-        return sendJson(res, 200, { ok: true, cutoff, count: r.count, productCount: r.productCount, skipped: r.skipped });
+        return sendJson(res, 200, { ok: true, cutoff, count: r.count, productCount: r.productCount, skipped: r.skipped, ambiguous: multiMatchCheck().length });
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
       }
@@ -3582,6 +3611,7 @@ $('#calChips').addEventListener('click', (e)=>{
       let warn='';
       if(r.dbError) warn='\\n※ 販売大臣DBに接続できず、消費税区分／税率表№は標準値(2／1)で出力します。';
       else if(r.missingTax) warn='\\n※ '+r.missingTax+' 件はDBに商品が無く、消費税は標準値(2／1)で出力します。';
+      if(r.ambiguous) warn+='\\n⚠ '+r.ambiguous+'件は1つの自社商品が複数のメーカー品に一致＝単価が不確定です（正しいメーカー品番を商品マスタ「商品名3」に登録→↻照合 で確定。発行済みは発行時の単価を使います）。';
       if(!confirm(cutoff+' までに実施日が到来した改定 '+r.count+' 行 / '+r.customerCount+' 得意先 を、販売大臣の「単価履歴」取込CSVとして出力します。'+warn+'\\n\\nダウンロードしますか？')){ box.textContent=''; return; }
       box.style.color='#2e7d32'; box.textContent='✓ 単価履歴CSVをダウンロードしました（'+r.count+' 行 / '+r.customerCount+' 得意先）。';
       window.location='/api/hanbai-export?cutoff='+encodeURIComponent(cutoff)+(issuedOnly?'&issuedOnly=1':'');
@@ -3594,7 +3624,9 @@ $('#calChips').addEventListener('click', (e)=>{
       const r=await fetch('/api/cost-export-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cutoff})}).then(x=>x.json());
       if(!r.ok){ box.style.color='#c0392b'; box.textContent='エラー: '+(r.error||''); return; }
       if(!r.count){ box.style.color='#b8860b'; box.textContent='対象なし（'+cutoff+' までに実施日が来た改定はありません）'; return; }
-      if(!confirm(cutoff+' までに実施日が到来した商品 '+r.count+' 件 の新しい仕入原価を、基幹システム取込用CSV（商品コード,新原価）として出力します。\\n\\nダウンロードしますか？')){ box.textContent=''; return; }
+      let cwarn='';
+      if(r.ambiguous) cwarn='\\n⚠ '+r.ambiguous+'件は1つの自社商品が複数のメーカー品に一致＝新原価が不確定です（正しいメーカー品番を商品マスタ「商品名3」に登録→↻照合 で確定。発行済みは発行時の原価を使います）。';
+      if(!confirm(cutoff+' までに実施日が到来した商品 '+r.count+' 件 の新しい仕入原価を、基幹システム取込用CSV（商品コード,新原価）として出力します。'+cwarn+'\\n\\nダウンロードしますか？')){ box.textContent=''; return; }
       box.style.color='#2e7d32'; box.textContent='✓ 仕入原価CSVをダウンロードしました（'+r.count+' 商品）。';
       window.location='/api/cost-export?cutoff='+encodeURIComponent(cutoff);
     }catch(e){ box.style.color='#c0392b'; box.textContent='通信に失敗しました: '+e; }
