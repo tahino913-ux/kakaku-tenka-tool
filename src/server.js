@@ -401,12 +401,13 @@ function calcAll(body) {
       itemStatus,
       customerName: r.customerName || '', customerCode: r.customerCode || '',
       productName: r.productName || '', productCode: r.productCode || '',
-      productNameCore: ps.core, supplierCode: ps.supplierCode, freight: ps.freight, lot: ps.lot, supplierIdEmbed: ps.supplierId,
+      productNameCore: (rec.masterName && String(rec.masterName).trim()) ? String(rec.masterName).trim() : ps.core, // DB直結時はマスタ商品名(クリーン)を優先＝1/120等のゴミを含まない
+      supplierCode: ps.supplierCode, freight: ps.freight, lot: ps.lot, supplierIdEmbed: ps.supplierId,
       makerName: r.makerName || '', makerCode: rec.makerCode || '', matchStatus, priceWarning, rateWarning, costConflict: '',
       currentCost: r.currentCost, newCost: r.newCost, costIncrease: r.costIncrease, costIncreaseRate: r.costIncreaseRate,
       currentSell: r.currentSell, newSell: r.newSell, sellIncrease: r.sellIncrease,
       currentMarginRate: r.currentMarginRate, newMarginRate: r.newMarginRate,
-      qty: r.qty, qtySource: r.qtySource,
+      qty: r.qty, qtySource: r.qtySource, lastDate: rec.lastDate || '',
       annualCostImpact: r.annualCostImpact, annualSellImpact: r.annualSellImpact,
       annualSellCurrent: r.annualSellCurrent, annualSellNew: r.annualSellNew,
       ruleType: r.ruleType,
@@ -513,7 +514,7 @@ function crossSupplierDupCheck() {
     for (const r of recs) {
       if (!/^[✓📌]/.test(r['照合'] || '')) continue;         // 一致行のみ（✓=CD/名前一致・📌=手動紐付け）
       const code = String(r['販売実績商品コード'] || '').trim();
-      if (!code || seen.has(code)) continue; seen.add(code);
+      if (!code || /^0+$/.test(code) || seen.has(code)) continue; seen.add(code); // 全ゼロ(000000等)は実商品でない＝除外
       if (!byCode.has(code)) byCode.set(code, { name: String(r['販売実績商品名'] || '').replace(/\s+/g, ' ').slice(0, 28), prices: {} });
       const e = byCode.get(code); if (e.prices[sup] == null) e.prices[sup] = r['新仕入単価'];
     }
@@ -525,6 +526,60 @@ function crossSupplierDupCheck() {
   }
   dups.sort((a, b) => String(a.code).localeCompare(String(b.code)));
   return dups;
+}
+
+// 「CD一致化 候補」＝今は名前一致で当たっているが メーカー品番がある行を集める。
+//  そのメーカー品番を自社マスタ(商品名3)に登録すれば、次の照合で「CD一致（高精度）」に昇格できる。
+//  各行: { supplier, selfCode(自社CD), selfName, makerCode(メーカー品番), makerName, pct(一致度%) }。
+//  自社CD×メーカー品番 で重複排除。休眠でも品番がある行は自社CD不明なので件数だけ数える（人が確認）。
+function buildCdCandidates() {
+  const files = listLatestCsv();
+  const fileRecs = [];
+  // 先に「既にCD一致しているメーカー品番」を集める＝その品番は正しい自社品に当たっている。
+  //  同じ品番が別の自社品に名前一致しているのは“別サイズ/別品の取り違え”なので候補から除外する。
+  //  例: 3770661 は 005616(NM3=3770661)にCD一致済み。001374(実は3770660)への名前一致100%は誤り＝出さない。
+  const cdMakerCodes = new Set();
+  for (const f of files) {
+    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    fileRecs.push({ sup: String(f).split('_照合結果_')[0], recs });
+    for (const r of recs) { if (/CD一致/.test(r['照合'] || '')) { const mc = String(r['メーカー商品CD'] || '').trim(); if (mc) cdMakerCodes.add(mc); } }
+  }
+  const seen = new Set();
+  const items = [];
+  let dormantWithCode = 0;
+  for (const { sup, recs } of fileRecs) {
+    for (const r of recs) {
+      const st = r['照合'] || '';
+      const makerCode = String(r['メーカー商品CD'] || '').trim();
+      const selfCode = String(r['販売実績商品コード'] || '').trim();
+      if (/休眠|未一致/.test(st)) { if (makerCode) dormantWithCode++; continue; } // 休眠＝自社CD不明
+      if (!/名前一致/.test(st)) continue; // CD一致・手動紐付けは確定済み＝対象外
+      if (!makerCode || !selfCode || /^0+$/.test(selfCode)) continue;
+      if (cdMakerCodes.has(makerCode)) continue; // その品番は既に正しい自社品にCD一致済み＝別品への取り違え候補なので除外
+      const key = selfCode + '' + makerCode;
+      if (seen.has(key)) continue; seen.add(key);
+      const m = st.match(/(\d+)\s*%/);
+      items.push({
+        supplier: sup, selfCode,
+        selfName: String(r['販売実績商品名'] || '').replace(/\s+/g, ' ').slice(0, 40),
+        makerCode,
+        makerName: String(r['メーカー商品名'] || '').replace(/\s+/g, ' ').slice(0, 40),
+        pct: m ? Number(m[1]) : '',
+      });
+    }
+  }
+  items.sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.selfCode).localeCompare(String(b.selfCode)));
+  return { items, count: items.length, dormantWithCode };
+}
+// 候補をマスタ登録用CSV（UTF-8 BOM＝Excelで日本語が文字化けしない）に。商品コード＋メーカー品番が主役。
+//  ※販売大臣の商品マスタ取込フォーマット（列名/SJIS要否）は実機で要確認。まずは確認・作業用の汎用CSV。
+function buildCdCandidatesCsv() {
+  const { items } = buildCdCandidates();
+  const cell = (v) => { const s = (v == null ? '' : String(v)); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const head = ['商品コード', 'メーカー品番（商品名3へ登録）', '現商品名（参考）', '仕入先', '一致度%'];
+  const lines = [head.join(',')];
+  for (const it of items) lines.push([it.selfCode, it.makerCode, it.selfName, it.supplier, it.pct].map(cell).join(','));
+  return '﻿' + lines.join('\r\n');
 }
 
 // 紐付けモーダル用：指定仕入先の「メーカー商品名の候補」と既存の手動紐付けを返す。
@@ -555,6 +610,27 @@ function getHanbaiRecordsCached(force) {
   const records = loadHanbaiRecords({ settings: getSettings() }); // ログは無音（UI用途）
   _hanbaiCache = { at: Date.now(), records };
   return records;
+}
+
+// 得意先マスタ（得意先コード→{name, kana}）。DB直結時(source=db/auto)だけ TOKUI から読む（読み取り専用）。
+//  ＝得意先ページで「コード表示」「カナ検索」に使う。ファイル方式/DB不可のときは空＝名前・コードのみで検索。
+//  DB読取は重いので短時間キャッシュ（5分）。失敗しても画面は壊さない（空マップで続行）。
+let _custMasterCache = null; // { at, map }
+function getCustomerMasterMap(force) {
+  const TTL = 5 * 60 * 1000;
+  if (!force && _custMasterCache && (Date.now() - _custMasterCache.at) < TTL) return _custMasterCache.map;
+  const map = {};
+  try {
+    const s = getSettings();
+    const mode = String((s.hanbai && s.hanbai.source) || 'file');
+    if (mode === 'db' || mode === 'auto') {
+      const { loadCustomerMaster } = require('./db_hanbai');
+      const dbCfg = Object.assign({}, (s.hanbai && s.hanbai.db) || {});
+      for (const c of loadCustomerMaster(dbCfg)) { if (c.code) map[c.code] = { name: c.name, kana: c.kana }; }
+    }
+  } catch (e) { /* DB不可＝コード/カナ無しで続行（名前検索は効く） */ }
+  _custMasterCache = { at: Date.now(), map };
+  return map;
 }
 
 // 休眠（メーカー品が自社品に1つも当たっていない行）を手動で直すための「自社販売実績品の候補」。
@@ -1246,6 +1322,8 @@ function buildCustomerCandidates(opts) {
         effectiveDate: normDateInput(effRaw),
         matchStatus: r.matchStatus || '',
         currentCost: r.currentCost, newCost: r.newCost,
+        annualQty: fin(r.qty) ? r.qty : 0, // 直近約1年の数量（0＝取引なし）
+        lastDate: r.lastDate || '',       // 最終売上日（ISO・DB直結時のみ）＝得意先ページの「過去N年」フィルタ用
         rowKey, ruleForRow, sellManual, effManual, note,
       };
       // 実施日が有効な日付でない（空・「未定」等）行に印を付ける。得意先ページの見積発行では実施日が必須＝
@@ -1276,6 +1354,7 @@ function buildCustomerCandidates(opts) {
 // /customers 画面の表示用。keep だけを「該当商品」に集め、要確認は件数のみ返す（従来互換）。
 function aggregateCustomers(opts) {
   const { byCustomer, fileCount, errors, applied } = buildCustomerCandidates(opts);
+  const masterMap = getCustomerMasterMap(); // 得意先コード→{name,kana}（DB直結時のみ・無ければ空）
   const customers = [];
   const bySupName = (a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.productName).localeCompare(String(b.productName), 'ja');
   for (const [name, { keep, review }] of byCustomer) {
@@ -1285,8 +1364,17 @@ function aggregateCustomers(opts) {
     const holdProducts = keep.filter((p) => p.status === 'hold').sort(bySupName);
     const issuedProducts = keep.filter((p) => p.status === 'issued').sort(bySupName);
     const suppliers = [...new Set(active.map((p) => p.supplier))].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
+    // 得意先コード（全アイテム共通）と 検索カナ（DBマスタから）。取引あり＝直近約1年に数量がある品が1つでもある。
+    const allItems = keep; // 対象/検討中/提出済み すべてからコード・取引判定を拾う
+    const code = (allItems.find((p) => p.customerCode && String(p.customerCode).trim()) || {}).customerCode || '';
+    const kana = (code && masterMap[code] && masterMap[code].kana) || '';
+    const hasRecent = allItems.some((p) => Number(p.annualQty) > 0);
+    // 最終売上日＝この得意先の全アイテム中で最新の売上日（ISO）。得意先ページの「過去N年」フィルタに使う。
+    let lastDate = '';
+    for (const p of allItems) { if (p.lastDate && p.lastDate > lastDate) lastDate = p.lastDate; }
     customers.push({
-      name, productCount: active.length, supplierCount: suppliers.length,
+      name, code, kana, hasRecent, lastDate,
+      productCount: active.length, supplierCount: suppliers.length,
       suppliers, reviewCount: review.length, products: active,
       holdProducts, issuedProducts, holdCount: holdProducts.length, issuedCount: issuedProducts.length,
     });
@@ -2010,6 +2098,26 @@ const server = http.createServer(async (req, res) => {
       try { return sendJson(res, 200, { ok: true, dups: crossSupplierDupCheck() }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), dups: [] }); }
     }
+    // CD一致化 候補（メーカー品番をマスタ商品名3に登録すればCD一致にできる品）
+    if (req.method === 'GET' && url === '/api/cd-candidates') {
+      try { const r = buildCdCandidates(); return sendJson(res, 200, { ok: true, count: r.count, dormantWithCode: r.dormantWithCode, items: r.items.slice(0, 300) }); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), count: 0 }); }
+    }
+    if (req.method === 'GET' && url === '/api/cd-candidates.csv') {
+      try {
+        const buf = Buffer.from(buildCdCandidatesCsv(), 'utf8');
+        const fnJp = 'CD一致化候補.csv';
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="cd_candidates.csv"; filename*=UTF-8\'\'' + encodeURIComponent(fnJp),
+          'Content-Length': buf.length,
+        });
+        return res.end(buf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('export error: ' + String(e && e.message || e));
+      }
+    }
     if (req.method === 'GET' && url === '/api/link-context') {
       try { const sp = new URLSearchParams(req.url.split('?')[1] || ''); return sendJson(res, 200, linkContext(sp.get('supplier') || '')); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
@@ -2148,6 +2256,9 @@ const PAGE = `<!doctype html>
   #priceAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fdecea; border:1px solid #f5b7b1; color:#922b21; font-size:13px; }
   #rateAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fff4d6; border:1px solid #f0d090; color:#7a5200; font-size:13px; }
   #dupAlert{ margin:8px 0; padding:9px 12px; border-radius:8px; background:#fdeede; border:1px solid #e6b87a; color:#8a4b12; font-size:13px; line-height:1.7; }
+  #cdCand{ margin:8px 0; padding:9px 12px; border-radius:8px; background:#eaf3fb; border:1px solid #9ec3e6; color:#1f4e78; font-size:13px; line-height:1.7; }
+  #cdCand a.dl{ display:inline-block; margin-left:6px; padding:3px 10px; border-radius:6px; background:#1f6fb2; color:#fff; text-decoration:none; font-weight:700; font-size:12px; }
+  #cdCand a.dl:hover{ background:#175a92; }
   .jumphint{ display:inline-block; margin-left:8px; padding:1px 8px; border-radius:10px; background:rgba(0,0,0,.08); font-weight:700; white-space:nowrap; }
   tr.flashrow{ animation:flashrow 1.4s ease-out 1; }
   @keyframes flashrow{ 0%{ background:#ffe08a; } 60%{ background:#fff3c4; } 100%{ background:transparent; } }
@@ -2388,40 +2499,19 @@ const PAGE = `<!doctype html>
       <button id="shogoBtn" class="ghost" style="white-space:nowrap" title="maker_quotes に取り込んだメーカー見積を販売実績と照合し、新しい照合結果CSVを作ります（販売実績が旧Excelなら自動変換）">↻ 照合を実行</button>
     </div>
     <span id="shogoMsg" style="font-size:11px;color:#6b7785"></span></div>
-  <div class="field"><label>転嫁ルール（全体方針）<br><span class="hint">保存すると得意先別へ引継ぎ</span></label>
-    <select id="rule">
-      <option value="add_increase">値上げ分を上乗せ（利益額キープ）</option>
-      <option value="keep_margin_rate">現在の粗利率を維持</option>
-      <option value="markup">現売価 × 掛率</option>
-      <option value="sell_cost_rate">現売価 × 仕入改定%（仕入と同率で値上げ＝粗利率維持と同結果）</option>
-      <option value="keep_sell">据え置き（値上げしない）</option>
-    </select></div>
-  <div class="field" id="factorBox" style="display:none"><label>掛率</label>
-    <input id="factor" class="num" type="number" step="0.01" value="1.25"></div>
-  <div class="field"><label>端数 単位</label>
-    <select id="unit">
-      <option value="1">1円</option>
-      <option value="0.1">0.1円</option>
-      <option value="0.01" selected>0.01円（銭）</option>
-    </select></div>
-  <div class="field"><label>端数 処理</label>
-    <select id="mode">
-      <option value="round" selected>四捨五入</option>
-      <option value="ceil">切上げ</option>
-      <option value="floor">切捨て</option>
-    </select></div>
-  <div class="field"><label>自社コスト上乗せ%<br><span class="hint">労務費・最賃</span></label>
-    <input id="selfUplift" class="num" type="number" step="0.1" value="0"></div>
-  <div class="field"><label>&nbsp;<br><span class="hint">この方針を会社全体の既定に</span></label>
-    <button class="go" id="savePolicyBtn" style="background:#5b6b8b" title="今の転嫁ルール・端数・自社上乗せ%を『全体方針』として保存します。得意先別ページの初期値に引き継がれます（損益シミュレーションの前提もこれになります）">💾 全体方針を保存</button></div>
+  <div class="field" style="flex:1;min-width:220px"><label>転嫁ルール（全体方針）</label>
+    <div style="font-size:12px;color:#5a6b7d;line-height:1.5">
+      価格の計算ルール（転嫁ルール・端数・自社上乗せ%）は <b>⚙ 設定</b> に集約しました。<br>
+      損益は設定の全体方針で自動計算します。<span class="hint">個別の価格・見積書は「得意先別ページ」で。</span>
+    </div></div>
 </div>
 
 <!-- 見積書作成への導線（メインは照合確認用 → 見積書は得意先別ページで）。独立バナーで目立たせる。 -->
 <div style="margin:0 16px 12px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:#eaf6ee;border:1px solid #bfe0c4;border-left:6px solid #1b6b3a;border-radius:10px;padding:12px 16px">
   <span style="font-size:20px">🧾</span>
   <div style="flex:1;min-width:200px">
-    <div style="font-weight:700;color:#1b5e34;font-size:14px">見積書の作成は「得意先別ページ」で行います</div>
-    <div style="color:#3c6b4a;font-size:12px;margin-top:2px">このメイン画面は照合の確認・全体方針の決定用です。価格を確認したら、得意先別ページで見積書を出力してください。</div>
+    <div style="font-weight:700;color:#1b5e34;font-size:14px">価格の設定・見積書の作成は「得意先別ページ」で行います</div>
+    <div style="color:#3c6b4a;font-size:12px;margin-top:2px">このメイン画面は<b>照合・紐付けの確認</b>用です（照合が正しいかを確認し、休眠は紐付けで救済）。価格は得意先ごとに得意先別ページで設定してください。</div>
   </div>
   <a id="toCustomersBtn" href="/customers" style="background:#1b6b3a;color:#fff;text-decoration:none;display:inline-block;text-align:center;padding:11px 20px;border-radius:8px;font-size:14px;font-weight:700;white-space:nowrap" onmouseover="this.style.background='#15532c'" onmouseout="this.style.background='#1b6b3a'">👥 得意先別ページで見積書を作成 →</a>
 </div>
@@ -2467,6 +2557,7 @@ const PAGE = `<!doctype html>
   <button id="dateFilterClear" type="button" style="margin-left:auto;background:#2f6fb0;color:#fff;border:none;border-radius:7px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer">× 解除して通常表示に戻す</button>
 </div>
 <div id="dupAlert" style="display:none"></div>
+<div id="cdCand" style="display:none"></div>
 <div id="priceAlert"></div>
 <div id="rateAlert"></div>
 <div id="issuedHideNote" style="display:none;margin:8px 0;padding:8px 12px;background:#eef7ef;border:1px solid #bfe0c4;border-radius:8px;font-size:12px;color:#1f6b35"></div>
@@ -2474,11 +2565,10 @@ const PAGE = `<!doctype html>
 <div class="wrap" id="wrap"><table id="tbl">
   <thead><tr>
     <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th>商品名</th>
-    <th class="r">現仕入</th><th class="c">改定後 仕入単価<br><span class="hint">(編集可)</span></th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
+    <th class="r">現仕入</th><th class="c">改定後 仕入単価</th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
     <th class="r">現売単価</th><th class="r">転嫁後 売単価</th><th class="r">値上額<br><span class="hint">(改定%)</span></th>
     <th class="r">現粗利</th><th class="r">転嫁後 粗利</th>
     <th class="c">年間数量</th><th class="r">仕入 年影響</th><th class="r">増収 年影響</th>
-    <th class="c">行ルール</th>
     <th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
   </tr></thead>
   <tbody id="tbody"></tbody>
@@ -2507,12 +2597,15 @@ const num = (v,d=2) => Number.isFinite(v) ? v.toLocaleString('ja-JP',{minimumFra
 const pct = (v) => Number.isFinite(v) ? v.toFixed(1)+'%' : '—';
 const signCls = (v) => Number.isFinite(v) ? (v>0?'pos':(v<0?'neg':'')) : '';
 
+// メイン画面の全体方針は ⚙設定 に集約（上部の方針バーは撤去）。settings() は保存済み方針
+//  （savedPolicy）を返す。初期化と設定保存のたびに applyToBar が savedPolicy を更新する。
+//  ＝メイン＝照合・紐付けの確認／価格設定は得意先別ページ、という役割分担。
+let savedPolicy = { rule:{ type:'add_increase', factor:1.25 }, rounding:{ unit:0.01, mode:'round' }, selfUplift:0 };
 function settings(){
-  const type = $('#rule').value;
   return {
-    rule: { type, factor: parseFloat($('#factor').value)||1 },
-    rounding: { unit: parseFloat($('#unit').value)||0.01, mode: $('#mode').value },
-    selfUplift: parseFloat($('#selfUplift').value)||0,
+    rule: { type: savedPolicy.rule.type, factor: savedPolicy.rule.factor },
+    rounding: { unit: savedPolicy.rounding.unit, mode: savedPolicy.rounding.mode },
+    selfUplift: savedPolicy.selfUplift,
   };
 }
 function isUnmatched(r){ return !r.customerName || r.customerName==='-' || /未一致/.test(r.matchStatus||''); }
@@ -2588,6 +2681,7 @@ async function runShogo(){
       $('#shogoMsg').style.color='#2e7d32'; $('#shogoMsg').textContent='✓ 照合完了（'+(res.files?res.files.length:0)+'件のCSVを作成）';
       await loadFiles(newest);
       loadAllImpact(); // 照合結果が増減した可能性 → 全社損益を取り直す
+      loadDupCheck(); loadCdCandidates(); // 二重登録・CD一致化候補も取り直す（マスタ登録→再照合で減る）
     } else {
       $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent='照合できません: '+(res.error||'');
     }
@@ -2611,19 +2705,9 @@ function buildMainRow(r, i, readOnly){
   let prodName = buildProdNameHtml(r);
   if(readOnly && r.supplier) prodName += '<div style="font-size:10px;color:#1f6fb2;margin-top:2px">🏢 '+esc(r.supplier)+'</div>';
   if(readOnly) prodName += progressBadge(r.itemStatus);
-  const costCell = readOnly
-    ? '<td class="r">'+num(r.newCost)+'</td>'
-    : '<td class="r"><input class="num newcost" data-i="'+i+'" type="number" step="0.01" value="'+(Number.isFinite(r.newCost)?r.newCost:'')+'"></td>';
-  const ruleCell = readOnly
-    ? '<td class="c"><span class="hint">—</span></td>'
-    : '<td class="c"><select class="rule-sel rowrule" data-i="'+i+'">'+
-        '<option value="">（全体）</option>'+
-        '<option value="add_increase">上乗せ</option>'+
-        '<option value="keep_margin_rate">粗利維持</option>'+
-        '<option value="markup">掛率</option>'+
-        '<option value="sell_cost_rate">売価×仕入率</option>'+
-        '<option value="keep_sell">据置</option>'+
-      '</select></td>';
+  // メイン画面は照合・紐付けの確認用＝価格は編集しない（改定後仕入は読み取り表示）。
+  //  価格の設定・行ごとの転嫁ルールは得意先別ページに集約した。
+  const costCell = '<td class="r">'+num(r.newCost)+'</td>';
   const linkCell = '<td class="c">'+linkCellHtml(r, i)+'</td>'; // 横断（読み取り）ビューでも紐付けは可能
   tr.innerHTML =
     custCellHtml(r)+
@@ -2640,7 +2724,7 @@ function buildMainRow(r, i, readOnly){
     '<td class="c" id="qt'+i+'"></td>'+
     '<td class="r" id="aci'+i+'"></td>'+
     '<td class="r" id="asi'+i+'"></td>'+
-    ruleCell+ linkCell;
+    linkCell;
   return tr;
 }
 // baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
@@ -2658,10 +2742,7 @@ function renderMainRows(readOnly){
     if(hiddenIssued && !readOnly){ note.style.display=''; note.innerHTML='✅ <b>見積書 作成済み '+hiddenIssued+' 件</b>は非表示です（提出済み）。得意先別ページの「✅提出済み」で確認・対象へ戻せます。'; }
     else { note.style.display='none'; note.textContent=''; }
   }
-  if(!readOnly){
-    tb.querySelectorAll('.newcost').forEach(el=> el.addEventListener('input', debounce(recalc,200)));
-    tb.querySelectorAll('.rowrule').forEach(el=> el.addEventListener('change', recalc));
-  }
+  // 価格編集（改定後仕入・行ルール）はメイン画面から撤去＝得意先別ページに集約したので配線しない。
   // 紐付けボタンは読み取り（実施日フィルタ）ビューでも有効（openLinkModal が行の仕入先で処理）
   tb.querySelectorAll('.linkBtn').forEach(el=> el.addEventListener('click', (e)=> openLinkModal(Number(e.currentTarget.dataset.i))));
 }
@@ -3089,26 +3170,9 @@ function renderPL(){
 function recalcAll(){ if(dateFilter){ loadByDate(dateFilter); return; } recalc(); loadAllImpact(); }
 $('#file').addEventListener('change', loadFile); // ファイル切替は表示の切替だけ＝損益(全社)は不変
 $('#shogoBtn').addEventListener('click', runShogo);
-$('#rule').addEventListener('change', ()=>{ $('#factorBox').style.display = $('#rule').value==='markup'?'flex':'none'; recalcAll(); });
-$('#factor').addEventListener('input', debounce(recalcAll,200));
-$('#unit').addEventListener('change', recalcAll);
-$('#mode').addEventListener('change', recalcAll);
-$('#selfUplift').addEventListener('input', debounce(recalcAll,200));
+// 全体方針（転嫁ルール・端数・自社上乗せ%）はメイン画面から撤去し ⚙設定 に集約。
+//  設定で保存すると applyToBar が savedPolicy を更新し、表示・損益にも反映される（setSave 内で再計算）。
 // 見積書の作成はメイン画面では行わない（得意先別ページに集約）。#toCustomersBtn は /customers への通常リンク。
-// 「全体方針を保存」：今のメイン上部の転嫁ルール・端数・自社上乗せ%を settings.json の既定に保存。
-//  得意先別ページはこの既定を初期値として読むので、メイン＝全体方針の決定／損益確認 という役割が明確になる。
-$('#savePolicyBtn').addEventListener('click', async ()=>{
-  const s=settings();
-  const patch={ default:{ type:s.rule.type, factor:s.rule.factor }, rounding:{ unit:s.rounding.unit, mode:s.rounding.mode }, selfCostUplift:{ rate:s.selfUplift } };
-  const btn=$('#savePolicyBtn'); btn.disabled=true;
-  $('#msg').style.color='#1f4e78'; $('#msg').textContent='全体方針を保存中…';
-  try{
-    const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(x=>x.json());
-    if(res&&res.ok){ $('#msg').style.color='#2e7d32'; $('#msg').textContent='✓ 全体方針を保存しました（'+(RULE_LABEL[s.rule.type]||s.rule.type)+(s.rule.type==='markup'?' '+s.rule.factor:'')+' ／ 端数 '+s.rounding.unit+'円 ／ 自社+'+s.selfUplift+'%）。得意先別ページの初期値に引き継がれます。'; }
-    else { $('#msg').style.color='#c0392b'; $('#msg').textContent='保存に失敗しました'; }
-  }catch(e){ $('#msg').style.color='#c0392b'; $('#msg').textContent='保存に失敗: '+e; }
-  finally{ btn.disabled=false; }
-});
 // 補助スクロールバー（上）と表本体（下）の左右位置を連動させる
 (function(){
   const hbar=$('#hbar'), wrap=$('#wrap');
@@ -3182,14 +3246,14 @@ function collectSettings(){
   };
 }
 // 画面上部のバーの初期値を、保存済み設定に合わせる
+// 保存済み設定を「全体方針」として取り込む（メインの方針バーは撤去したので DOM ではなく savedPolicy へ）。
 function applyToBar(s){
   const df=s.default||{}, rd=s.rounding||{}, su=s.selfCostUplift||{};
-  $('#rule').value=df.type||'add_increase';
-  $('#factor').value=df.factor||1.25;
-  $('#factorBox').style.display = $('#rule').value==='markup'?'flex':'none';
-  $('#unit').value=String(rd.unit||0.01);
-  $('#mode').value=rd.mode||'round';
-  $('#selfUplift').value=Number(su.rate)||0;
+  savedPolicy = {
+    rule: { type: df.type||'add_increase', factor: Number(df.factor)||1.25 },
+    rounding: { unit: Number(rd.unit)||0.01, mode: rd.mode||'round' },
+    selfUplift: Number(su.rate)||0,
+  };
 }
 function openSettings(){ setEl('settingsOverlay').classList.add('show'); }
 function closeSettings(){ setEl('settingsOverlay').classList.remove('show'); }
@@ -3216,9 +3280,10 @@ setEl('setSave').addEventListener('click', async ()=>{
   try{
     const res = await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(x=>x.json());
     if(res && res.ok){
-      applyToBar(res.settings);
+      applyToBar(res.settings); // savedPolicy を更新（メインの方針バーは撤去済み）
       setEl('setMsg').style.color='#2e7d32'; setEl('setMsg').textContent='✓ 保存しました';
-      setTimeout(()=>{ closeSettings(); if(baseRows.length) recalc(); }, 600);
+      // 全体方針が変わった可能性 → 表示中の表と 全社損益を新方針で取り直す
+      setTimeout(()=>{ closeSettings(); if(baseRows.length) recalc(); loadAllImpact(); }, 600);
     } else { setEl('setMsg').style.color='#c0392b'; setEl('setMsg').textContent='保存に失敗しました'; }
   }catch(e){ setEl('setMsg').style.color='#c0392b'; setEl('setMsg').textContent='保存に失敗: '+e; }
   finally{ btn.disabled=false; }
@@ -3538,8 +3603,21 @@ async function loadDupCheck(){
       +'修正見積を違う仕入先名で取り込むと起きます（損益・見積・取込CSVが二重に）。正しい仕入先名で取り込み直すか、片方を整理してください。<br>'+sample+(dups.length>6?'<br>　…ほか':'');
   }catch(e){ box.style.display='none'; }
 }
+// CD一致化 候補：メーカー品番をマスタ(商品名3)に登録すればCD一致にできる品の案内＋CSVダウンロード。
+async function loadCdCandidates(){
+  const box=$('#cdCand'); if(!box) return;
+  try{
+    const r=await fetch('/api/cd-candidates').then(x=>x.json());
+    if(!r||!r.ok||!r.count){ box.style.display='none'; box.innerHTML=''; return; }
+    box.style.display='block';
+    box.innerHTML='🏷 <b>メーカー品番を商品マスタ(商品名3)に登録すると「CD一致(高精度)」にできる品 '+r.count+'件</b>'
+      +(r.dormantWithCode?'（ほか 品番ありの休眠 '+r.dormantWithCode+'件＝自社品の確認が必要）':'')
+      +' <a class="dl" href="/api/cd-candidates.csv" download>📥 候補CSV</a>'
+      +'<div style="font-size:11px;margin-top:3px;color:#3a567a">CSVを確認 → 販売大臣の商品マスタ取込で「商品名3」に登録 → 「↻ 照合を実行」でCD一致に昇格します（今は名前一致＝確度は高いが、CDにすると確実）。</div>';
+  }catch(e){ box.style.display='none'; }
+}
 (async ()=>{
-  await initSettings(); fetchPL(); loadAllImpact(); loadDupCheck();
+  await initSettings(); fetchPL(); loadAllImpact(); loadDupCheck(); loadCdCandidates();
   const params=new URLSearchParams(location.search);
   const fSup=params.get('focusSupplier');
   if(fSup){

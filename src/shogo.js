@@ -181,7 +181,10 @@ function run(argv) {
 
   // 販売実績の取得（DB直結 or ファイル）。取得ロジックは loadHanbaiRecords に集約（'auto'=会社PCは
   //  DB直結／自宅PCはファイル を1設定で両立）。引数で販売実績ファイルを明示した時は常にファイル優先。
-  const hanbai = loadHanbaiRecords({ settings: s, hanbaiArg, log: console.log });
+  // 照合の候補プールは「全期間（システム内の過去履歴すべて）」で拾う＝季節品・たまにしか出ない品も取りこぼさない。
+  //  年間金額(損益)の窓は db_hanbai 側で直近約1年のまま据え置く（候補だけ全期間＝損益は歪まない）。
+  //  どこまで遡って表示・見積するかは得意先ページの「過去N年」フィルタで制御する（候補は広く・表示は可変）。
+  const hanbai = loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: true, log: console.log });
 
   // .xlsx のメーカー見積を maker_quotes/ のCSVへ展開（ドロップ→照合.bat だけで使える）
   const expandXlsx = (file) => {
@@ -216,12 +219,6 @@ function run(argv) {
   // 案A：仕入先ごとに統合（同じ商品は最新の取り込みで上書き）してから1仕入先1本で照合・出力する。
   //  さらに makerChannel で「問屋経由のメーカー」を実際の仕入先に寄せる（エフピコ→朝日 等）＝二重計上の防止。
   const merged = mergeMakerFiles(makerFiles, s.makerChannel || {});
-  // 自社製造（メーカーコード9000）専用の「全期間」販売実績プール（必要時だけ1回ロード＝重いDB照会を節約）。
-  let selfHanbai = null;
-  const getSelfHanbai = () => {
-    if (!selfHanbai) selfHanbai = loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: true, log: console.log });
-    return selfHanbai;
-  };
   // 自社製造（9000分類）に取り込まれた自社CDの集合。これらは「自社で作る品＝原価0」なので、
   //  他の仕入先の照合候補から除外する（過去伝票の発注先が他社でも、自社製造品は9000側だけに出すのが正）。
   //  例 008080「ﾄﾚｰ279-1」＝自社製造分類だが発注先0014(北原)。除外しないと北原の値上げに名前一致し二重計上。
@@ -236,12 +233,11 @@ function run(argv) {
     // 仕入先コードフィルタ: 各メーカー見積に紐づく 4桁仕入先コードを settings.makers から拾う。
     // 設定済なら自社末尾コードと一致する自社品だけが候補に。未設定なら従来通り全件候補。
     const purchaseCode = (makersProfile[supplier] && makersProfile[supplier].purchaseCode) || '';
-    // 自社製造(9000)は自社コード完全一致で、かつ過去実績を遡れるだけ遡る（全期間プール）。他メーカーは従来の窓。
+    // 候補プールは全仕入先とも全期間（hanbai）。自社製造(9000)は自社コード完全一致(matchSelf)で拾う。
     const isSelf = String(purchaseCode).trim() === '9000';
-    const pool = isSelf ? getSelfHanbai() : hanbai;
     // 非9000の照合だけ、自社製造分類の自社CDを候補から除外（9000自身の照合には渡さない＝自社製造品はそのまま拾う）。
     const excludeSelfCodes = isSelf ? null : selfMadeCodes;
-    const rows = matchAll(items, pool, { nameFloor, productLinks, purchaseCode, priceVetoBelow, excludeSelfCodes });
+    const rows = matchAll(items, hanbai, { nameFloor, productLinks, purchaseCode, priceVetoBelow, excludeSelfCodes });
     const matched = rows.filter((r) => /^✓/.test(r.status)).length;
     const dormant = rows.length - matched;
     const out = uniqueOutPath(INPUT_DIR, supplier, usedOut);

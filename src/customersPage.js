@@ -78,6 +78,9 @@ const CUSTOMERS_PAGE = `<!doctype html>
   .cust .meta{font-size:11px;color:#6b7785;margin-top:2px}
   .cust .cnt{flex:0 0 auto;background:#1f4e78;color:#fff;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:700}
   .cust .rev{color:#c0392b;font-size:11px;font-weight:700;margin-left:6px}
+  .cust .ccode{display:inline-block;background:#eef2f7;color:#41526b;border-radius:4px;padding:0 5px;font-size:10px;font-weight:700;margin-right:5px;font-family:monospace}
+  .cust .nrec{color:#9aa6b2;font-size:11px;font-weight:700;margin-left:6px}
+  .listnote{font-size:11px;color:#8a6d3b;background:#fbf6e7;border:1px solid #ecdba8;border-radius:6px;padding:5px 8px;margin:0 0 8px}
   table{border-collapse:collapse;width:100%;background:#fff;font-size:13px}
   th,td{border:1px solid #e2e6ec;padding:6px 9px;vertical-align:middle}
   th{background:#eef2f7;text-align:left;white-space:nowrap;position:sticky;top:0;z-index:1}
@@ -168,7 +171,14 @@ const CUSTOMERS_PAGE = `<!doctype html>
 <div class="toolbar">
   <button class="go" id="toggleListBtn" style="background:#5b6b8b" title="左の得意先一覧を隠して、右の明細を広く使えます（もう一度押すと表示）">◀ 一覧を隠す</button>
   <button class="go" id="reloadBtn">🔄 最新の状態を読み込む</button>
-  <input id="search" type="text" placeholder="得意先を検索…">
+  <input id="search" type="text" placeholder="得意先を検索（名前・コード・カナ）…">
+  <label style="font-size:12px;color:#5a6b7d;display:flex;align-items:center;gap:4px;white-space:nowrap" title="この期間に取引のある得意先だけ表示します（最終売上日で判定・DB直結時）。照合は全期間で拾うので、ここで何年ぶんを見るか決められます。"><span>表示期間</span>
+    <select id="recentYears" style="padding:5px 8px;border:1px solid #c7d6e4;border-radius:8px;font-size:13px">
+      <option value="1">過去1年（取引あり）</option>
+      <option value="2">過去2年</option>
+      <option value="3">過去3年</option>
+      <option value="0">全期間（過去客も）</option>
+    </select></label>
   <span id="msg" class="muted"></span>
   <span class="spacer" style="margin-left:auto"></span>
   <span id="issuedStat" class="muted" title="見積書を提出（発行）済みの得意先数">提出済 0</span>
@@ -286,6 +296,7 @@ function pctChg(cur,neu){
 }
 let DATA=[];      // 得意先配列
 let filtered=[];  // 検索後
+let hiddenNoRecent=0; // 「取引のない先を隠す」で隠した件数（一覧上部に表示）
 let selName=null; // 選択中の得意先名
 let ISSUED={};    // 提出（発行）履歴 { 得意先名: {lastIssuedAt,count,quoteNo,itemCount,folder} }
 let rowRules={};  // 行ごと転嫁ルールの上書き { rowKey: ruleType }（空=全体ルール）
@@ -456,9 +467,50 @@ async function load(){
   updateIssuedToolbar();
   if(selName && DATA.find(x=>x.name===selName)) selectCust(selName); // 再計算後も選択中の得意先を保持
 }
+// カナ検索の正規化キー：NFKC（半角カナ→全角・全角英数→半角）→カタカナをひらがなへ→小文字・空白除去。
+//  これで「なかじま / ナカジマ / ﾅｶ」のどれで打っても KCODE(半角カナ ﾅｶｼﾞﾏ) に一致する。※正規表現は使わない。
+function kanaKey(s){
+  s=String(s==null?'':s).normalize('NFKC');
+  let out='';
+  for(const ch of s){
+    let c=ch.charCodeAt(0);
+    if(c>=0x30A1 && c<=0x30F6) c-=0x60; // 全角カタカナ→ひらがな
+    const x=String.fromCharCode(c).toLowerCase();
+    if(x!==' ' && x!=='　') out+=x;
+  }
+  return out;
+}
+// 得意先が検索語に一致するか（名前・得意先コード・検索カナ のいずれか）。
+function matchCust(c,q){
+  if(!q) return true;
+  if(c.name && c.name.indexOf(q)>=0) return true;
+  if(c.code && String(c.code).indexOf(q)>=0) return true;
+  const qk=kanaKey(q);
+  if(qk){
+    if(c.kana && kanaKey(c.kana).indexOf(qk)>=0) return true;
+    if(c.name && kanaKey(c.name).indexOf(qk)>=0) return true;
+  }
+  return false;
+}
+// 過去N年の判定。最終売上日(ISO)が「今日からN年前」以降なら期間内。
+//  最終売上日が無い（ファイル方式/未再照合のCSV）ときは直近1年フラグ(hasRecent)で代用。
+function cutoffIso(years){
+  const d=new Date(); const t=new Date(d.getFullYear()-years, d.getMonth(), d.getDate());
+  const p=(n)=>String(n).padStart(2,'0');
+  return t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate());
+}
+function withinYears(c, years){
+  if(!years || years<=0) return true; // 全期間
+  if(c.lastDate) return c.lastDate >= cutoffIso(years);
+  return !!c.hasRecent; // 最終売上日が無いときは直近1年(hasRecent)で代用
+}
 function applyFilter(){
   const q=($('#search').value||'').trim();
-  filtered = q ? DATA.filter(c=>c.name.indexOf(q)>=0) : DATA.slice();
+  const years = parseInt(($('#recentYears') && $('#recentYears').value) || '1', 10);
+  let list = DATA.slice();
+  hiddenNoRecent = 0;
+  if(years>0){ const before=list.length; list=list.filter(c=>withinYears(c,years)); hiddenNoRecent = before-list.length; }
+  filtered = q ? list.filter(c=>matchCust(c,q)) : list;
   renderList();
 }
 // 提出（発行）履歴をサーバから取得
@@ -508,24 +560,33 @@ function updateIssuedToolbar(){
   el.textContent = n ? ('✅ 提出済 '+n+(total?'/'+total:'')+' 得意先') : '提出済 0';
 }
 function renderList(){
-  if(!filtered.length){ $('#listCol').innerHTML='<div class="empty">該当する得意先がありません。<br>照合結果がない場合は「↻ 照合を実行」してください。</div>'; return; }
-  let html='';
+  // 「取引のない先を隠す」で隠した件数の案内（解除リンク付き）。
+  const yrs = parseInt(($('#recentYears') && $('#recentYears').value) || '1', 10);
+  const note = hiddenNoRecent
+    ? '<div class="listnote">🔇 過去'+yrs+'年に取引のない先 '+hiddenNoRecent+'件 を非表示中。<a href="#" onclick="showAllCusts();return false">全期間を表示</a></div>'
+    : '';
+  if(!filtered.length){ $('#listCol').innerHTML=note+'<div class="empty">該当する得意先がありません。'+(hiddenNoRecent?'<br>表示期間を「全期間」にすると過去客も表示されます。':'<br>照合結果がない場合は「↻ 照合を実行」してください。')+'</div>'; return; }
+  let html=note;
   for(const c of filtered){
     const sel = c.name===selName ? ' sel' : '';
     const rev = c.reviewCount ? '<span class="rev">要確認'+c.reviewCount+'</span>' : '';
     const lowN = lowMarginCount(c);
     const low = lowN ? '<span class="lowm">薄利'+lowN+'</span>' : '';
     const hold = c.holdCount ? '<span class="holdm">検討中'+c.holdCount+'</span>' : '';
+    const nrec = c.hasRecent ? '' : (c.lastDate ? '<span class="nrec" title="最終売上 '+esc(c.lastDate)+'">最終 '+esc(c.lastDate.slice(0,7))+'</span>' : '<span class="nrec" title="直近約1年に取引がありません（過去の得意先）">取引なし</span>');
+    const code = c.code ? '<span class="ccode" title="得意先コード">'+esc(c.code)+'</span>' : '';
     const iss = ISSUED[c.name];
     const issBadge = iss ? '<span class="issued" title="最終提出 '+esc(iss.lastIssuedAt||'')+(iss.count>1?' / 提出'+iss.count+'回':'')+'">✅ 提出済 '+issuedShort(iss.lastIssuedAt)+(iss.count>1?'×'+iss.count:'')+'</span>' : '';
     html+='<div class="cust'+sel+(iss?' done':'')+'" data-name="'+esc(c.name)+'" onclick="selectCust(this.getAttribute(\\'data-name\\'))">'
       +'<div style="min-width:0"><div class="nm">'+esc(c.name)+'</div>'
-      +'<div class="meta">仕入先 '+c.supplierCount+' 社'+rev+low+hold+issBadge+'</div></div>'
+      +'<div class="meta">'+code+'仕入先 '+c.supplierCount+' 社'+rev+low+hold+nrec+issBadge+'</div></div>'
       +'<span class="cnt">'+c.productCount+'</span>'
       +'</div>';
   }
   $('#listCol').innerHTML=html;
 }
+// 「全期間を表示」リンク：表示期間を全期間にして再描画
+function showAllCusts(){ const sel=$('#recentYears'); if(sel) sel.value='0'; applyFilter(); }
 function selectCust(name){
   selName=name;
   // 転嫁ルールバーは社名の下（該当商品〜提出済の間）へ移す。innerHTML再描画で消えないよう、
@@ -538,7 +599,9 @@ function selectCust(name){
   const c=DATA.find(x=>x.name===name);
   if(!c){ $('#detailCol').innerHTML='<div class="empty">データがありません。</div>'; return; }
   const supChips=c.suppliers.map(s=>'<span class="sup-badge">'+esc(s)+'</span>').join(' ');
-  let html='<div class="detail-head"><h2>'+esc(c.name)+'</h2>'
+  const codeTag = c.code ? '<span class="ccode" style="margin-left:8px;vertical-align:middle">'+esc(c.code)+'</span>' : '';
+  const nrecTag = c.hasRecent ? '' : (c.lastDate ? '<span class="nrec" style="margin-left:6px" title="最終売上日">最終売上 '+esc(c.lastDate)+'</span>' : '<span class="nrec" style="margin-left:6px">取引なし</span>');
+  let html='<div class="detail-head"><h2>'+esc(c.name)+codeTag+nrecTag+'</h2>'
     +'<div class="sum">該当商品 <b>'+c.productCount+'</b> 品／仕入先 <b>'+c.supplierCount+'</b> 社　'+supChips+'</div></div>'
     +'<div id="calcbarSlot"></div>';  // ← ここに転嫁ルールバーを差し込む（社名の下・提出済の上）
   // 提出（発行）状況
@@ -836,6 +899,7 @@ $('#cLowMargin').addEventListener('input',()=>{
 });
 $('#reloadPolicyBtn').addEventListener('click', async ()=>{ await initControls(); load(); }); // メインの全体方針を取り込み直す
 $('#search').addEventListener('input',applyFilter);
+$('#recentYears').addEventListener('change',applyFilter);
 $('#resetIssuedBtn').addEventListener('click',resetAllIssued);
 $('#exportAllBtn').addEventListener('click',()=>exportFlow('all'));
 $('#exportOneBtn').addEventListener('click',()=>exportFlow('one'));

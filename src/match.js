@@ -388,7 +388,15 @@ function matchOne(item, hanbai, opts = {}) {
     const score = isLink ? 2000 : (cd ? 1000 : ns);
     if (!cur || score > cur.score) best.set(key, { rec: r, score, cd, ns, link: isLink, pm: pmTag });
   }
-  return [...best.values()];
+  const arr = [...best.values()];
+  // 取り違え抑制：このメーカー品が CD一致／手動紐付け で特定の自社品に当たっているなら、
+  //  「それ以外の自社品」への“名前だけ一致”は別サイズ/別品の取り違えとして落とす。
+  //  ※同じ自社品の別得意先行（その得意先の伝票に品番が埋まっておらず名前一致になった等）は残す。
+  //  例: メーカー品番3770661 は 005616(NM3=3770661)にCD一致。名前が似た 001374(実は3770660)への
+  //      名前一致100% は誤りなので除外＝見積に001374が大黒価格で混入するのを防ぐ。
+  const cdSelf = new Set(arr.filter((h) => h.cd || h.link).map((h) => h.rec.productCode));
+  if (cdSelf.size) return arr.filter((h) => h.cd || h.link || cdSelf.has(h.rec.productCode));
+  return arr;
 }
 
 // 全メーカー品を照合し、照合結果レコード配列を返す
@@ -411,10 +419,10 @@ function matchAll(items, hanbai, opts = {}) {
         status: '✗ 未一致（休眠）',
         supplier: item.supplier, switchDate: item.switchDate,
         makerCode: item.makerCode, makerName: item.makerName,
-        productCode: '', productName: '【販売実績なし or 商品名不一致】',
+        productCode: '', productName: '【販売実績なし or 商品名不一致】', masterName: '',
         customerCode: '', customerName: '',
         currentSell: '', currentCost: cCost, newCost: nCost,
-        costInc, costRate, annualAmount: '',
+        costInc, costRate, annualAmount: '', lastDate: '',
       });
       continue;
     }
@@ -427,10 +435,10 @@ function matchAll(items, hanbai, opts = {}) {
             : (h.cd ? ('✓ CD一致' + pmTag) : ('✓ 名前一致(' + h.ns + '%)' + pmTag))),
         supplier: item.supplier, switchDate: item.switchDate,
         makerCode: item.makerCode, makerName: item.makerName,
-        productCode: r.productCode, productName: r.productName,
+        productCode: r.productCode, productName: r.productName, masterName: r.masterName || '',
         customerCode: r.customerCode, customerName: r.customerName,
         currentSell: r.currentSell, currentCost: cCost, newCost: nCost,
-        costInc, costRate, annualAmount: r.annualAmount,
+        costInc, costRate, annualAmount: r.annualAmount, lastDate: r.lastDate || '',
       });
     }
   }
@@ -440,8 +448,8 @@ function matchAll(items, hanbai, opts = {}) {
 // 照合結果レコード → 既存パイプラインが読むCSV文字列（列は朝日形式準拠＋得意先コード）
 const RESULT_HEADER = [
   '照合', '仕入先（メーカー）', '切替日', 'メーカー商品CD', 'メーカー商品名',
-  '販売実績商品コード', '販売実績商品名', '得意先コード', '得意先名',
-  '現販売単価', '現行仕入単価', '新仕入単価', '仕入値上額', '仕入値上率(%)', '年間金額',
+  '販売実績商品コード', '販売実績商品名', '商品名(マスタ)', '得意先コード', '得意先名',
+  '現販売単価', '現行仕入単価', '新仕入単価', '仕入値上額', '仕入値上率(%)', '年間金額', '最終売上日',
 ];
 function csvCell(v) {
   const s = (v === null || v === undefined) ? '' : String(v);
@@ -452,10 +460,10 @@ function toCsv(rows) {
   for (const r of rows) {
     lines.push([
       r.status, r.supplier, r.switchDate, r.makerCode, r.makerName,
-      r.productCode, r.productName, r.customerCode, r.customerName,
+      r.productCode, r.productName, r.masterName || '', r.customerCode, r.customerName,
       r.currentSell, r.currentCost, r.newCost,
       Number.isFinite(r.costInc) ? r.costInc : '', Number.isFinite(r.costRate) ? r.costRate : '',
-      r.annualAmount,
+      r.annualAmount, r.lastDate || '',
     ].map(csvCell).join(','));
   }
   return '﻿' + lines.join('\r\n');

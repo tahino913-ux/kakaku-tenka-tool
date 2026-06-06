@@ -81,15 +81,12 @@ SELECT
   CONVERT(char(10), l.DENDATE, 23) AS lastdate,
   RTRIM(ISNULL(si.CODE,'')) AS scd,
   RTRIM(ISNULL(tk.NM1,'')) AS cname,
+  RTRIM(ISNULL(sh.NM1,'')) AS sname,   -- 商品マスタのクリーンな商品名（表示用＝伝票テキストの運賃/入数ゴミを含まない）
   l.pname AS pname,
-  -- 商品マスタ(SHOHIN)の 商品名2〜5＋摘要。CD一致用の文字列(codeNorm)にだけ足す＝
-  --  「メーカー品番を自社マスタに入れておけば CD一致で確実に拾える」を可能にする（名前一致には使わない）。
-  --  ※ 売上明細(URIMEI)の NAME は過去伝票で凍結されるため、マスタ編集を即 照合へ反映するにはマスタを直接読む必要がある。
-  LTRIM(RTRIM(ISNULL(sh.NM2,'')))
-    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.NM3,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.NM3)) END
-    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.NM4,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.NM4)) END
-    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.NM5,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.NM5)) END
-    + CASE WHEN LTRIM(RTRIM(ISNULL(sh.TEK,''))) = '' THEN '' ELSE ' ' + LTRIM(RTRIM(sh.TEK)) END AS mname
+  -- 商品マスタのフィールド規約：商品名1(NM1)=商品名（表示/名前照合）・商品名3(NM3)=メーカーコード（CD一致専用）。
+  --  商品名2/4/5・摘要は「使わない」（運賃/入数/発注先などのゴミが入るため、CD一致に混ぜると誤マッチの元）。
+  --  ＝メーカー品番をマスタの商品名3に入れておけば CD一致で確実に拾える（名前一致には使わない）。
+  RTRIM(ISNULL(sh.NM3,'')) AS mname
 FROM latest l
 JOIN agg a ON a.TOKSHI = l.TOKSHI AND a.SHO = l.SHO
 LEFT JOIN dbo.TOKUI  tk ON tk.ICODE = l.TOKSHI
@@ -97,7 +94,8 @@ LEFT JOIN dbo.SHOHIN sh ON sh.ICODE = l.SHO
 LEFT JOIN dbo.SHIIRE si ON si.ICODE = l.shiicode
 WHERE l.rn = 1
   AND RTRIM(ISNULL(tk.CODE,'')) <> '' AND RTRIM(ISNULL(tk.CODE,'')) <> '0000'  -- 諸口(0000)・得意先未設定は除外
-  AND RTRIM(ISNULL(sh.CODE,'')) <> ''                                          -- 自社CDが無い行は除外`;
+  AND RTRIM(ISNULL(sh.CODE,'')) <> ''                                          -- 自社CDが無い行は除外
+  AND REPLACE(RTRIM(ISNULL(sh.CODE,'')),'0','') <> ''                          -- 000000等の全ゼロ(プレースホルダ/未設定品)は除外`;
 }
 
 // PowerShell(.NET SqlClient) で SQL を実行し、結果CSV(UTF-8)のパスを返す。SELECT のみ。
@@ -169,22 +167,27 @@ function csvToRecords(csvPath) {
     const pname = String(r[ix.pname] == null ? '' : r[ix.pname]).trim();
     if (!pcd && !pname) continue;
     const scd = String(r[ix.scd] == null ? '' : r[ix.scd]).trim();
-    // 商品マスタの 商品名2〜5＋摘要（メーカー品番を入れておく欄）。CD一致用文字列にだけ足す。
+    // 商品マスタ規約：mname＝商品名3(NM3)＝メーカーコード（CD一致専用）。商品名2/4/5・摘要は使わない。
     const mname = ix.mname != null ? String(r[ix.mname] == null ? '' : r[ix.mname]).trim() : '';
+    // 商品名1(NM1)＝商品マスタのクリーンな商品名。表示・名前一致のベース（伝票テキストの運賃/入数ゴミを含まない）。
+    const masterName = String(r[ix.sname] == null ? '' : r[ix.sname]).trim();
+    const dispName = masterName || pname; // マスタ名が空なら従来どおり伝票名でフォールバック
     out.push({
       customerCode: tcd,
       customerName: String(r[ix.cname] == null ? '' : r[ix.cname]).trim(),
       productCode: pcd,
-      productName: pname,                       // 自社CDを除いた本文（NAME+NAME2..5 連結＝埋込品番込み）
+      productName: pname,                       // 伝票テキスト（NAME+NAME2..5 連結）＝CD一致の埋込品番探索に使う
+      masterName,                               // 商品マスタのクリーン名（表示用）
       currentSell: toNum(r[ix.sell]),
       annualAmount: toNum(r[ix.amt]),
       origCost: toNum(r[ix.cost]),
       lastDate: String(r[ix.lastdate] == null ? '' : r[ix.lastdate]).trim(),
-      norm: normName(pname),
-      // CD一致は 売上明細の名前(pname) に加え 商品マスタの名称2-5/摘要(mname) も探索範囲に含める
-      //  ＝マスタにメーカー品番を登録しておけば、売上明細に品番が無くても CD一致で確実に拾える。
+      norm: normName(dispName),
+      // CD一致＝メーカーコードの探索範囲：① 売上明細の伝票テキスト(pname・過去の埋込品番) ＋ ② マスタの商品名3(mname=メーカーコード)。
+      //  ＝マスタの商品名3にメーカー品番を登録しておけば、売上明細に品番が無くても CD一致で確実に拾える。
       codeNorm: normForCode((pname + ' ' + mname).trim()),
-      coreNorm: normName(coreName(pname)), // 名前一致は従来どおり pname のみ（mname は名前一致に使わない）
+      // 名前一致は 商品マスタの商品名1(クリーン) を使う＝伝票テキストのゴミに左右されない（マスタ名が無ければ伝票名）。
+      coreNorm: normName(coreName(dispName)),
       // 仕入先コード：DB結合の実値(4桁)を優先。空なら従来の末尾数字推定にフォールバック。
       purchaseCode: scd ? scd.padStart(4, '0') : require('./hanbai').trailingPurchaseCode(pname),
     });
@@ -275,4 +278,34 @@ function loadSelfProductsFromDb(dbCfg, opts) {
   } finally { try { fs.unlinkSync(csv); } catch (_) {} }
 }
 
-module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax, loadSelfProductsFromDb };
+// 得意先マスタ(TOKUI)から コード・名称・検索カナ を読み取り専用で引く（得意先ページの表示/検索用）。
+//  CODE=得意先コード(4桁)・NM1=名称・KCODE=販売大臣の検索カナ(半角カナ 例: 中島商店→ﾅｶｼﾞﾏ)。
+//  諸口(0000)・コード空は除外。戻り値: [{ code, name, kana }]。⚠ SELECT のみ。
+function loadCustomerMaster(dbCfg) {
+  dbCfg = dbCfg || {};
+  const sql =
+    "SELECT RTRIM(CODE) AS code, RTRIM(ISNULL(NM1,'')) AS name, RTRIM(ISNULL(KCODE,'')) AS kana " +
+    "FROM dbo.TOKUI " +
+    "WHERE RTRIM(ISNULL(CODE,'')) <> '' AND RTRIM(ISNULL(CODE,'')) <> '0000'";
+  const csv = runQueryToCsv(dbCfg, sql);
+  try {
+    const { parseCsvText } = require('./csv');
+    const rows = parseCsvText(fs.readFileSync(csv, 'utf8').replace(/^﻿/, ''));
+    if (!rows.length) return [];
+    const head = rows[0]; const ix = {}; head.forEach((h, i) => { ix[String(h).trim().toLowerCase()] = i; });
+    const out = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i]; if (!r || !r.length) continue;
+      const code = String(r[ix.code] == null ? '' : r[ix.code]).trim();
+      if (!code) continue;
+      out.push({
+        code,
+        name: String(r[ix.name] == null ? '' : r[ix.name]).trim(),
+        kana: String(r[ix.kana] == null ? '' : r[ix.kana]).trim(),
+      });
+    }
+    return out;
+  } finally { try { fs.unlinkSync(csv); } catch (_) {} }
+}
+
+module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax, loadSelfProductsFromDb, loadCustomerMaster };

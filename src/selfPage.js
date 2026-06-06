@@ -58,8 +58,19 @@ const SELF_PAGE = `<!doctype html>
   <div id="srcInfo" class="muted">読込中…</div>
 </div>
 
+<div class="card" style="border-left:4px solid #1f6fb2">
+  <h3 style="margin:0 0 6px">🏷 商品マスタの入力ルール（照合の精度を上げる）</h3>
+  <div class="hint" style="line-height:1.9">
+    DB直結では商品マスタ（SHOHIN）の項目を次のルールで読みます：<br>
+    ・<b style="color:#2e7d32">商品名1</b> ＝ <b>商品名</b>（見積・画面の表示名／名前照合に使用＝クリーンな名前）<br>
+    ・<b style="color:#1976d2">商品名3</b> ＝ <b>メーカー品番</b>（CD一致に使用＝ここに入れると高精度で確実に照合）<br>
+    ・商品名2／4／5 ＝ <span style="color:#aa6">使いません</span>（運賃・入数などのメモ欄。照合には使わない）<br>
+    👉 <b>メーカー品番は「商品名3」に登録</b>してください。シミュレーション画面の「🏷 CD一致化候補」CSVが、登録すべき品の一覧です（登録→「↻ 照合を実行」でCD一致に昇格）。
+  </div>
+</div>
+
 <div class="card">
-  <h3 style="margin:0 0 6px">🔍 別ファイルをプレビュー（取込ルールの確認用）</h3>
+  <h3 style="margin:0 0 6px">🔍 別ファイルをプレビュー（取込ルールの確認用）<span class="hint" style="font-weight:normal">※DB直結時は予備（ファイル方式/DBなしPC用）</span></h3>
   <div class="hint" style="margin-bottom:8px">
     上の本番ファイルとは別に、任意のファイルを開いて列構成・パース結果を確認できます。<br>
     ここで保存した「列の役割」は <code>settings.json:selfProfile</code> に書き込まれ、次回以降の取込で使われます。
@@ -292,12 +303,9 @@ async function loadHanbaiSource(){
         + '<b>✅ 現在は販売大臣DBから直接取得しています'+(r.source==='auto'?'（自動：DBが無いPCのみ下のファイルを使用）':'（DB直結）')+'。</b><br>'
         + '年間金額・損益の集計期間：<b>'+rng+'</b>（実行のたびに「今日を基準に直近約1年」を自動で取り直します）。手動エクスポートは不要です。'
         + '<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #b7e0c0">'
-        +   '⏳ <b>照合に含める期間（さかのぼり）</b>：'
-        +   '<input id="candMonths" type="number" min="12" max="60" step="1" value="'+cm+'" style="width:64px;padding:3px 6px;border:1px solid #b7e0c0;border-radius:4px;font:inherit;text-align:right"> か月　'
-        +   '<button id="candSave" style="padding:4px 12px;background:#1f6b35;color:#fff;border:none;border-radius:4px;cursor:pointer">保存</button>'
-        +   ' <span id="candMsg" style="font-size:12px"></span><br>'
-        +   '<span style="color:#4a7a55;font-size:12px">この期間に売上がある商品を照合の<b>候補</b>に含めます（既定12か月）。長くすると、1年以上ご無沙汰の商品も見積で拾えます。'
-        +   '<b>年間金額・損益は上記のとおり直近約1年で計算</b>するので、延ばしても損益は歪みません。変更は次回の「↻ 照合を実行」から有効。</span></div>'
+        +   '⏳ <b>照合に含める期間</b>：<b>全期間（システム内の過去履歴すべて）</b>で照合しています。季節品・たまにしか出ない品も取りこぼしません。<br>'
+        +   '<span style="color:#4a7a55;font-size:12px">どこまで遡って表示・見積するかは <b>得意先別ページの「表示期間」</b>（過去1年／2年／3年／全期間）で切り替えます。'
+        +   '年間金額・損益は直近約1年で計算するので、全期間で照合しても損益は歪みません。</span></div>'
         + (r.selfManufacture && r.selfManufacture.enabled
           ? ('<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #b7e0c0">'
             + '🏭 <b>自社製造品（折箱）をDBから取り込む</b>　'
