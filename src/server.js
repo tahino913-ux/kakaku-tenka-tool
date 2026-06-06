@@ -1562,12 +1562,13 @@ function exportCustomerQuotes(opts, doIssue) {
 function collectHanbaiExportLines(cutoffIso, issuedOnly) {
   const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(String(cutoffIso || '')) ? cutoffIso : null;
   const { byCustomer } = buildCustomerCandidates({});
-  const issued = issuedOnly ? readIssueLog() : null; // 発行済みのみモードの時だけ参照
   const byPair = new Map(); // 得意先コード|商品コード -> line（実施日が新しい方を採用）
   for (const [name, { keep }] of byCustomer) {
-    if (issuedOnly && !issued[name]) continue; // 「発行済みのみ」モードでは発行済み得意先だけ
     for (const it of keep) {
-      if (it.status === 'hold') continue;                      // 検討中（除外）は基幹更新にも載せない（提出済みは載せる）
+      // issuedOnly（既定・推奨）＝「発行した見積のみ」＝アイテム単位で提出済み(issued)の品だけ。
+      //  発行時に確定した単価(newSell/newCost)が保存済み＝CSVが見積書と完全一致。未発行は載せない。
+      if (issuedOnly) { if (it.status !== 'issued') continue; }
+      else if (it.status === 'hold') continue;                 // 「改定すべて」＝検討中(除外)以外（未発行は既定再計算）
       const eff = String(it.effectiveDate || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;         // 実施日がISOで取れない行は対象外
       if (cutoff && eff > cutoff) continue;                    // まだ実施日が来ていない行は除外
@@ -2532,8 +2533,8 @@ const PAGE = `<!doctype html>
       <div class="celine">
         <button id="calHanbaiBtn" class="calexpbtn" style="background:#2e6b3e">📥 単価履歴CSV（売価）</button>
         <select id="calHanbaiScope" title="単価履歴CSVの対象範囲">
-          <option value="all">改定すべて</option>
-          <option value="issued">発行済みの得意先だけ</option>
+          <option value="issued" selected>発行した見積のみ（発行時の単価）</option>
+          <option value="all">改定すべて（未発行も既定計算）</option>
         </select>
         <span class="ceop">👉 取込先： <b>販売大臣 63→13 データ受入 → 売上履歴 → データ取込</b></span>
       </div>

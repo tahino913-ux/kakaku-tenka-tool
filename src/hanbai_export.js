@@ -33,11 +33,18 @@ function cell(v) {
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
-// 整数化（金額の小数誤差をならす）。空/不正は空文字。
+// 整数化（金額の小数誤差をならす）。空/不正は空文字。※数量等の整数列用。
 function intStr(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return '';
   return String(Math.round(n));
+}
+// 銭（小数2桁）保持。単価/原単価は容器の銭単位なので整数に丸めず見積どおりに出す（78.69→78.69, 79→79, 17.11→17.11）。
+//  String(round(n*100)/100) は末尾0・余分な小数点が付かない（仕入原価CSVと整合）。
+function senStr(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '';
+  return String(Math.round(n * 100) / 100);
 }
 
 // 1明細 → 11列の配列。tax = {zeiKbn, zeiRitu}（無ければ既定）。
@@ -51,8 +58,8 @@ function toRow(line, tax) {
     ID_FIXED,
     d.year, d.month, d.day,
     BARACASE_FIXED,
-    intStr(line.newSell),                 // 単価 = 新販売単価
-    (line.newCost != null && Number.isFinite(Number(line.newCost))) ? intStr(line.newCost) : '0', // 原単価 = 新仕入単価
+    senStr(line.newSell),                 // 単価 = 新販売単価（銭・小数保持＝見積どおり）
+    (line.newCost != null && Number.isFinite(Number(line.newCost))) ? senStr(line.newCost) : '0', // 原単価 = 新仕入単価（銭・小数保持）
     (t.zeiKbn != null && String(t.zeiKbn) !== '') ? String(t.zeiKbn) : DEFAULT_ZEI_KBN,
     (t.zeiRitu != null && String(t.zeiRitu) !== '') ? String(t.zeiRitu) : DEFAULT_ZEI_RITU,
   ];
