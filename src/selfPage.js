@@ -298,14 +298,23 @@ async function loadHanbaiSource(){
     let banner = '';
     if (usesDb) {
       const rng = r.dbRange ? (esc(r.dbRange.start)+' 〜 '+esc(r.dbRange.end)) : '過去約1年';
-      const cm = Number(r.candidateMonths) || 12;
+      const cm = (function(){ const v=Number(r.candidateMonths); return (Number.isFinite(v)&&v>=12)?v:0; })(); // 0=全期間
       banner = '<div style="margin-bottom:10px;padding:10px 12px;background:#e9f6ec;border:1px solid #b7e0c0;border-radius:8px;color:#1f6b35;font-size:13px;line-height:1.8">'
         + '<b>✅ 現在は販売大臣DBから直接取得しています'+(r.source==='auto'?'（自動：DBが無いPCのみ下のファイルを使用）':'（DB直結）')+'。</b><br>'
         + '年間金額・損益の集計期間：<b>'+rng+'</b>（実行のたびに「今日を基準に直近約1年」を自動で取り直します）。手動エクスポートは不要です。'
         + '<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #b7e0c0">'
-        +   '⏳ <b>照合に含める期間</b>：<b>全期間（システム内の過去履歴すべて）</b>で照合しています。季節品・たまにしか出ない品も取りこぼしません。<br>'
-        +   '<span style="color:#4a7a55;font-size:12px">どこまで遡って表示・見積するかは <b>得意先別ページの「表示期間」</b>（過去1年／2年／3年／全期間）で切り替えます。'
-        +   '年間金額・損益は直近約1年で計算するので、全期間で照合しても損益は歪みません。</span></div>'
+        +   '⏳ <b>照合に含める期間（さかのぼり）</b>：'
+        +   '<select id="candMonths" style="padding:3px 6px;border:1px solid #b7e0c0;border-radius:4px;font:inherit">'
+        +     '<option value="0"'+(cm<12?' selected':'')+'>全期間（過去すべて）</option>'
+        +     '<option value="60"'+(cm===60?' selected':'')+'>過去5年（60か月）</option>'
+        +     '<option value="36"'+(cm===36?' selected':'')+'>過去3年（36か月）</option>'
+        +     '<option value="24"'+(cm===24?' selected':'')+'>過去2年（24か月）</option>'
+        +     '<option value="12"'+(cm===12?' selected':'')+'>過去1年（12か月）</option>'
+        +   '</select> '
+        +   '<button id="candSave" style="padding:4px 12px;background:#1f6b35;color:#fff;border:none;border-radius:4px;cursor:pointer">保存</button>'
+        +   ' <span id="candMsg" style="font-size:12px"></span><br>'
+        +   '<span style="color:#4a7a55;font-size:12px">この期間に売上がある商品を照合の<b>候補</b>に含めます。短くすると休眠/過去客が減り、長く（全期間）すると季節品も拾えます。'
+        +   '自社製造（折箱・9000）は常に全期間。年間金額・損益は直近約1年で計算するので期間を変えても歪みません。変更は次回の「↻ 照合を実行」から有効。</span></div>'
         + (r.selfManufacture && r.selfManufacture.enabled
           ? ('<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #b7e0c0">'
             + '🏭 <b>自社製造品（折箱）をDBから取り込む</b>　'
@@ -340,7 +349,7 @@ async function loadHanbaiSource(){
         msg.style.color='#6b7785'; msg.textContent='保存中…';
         try{
           const res = await fetch('/api/hanbai-period',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({months:m})}).then(x=>x.json());
-          if(res.ok){ msg.style.color='#1f6b35'; msg.textContent='✓ 保存（'+res.candidateMonths+'か月）。次回の「↻ 照合を実行」から有効'; $('#candMonths').value=res.candidateMonths; }
+          if(res.ok){ msg.style.color='#1f6b35'; msg.textContent='✓ 保存（'+(res.candidateMonths>0?res.candidateMonths+'か月':'全期間')+'）。次回の「↻ 照合を実行」から有効'; $('#candMonths').value=String(res.candidateMonths); }
           else { msg.style.color='#c0392b'; msg.textContent='失敗: '+(res.error||''); }
         }catch(e){ msg.style.color='#c0392b'; msg.textContent='失敗: '+e; }
       });

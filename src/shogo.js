@@ -185,10 +185,12 @@ function run(argv) {
 
   // 販売実績の取得（DB直結 or ファイル）。取得ロジックは loadHanbaiRecords に集約（'auto'=会社PCは
   //  DB直結／自宅PCはファイル を1設定で両立）。引数で販売実績ファイルを明示した時は常にファイル優先。
-  // 照合の候補プールは「全期間（システム内の過去履歴すべて）」で拾う＝季節品・たまにしか出ない品も取りこぼさない。
-  //  年間金額(損益)の窓は db_hanbai 側で直近約1年のまま据え置く（候補だけ全期間＝損益は歪まない）。
-  //  どこまで遡って表示・見積するかは得意先ページの「過去N年」フィルタで制御する（候補は広く・表示は可変）。
-  const hanbai = loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: true, log: console.log });
+  // 照合の候補プール期間＝settings.hanbai.candidateMonths（/self で設定）。0/未設定=全期間／12〜60=その月数の窓。
+  //  年間金額(損益)の窓は db_hanbai 側で直近約1年のまま据え置く（候補期間を変えても損益は歪まない）。
+  //  どこまで遡って表示・見積するかは得意先ページの「過去N年」フィルタで別途制御できる。
+  const cm = Number((s.hanbai && s.hanbai.candidateMonths));
+  const fullHist = !(Number.isFinite(cm) && cm >= 12); // 12未満/0/未設定 → 全期間
+  const hanbai = loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: fullHist, log: console.log });
 
   // .xlsx のメーカー見積を maker_quotes/ のCSVへ展開（ドロップ→照合.bat だけで使える）
   const expandXlsx = (file) => {
@@ -232,16 +234,23 @@ function run(argv) {
     if (String(pc).trim() !== '9000') continue;
     for (const it of items) { const c = padSelfCode(it.makerCode); if (c) selfMadeCodes.add(c); }
   }
+  // 自社製造(9000)は季節品が多く窓では取りこぼすため常に全期間プール。窓モードのときだけ別途ロード（全期間時は hanbai を流用）。
+  let selfHanbai = null;
+  const getSelfHanbai = () => {
+    if (!selfHanbai) selfHanbai = fullHist ? hanbai : loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: true, log: console.log });
+    return selfHanbai;
+  };
   for (const [supplier, items] of merged) {
     if (!items.length) continue;
     // 仕入先コードフィルタ: 各メーカー見積に紐づく 4桁仕入先コードを settings.makers から拾う。
     // 設定済なら自社末尾コードと一致する自社品だけが候補に。未設定なら従来通り全件候補。
     const purchaseCode = (makersProfile[supplier] && makersProfile[supplier].purchaseCode) || '';
-    // 候補プールは全仕入先とも全期間（hanbai）。自社製造(9000)は自社コード完全一致(matchSelf)で拾う。
+    // 自社製造(9000)は全期間プールで自社コード完全一致。他メーカーは設定期間のプール(hanbai)。
     const isSelf = String(purchaseCode).trim() === '9000';
+    const pool = isSelf ? getSelfHanbai() : hanbai;
     // 非9000の照合だけ、自社製造分類の自社CDを候補から除外（9000自身の照合には渡さない＝自社製造品はそのまま拾う）。
     const excludeSelfCodes = isSelf ? null : selfMadeCodes;
-    const rows = matchAll(items, hanbai, { nameFloor, productLinks, purchaseCode, priceVetoBelow, excludeSelfCodes });
+    const rows = matchAll(items, pool, { nameFloor, productLinks, purchaseCode, priceVetoBelow, excludeSelfCodes });
     const matched = rows.filter((r) => /^✓/.test(r.status)).length;
     const dormant = rows.length - matched;
     const out = uniqueOutPath(INPUT_DIR, supplier, usedOut);

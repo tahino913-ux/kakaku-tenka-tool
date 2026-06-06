@@ -1921,8 +1921,8 @@ const server = http.createServer(async (req, res) => {
           dbRange = { start: dbCfg.start || r.start, end: dbCfg.end || r.end };
         } catch (e) { /* ignore */ }
       }
-      // 照合に含めるさかのぼり期間（既定12か月）。年間金額(損益)は常に直近約1年なので歪まない。
-      const candidateMonths = Math.max(12, Math.min(60, Math.round(Number((s.hanbai && s.hanbai.candidateMonths)) || 12)));
+      // 照合に含めるさかのぼり期間。0=全期間／12〜60=その月数。未設定は0(全期間)扱い。年間金額(損益)は常に直近約1年なので歪まない。
+      const candidateMonths = (() => { const v = Math.round(Number((s.hanbai && s.hanbai.candidateMonths))); if (!Number.isFinite(v) || v <= 0) return 0; return Math.max(12, Math.min(60, v)); })();
       // 自社製造品のDB抽出（日野折箱店の折箱）の有効/設定。/self の取り込みボタン表示判定に使う。
       const sm = s.selfManufacture || {};
       const selfManufacture = { enabled: !!sm.enabled, supplier: sm.supplier || '', bun1: sm.bun1 || [], bun2: sm.bun2 };
@@ -1933,11 +1933,11 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (req.method === 'POST' && url === '/api/hanbai-period') {
-      // 照合に含める「さかのぼり期間（月数）」を保存。12〜60に丸める。年間金額(損益)は直近約1年のまま。
+      // 照合に含める「さかのぼり期間（月数）」を保存。0=全期間／それ以外は12〜60に丸める。年間金額(損益)は直近約1年のまま。
       const body = await readBody(req);
       let months = Math.round(Number(body && body.months));
       if (!Number.isFinite(months)) return sendJson(res, 200, { ok: false, error: '月数が不正です' });
-      months = Math.max(12, Math.min(60, months));
+      months = months <= 0 ? 0 : Math.max(12, Math.min(60, months)); // 0=全期間
       saveSettings({ hanbai: { candidateMonths: months } }); // hanbai は浅いマージ＝source/db は保持
       _hanbaiCache = null; // 自社品検索のキャッシュも破棄（次回 最新期間で読む）
       return sendJson(res, 200, { ok: true, candidateMonths: months });
