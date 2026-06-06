@@ -615,6 +615,16 @@ function multiMatchCheck() {
   out.sort((a, b) => String(a.code).localeCompare(String(b.code)));
   return out;
 }
+// 「単価不確定（複数メーカー品に一致）」の品を確認用CSV（UTF-8 BOM）に。1商品×候補ごとに1行。
+//  ＝どの商品にどのメーカー品番候補が当たっているかを見て、正しい品番を商品名3に登録するための一覧。
+function buildMultiMatchCsv() {
+  const items = multiMatchCheck();
+  const cell = (v) => { const s = (v == null ? '' : String(v)); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const head = ['商品コード', '現商品名', 'メーカー品番（候補）', 'メーカー商品名', '新仕入単価', '仕入先'];
+  const lines = [head.join(',')];
+  for (const it of items) for (const v of it.variants) lines.push([it.code, it.name, v.makerCode, v.makerName, v.cost, v.supplier].map(cell).join(','));
+  return '﻿' + lines.join('\r\n');
+}
 
 // 紐付けモーダル用：指定仕入先の「メーカー商品名の候補」と既存の手動紐付けを返す。
 //  実施日フィルタ（横断）ビューでは行ごとに仕入先が違うので、行の仕入先でこれを引いて候補を出す。
@@ -2168,6 +2178,20 @@ const server = http.createServer(async (req, res) => {
       try { const r = buildCdCandidates(); return sendJson(res, 200, { ok: true, count: r.count, dormantWithCode: r.dormantWithCode, items: r.items.slice(0, 300) }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), count: 0 }); }
     }
+    if (req.method === 'GET' && url === '/api/multimatch.csv') {
+      try {
+        const buf = Buffer.from(buildMultiMatchCsv(), 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="multimatch.csv"; filename*=UTF-8\'\'' + encodeURIComponent('単価不確定の品.csv'),
+          'Content-Length': buf.length,
+        });
+        return res.end(buf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('export error: ' + String(e && e.message || e));
+      }
+    }
     if (req.method === 'GET' && url === '/api/cd-candidates.csv') {
       try {
         const buf = Buffer.from(buildCdCandidatesCsv(), 'utf8');
@@ -2541,6 +2565,10 @@ const PAGE = `<!doctype html>
       <div class="celine">
         <button id="calCostBtn" class="calexpbtn" style="background:#b5742a">🏭 仕入原価CSV</button>
         <span class="ceop">👉 取込先： <b>販売大臣 63→13 データ受入 → 商品 → データ取込</b></span>
+      </div>
+      <div class="celine">
+        <a id="calMultiLink" href="/api/multimatch.csv" download class="ceop" style="color:#b1432f;text-decoration:underline;cursor:pointer">⚠ 単価が不確定な品（1商品が複数メーカー品に一致）の一覧をダウンロード</a>
+        <span class="ceop">＝CSVの「単価不確定 N件」の中身。正しいメーカー品番を商品マスタ「商品名3」に登録→↻照合 で解消します。</span>
       </div>
       <div id="calExpMsg" style="font-size:11.5px;margin-top:7px"></div>
       <div class="cehint">単価履歴CSV＝得意先×商品の新「販売単価」（11列・税付き・DBから税自動付与）。仕入原価CSV＝商品ごとの新「仕入原価」（商品コード,新原価の2列）。どちらもShift_JIS。範囲セレクトは単価履歴CSVのみ有効。</div>
@@ -3612,7 +3640,7 @@ $('#calChips').addEventListener('click', (e)=>{
       let warn='';
       if(r.dbError) warn='\\n※ 販売大臣DBに接続できず、消費税区分／税率表№は標準値(2／1)で出力します。';
       else if(r.missingTax) warn='\\n※ '+r.missingTax+' 件はDBに商品が無く、消費税は標準値(2／1)で出力します。';
-      if(r.ambiguous) warn+='\\n⚠ '+r.ambiguous+'件は1つの自社商品が複数のメーカー品に一致＝単価が不確定です（正しいメーカー品番を商品マスタ「商品名3」に登録→↻照合 で確定。発行済みは発行時の単価を使います）。';
+      if(r.ambiguous) warn+='\\n⚠ '+r.ambiguous+'件は1つの自社商品が複数のメーカー品に一致＝単価が不確定です（どの品かは下の「単価が不確定な品の一覧をダウンロード」で確認。商品名3に正しい品番を登録→↻照合 で確定。発行済みは発行時の単価を使います）。';
       if(!confirm(cutoff+' までに実施日が到来した改定 '+r.count+' 行 / '+r.customerCount+' 得意先 を、販売大臣の「単価履歴」取込CSVとして出力します。'+warn+'\\n\\nダウンロードしますか？')){ box.textContent=''; return; }
       box.style.color='#2e7d32'; box.textContent='✓ 単価履歴CSVをダウンロードしました（'+r.count+' 行 / '+r.customerCount+' 得意先）。';
       window.location='/api/hanbai-export?cutoff='+encodeURIComponent(cutoff)+(issuedOnly?'&issuedOnly=1':'');
@@ -3626,7 +3654,7 @@ $('#calChips').addEventListener('click', (e)=>{
       if(!r.ok){ box.style.color='#c0392b'; box.textContent='エラー: '+(r.error||''); return; }
       if(!r.count){ box.style.color='#b8860b'; box.textContent='対象なし（'+cutoff+' までに実施日が来た改定はありません）'; return; }
       let cwarn='';
-      if(r.ambiguous) cwarn='\\n⚠ '+r.ambiguous+'件は1つの自社商品が複数のメーカー品に一致＝新原価が不確定です（正しいメーカー品番を商品マスタ「商品名3」に登録→↻照合 で確定。発行済みは発行時の原価を使います）。';
+      if(r.ambiguous) cwarn='\\n⚠ '+r.ambiguous+'件は1つの自社商品が複数のメーカー品に一致＝新原価が不確定です（どの品かは下の「単価が不確定な品の一覧をダウンロード」で確認。商品名3に正しい品番を登録→↻照合 で確定。発行済みは発行時の原価を使います）。';
       if(!confirm(cutoff+' までに実施日が到来した商品 '+r.count+' 件 の新しい仕入原価を、基幹システム取込用CSV（商品コード,新原価）として出力します。'+cwarn+'\\n\\nダウンロードしますか？')){ box.textContent=''; return; }
       box.style.color='#2e7d32'; box.textContent='✓ 仕入原価CSVをダウンロードしました（'+r.count+' 商品）。';
       window.location='/api/cost-export?cutoff='+encodeURIComponent(cutoff);
