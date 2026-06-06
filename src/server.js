@@ -2657,12 +2657,11 @@ const PAGE = `<!doctype html>
 <div class="hbar" id="hbar"><div id="hbarInner"></div></div>
 <div class="wrap" id="wrap"><table id="tbl">
   <thead><tr>
-    <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th>商品名</th>
+    <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th>商品名</th><th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
     <th class="r">現仕入</th><th class="c">改定後 仕入単価</th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
     <th class="r">現売単価</th><th class="r">転嫁後 売単価</th><th class="r">値上額<br><span class="hint">(改定%)</span></th>
     <th class="r">現粗利</th><th class="r">転嫁後 粗利</th>
     <th class="c">年間数量</th><th class="r">仕入 年影響</th><th class="r">増収 年影響</th>
-    <th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
   </tr></thead>
   <tbody id="tbody"></tbody>
 </table></div>
@@ -2806,6 +2805,7 @@ function buildMainRow(r, i, readOnly){
     custCellHtml(r)+
     '<td class="c">'+matchPctCell(r)+'</td>'+
     '<td>'+prodName+'</td>'+
+    linkCell+
     '<td class="r">'+num(r.currentCost)+'</td>'+
     costCell+
     '<td class="r" id="ci'+i+'"></td>'+
@@ -2816,8 +2816,7 @@ function buildMainRow(r, i, readOnly){
     '<td class="r" id="nm'+i+'"></td>'+
     '<td class="c" id="qt'+i+'"></td>'+
     '<td class="r" id="aci'+i+'"></td>'+
-    '<td class="r" id="asi'+i+'"></td>'+
-    linkCell;
+    '<td class="r" id="asi'+i+'"></td>';
   return tr;
 }
 // baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
