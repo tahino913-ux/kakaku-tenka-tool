@@ -118,7 +118,12 @@ function markItemsIssued(customer, items, quoteNo, atIso) {
   if (!map[customer]) map[customer] = {};
   for (const it of items) {
     const k = it && it.rowKey; if (!k) continue;
-    map[customer][k] = { s: 'issued', at: atIso, quoteNo: quoteNo || '', eff: String((it && it.effectiveDate) || '') };
+    map[customer][k] = {
+      s: 'issued', at: atIso, quoteNo: quoteNo || '', eff: String((it && it.effectiveDate) || ''),
+      // 発行時の確定単価を保存＝手入力/価格帯別/行ルールで決めた見積書の単価をそのまま基幹CSV(単価履歴/仕入原価)へ反映。
+      sell: (it && Number.isFinite(Number(it.newSell))) ? Number(it.newSell) : null,
+      cost: (it && Number.isFinite(Number(it.newCost))) ? Number(it.newCost) : null,
+    };
   }
   writeItemStatus(map);
 }
@@ -1368,6 +1373,10 @@ function buildCustomerCandidates(opts) {
         item.issuedAt = stEntry.at || ''; item.issuedQuoteNo = stEntry.quoteNo || '';
         // 提出済みは「発行に使った実施日」を採用（自社製造＝切替日なしでも実施日が残り、単価履歴CSV/カレンダーに反映）。
         if (stEntry.eff) { item.effectiveDate = stEntry.eff; item.noEff = !isValidEff(item.effectiveDate); }
+        // 提出済みは「発行時に確定した単価」を優先＝手入力/価格帯別/行ルールで決めた見積書の単価をそのまま使う。
+        //  これで 単価履歴CSV(新販売単価)・仕入原価CSV(新仕入単価) が見積書と完全一致する（既定再計算で上書きしない）。
+        if (stEntry.sell != null && Number.isFinite(Number(stEntry.sell))) { newSell = Number(stEntry.sell); item.newSell = newSell; }
+        if (stEntry.cost != null && Number.isFinite(Number(stEntry.cost))) { item.newCost = Number(stEntry.cost); }
       }
       keep.push(item);
     }
