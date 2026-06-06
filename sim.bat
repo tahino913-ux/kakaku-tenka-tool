@@ -1,13 +1,8 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo 価格転嫁シミュレーションを起動します...
-echo ブラウザが自動で開きます。終了するときはこのウィンドウで Ctrl+C を押してください。
-echo.
-echo ブックマーク用URL: http://localhost:8765
-echo  ・起動中なら、ブラウザのブックマークからこのURLを開くだけで画面に戻れます
-echo  ・sim.bat をもう一度押しても、二重起動せずその画面を開き直します
-echo.
+rem Japanese guidance is printed by node (renders correctly under chcp 65001).
+rem Keep this .bat ASCII-only: cmd misparses Japanese in batch source and shows mojibake.
 node src\server.js
-echo.
-pause
+rem Normal start / reuse exits 0 -> window auto-closes. Pause only on error (errorlevel>=1) so it can be read.
+if errorlevel 1 pause
