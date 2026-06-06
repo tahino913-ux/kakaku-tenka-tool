@@ -252,4 +252,19 @@ function setExcludedCustomer(customer, exclude) {
   return getExcludedCustomers();
 }
 
-module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer };
+// 複数得意先の除外/復活を1回の保存でまとめて行う（チェックして一括で隠す用）。
+function setExcludedCustomersBulk(names, exclude) {
+  const cur = readUser() || {};
+  cur.excludedCustomers = (cur.excludedCustomers && typeof cur.excludedCustomers === 'object') ? cur.excludedCustomers : {};
+  const now = new Date().toISOString();
+  (Array.isArray(names) ? names : []).forEach((n) => {
+    const name = String(n || '').trim();
+    if (!name) return;
+    if (exclude) cur.excludedCustomers[name] = now;
+    else delete cur.excludedCustomers[name];
+  });
+  saveSettings({ excludedCustomers: cur.excludedCustomers });
+  return getExcludedCustomers();
+}
+
+module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk };

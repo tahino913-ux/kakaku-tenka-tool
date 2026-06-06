@@ -22,7 +22,7 @@ const { SUPPLIERS_PAGE } = require('./suppliersPage');
 const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
 const { CDLINK_PAGE } = require('./cdlinkPage');
-const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer } = require('./settings');
+const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk } = require('./settings');
 const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
 const { readXlsxBuffer } = require('./xlsxread');
@@ -2228,6 +2228,12 @@ const server = http.createServer(async (req, res) => {
       setExcludedCustomer(customer, !!(body && body.exclude));
       return sendJson(res, 200, Object.assign({ ok: true }, customerExclusionData()));
     }
+    if (req.method === 'POST' && url === '/api/exclude-customers-bulk') {
+      const body = await readBody(req);
+      const names = Array.isArray(body && body.names) ? body.names : [];
+      setExcludedCustomersBulk(names, !!(body && body.exclude));
+      return sendJson(res, 200, Object.assign({ ok: true }, customerExclusionData()));
+    }
     if (req.method === 'POST' && url === '/api/impact-all') {
       const body = await readBody(req);
       return sendJson(res, 200, impactAllSuppliers(body));
@@ -2912,46 +2918,98 @@ function custCellHtml(r){
 
 // ===== 得意先 除外設定（取引終了の先を隠す／復活する）=====================
 let exclData = { active:[], excluded:[] };
-function exclRender(){
+let exclChecked = new Set(); // 隠す対象に選択中の得意先名
+function exclVisibleActive(){
   const si0=$('#exclSearch'); const q=(si0?si0.value:'').trim().toLowerCase();
   const norm = (s)=>String(s||'').toLowerCase();
   // active：取引なし(直近約1年 数量0)を先頭、その後 最終売上が古い順＝隠す候補を見つけやすく
-  const active = exclData.active.slice().filter(c=> !q || norm(c.name).indexOf(q)>=0 || norm(c.code).indexOf(q)>=0)
+  return exclData.active.slice().filter(c=> !q || norm(c.name).indexOf(q)>=0 || norm(c.code).indexOf(q)>=0)
     .sort((a,b)=>{ if(a.hasRecent!==b.hasRecent) return a.hasRecent?1:-1; return String(a.lastDate||'').localeCompare(String(b.lastDate||'')); });
+}
+function exclSyncSelCount(){
+  const n=exclChecked.size; const b=$('#exclHideSel');
+  if(b){ b.textContent='🚫 選択した '+n+' 件を隠す'; b.disabled=(n===0); b.style.opacity=n===0?'.5':'1'; b.style.cursor=n===0?'default':'pointer'; }
+}
+function exclRender(){
+  const si0=$('#exclSearch'); const q=(si0?si0.value:'').trim().toLowerCase();
+  const norm = (s)=>String(s||'').toLowerCase();
+  const active = exclVisibleActive();
   const ex = exclData.excluded.slice().filter(c=> !q || norm(c.name).indexOf(q)>=0);
   let h = '';
   h += '<div style="font-size:12px;color:#6b7785;margin-bottom:8px">すでに取引が無いのに照合に出てくる得意先を隠せます。隠した先は<b>メイン画面・損益・得意先別・見積書</b>から外れます。いつでも「復活」で戻せます。</div>';
   h += '<input id="exclSearch" placeholder="🔍 得意先名・コードで絞り込み" style="width:100%;padding:6px;margin-bottom:8px;border:1px solid #c7ced8;border-radius:4px;font:inherit;box-sizing:border-box" value="'+esc(q)+'">';
   h += '<div style="font-weight:700;margin:6px 0 4px">🚫 除外中（'+ex.length+'件）</div>';
   if(!ex.length) h += '<div style="font-size:12px;color:#aaa;margin-bottom:10px">（なし）</div>';
-  else { h += '<div style="max-height:140px;overflow:auto;border:1px solid #eee;border-radius:6px;margin-bottom:12px">';
+  else { h += '<div style="max-height:120px;overflow:auto;border:1px solid #eee;border-radius:6px;margin-bottom:12px">';
     ex.forEach(c=>{ h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid #f3f3f3"><span style="flex:1">'+esc(c.name)+'</span><button class="exclRestore" data-name="'+esc(c.name)+'" style="font-size:12px;background:#2f6fb0;color:#fff;border:none;border-radius:6px;padding:3px 10px;cursor:pointer">↩ 復活</button></div>'; });
     h += '</div>'; }
   h += '<div style="font-weight:700;margin:6px 0 4px">照合に出ている得意先（'+active.length+'件）<span style="font-weight:400;font-size:11px;color:#888"> ※赤＝直近約1年 取引なし</span></div>';
+  // 操作バー：取引なし一括チェック・全解除・選択を隠す
+  h += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
+    + '<button id="exclCheckNoTrade" type="button" style="font-size:12px;background:#fff;border:1px solid #c0392b;color:#c0392b;border-radius:6px;padding:4px 10px;cursor:pointer">☑ 取引なしを一括チェック</button>'
+    + '<button id="exclClearSel" type="button" style="font-size:12px;background:#fff;border:1px solid #bbb;color:#555;border-radius:6px;padding:4px 10px;cursor:pointer">選択を全解除</button>'
+    + '<button id="exclHideSel" type="button" style="margin-left:auto;font-size:12px;background:#c0392b;color:#fff;border:none;border-radius:6px;padding:5px 12px;font-weight:700">🚫 選択した 0 件を隠す</button>'
+    + '</div>';
   h += '<div style="max-height:300px;overflow:auto;border:1px solid #eee;border-radius:6px"><table style="width:100%;border-collapse:collapse;font-size:12px">';
-  h += '<thead><tr style="background:#f6f6f6"><th style="text-align:left;padding:4px 8px">得意先</th><th style="padding:4px 8px">最終売上</th><th style="padding:4px 8px">品数</th><th style="padding:4px 8px"></th></tr></thead><tbody>';
+  h += '<thead><tr style="background:#f6f6f6"><th style="padding:4px 6px;width:34px"><input type="checkbox" id="exclChkAll" title="表示中をすべてチェック"></th><th style="text-align:left;padding:4px 8px">得意先</th><th style="padding:4px 8px">最終売上</th><th style="padding:4px 8px">品数</th></tr></thead><tbody>';
   active.forEach(c=>{
     const no = !c.hasRecent;
     const last = c.lastDate ? String(c.lastDate).slice(0,7) : '—';
+    const ck = exclChecked.has(c.name) ? ' checked' : '';
     h += '<tr style="border-bottom:1px solid #f3f3f3'+(no?';background:#fdecec':'')+'">'
+      + '<td style="padding:4px 6px;text-align:center"><input type="checkbox" class="exclChk" data-name="'+esc(c.name)+'"'+ck+'></td>'
       + '<td style="padding:4px 8px">'+esc(c.name)+(c.code?' <span style="color:#aaa">['+esc(c.code)+']</span>':'')+(no?' <span style="color:#c0392b;font-size:10px">取引なし</span>':'')+'</td>'
       + '<td style="padding:4px 8px;text-align:center;color:'+(no?'#c0392b':'#555')+'">'+last+'</td>'
       + '<td style="padding:4px 8px;text-align:center">'+c.productCount+'</td>'
-      + '<td style="padding:4px 8px;text-align:center"><button class="exclHide" data-name="'+esc(c.name)+'" style="font-size:12px;background:#fff;border:1px solid #c0392b;color:#c0392b;border-radius:6px;padding:3px 10px;cursor:pointer">🚫 隠す</button></td>'
       + '</tr>';
   });
   if(!active.length) h += '<tr><td colspan="4" style="padding:10px;color:#aaa;text-align:center">該当なし</td></tr>';
   h += '</tbody></table></div>';
   $('#exclBody').innerHTML = h;
   const si=$('#exclSearch'); if(si){ si.addEventListener('input', exclRender); si.focus(); si.setSelectionRange(si.value.length, si.value.length); }
-  $('#exclBody').querySelectorAll('.exclHide').forEach(b=> b.addEventListener('click', ()=> exclToggle(b.dataset.name, true)));
+  // チェックボックス（行）
+  $('#exclBody').querySelectorAll('.exclChk').forEach(cb=> cb.addEventListener('change', (e)=>{
+    const nm=e.currentTarget.dataset.name;
+    if(e.currentTarget.checked) exclChecked.add(nm); else exclChecked.delete(nm);
+    exclSyncSelCount();
+  }));
+  // ヘッダーの全チェック（表示中のみ）
+  const all=$('#exclChkAll'); if(all) all.addEventListener('change', (e)=>{
+    const on=e.currentTarget.checked;
+    exclVisibleActive().forEach(c=>{ if(on) exclChecked.add(c.name); else exclChecked.delete(c.name); });
+    exclRender();
+  });
+  // 取引なしを一括チェック（フィルタ中なら表示中の取引なし）
+  $('#exclCheckNoTrade').addEventListener('click', ()=>{
+    exclVisibleActive().forEach(c=>{ if(!c.hasRecent) exclChecked.add(c.name); });
+    exclRender();
+  });
+  $('#exclClearSel').addEventListener('click', ()=>{ exclChecked.clear(); exclRender(); });
+  $('#exclHideSel').addEventListener('click', exclHideSelected);
+  // 復活ボタン
   $('#exclBody').querySelectorAll('.exclRestore').forEach(b=> b.addEventListener('click', ()=> exclToggle(b.dataset.name, false)));
+  exclSyncSelCount();
 }
+// 選択した得意先をまとめて隠す
+async function exclHideSelected(){
+  const names=[...exclChecked]; if(!names.length) return;
+  try{
+    const res = await fetch('/api/exclude-customers-bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names, exclude:true})}).then(x=>x.json());
+    if(!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
+    exclData = { active:res.active||[], excluded:res.excluded||[] };
+    exclChecked.clear();
+    exclRender();
+    if(allView) loadAll(); else if(!dateFilter) loadFile();
+    loadAllImpact();
+  }catch(e){ alert('通信に失敗: '+e); }
+}
+// 1件の除外/復活（復活ボタン用）
 async function exclToggle(name, exclude){
   try{
     const res = await fetch('/api/exclude-customer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name, exclude})}).then(x=>x.json());
     if(!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
     exclData = { active:res.active||[], excluded:res.excluded||[] };
+    exclChecked.delete(name);
     exclRender();
     // メイン表・損益を最新に（除外結果を即反映）
     if(allView) loadAll(); else if(!dateFilter) loadFile();
@@ -2963,6 +3021,7 @@ async function openExcludeModal(){
   try{ data = await fetch('/api/customer-list').then(x=>x.json()); }
   catch(e){ alert('得意先一覧の取得に失敗: '+e); return; }
   exclData = { active:data.active||[], excluded:data.excluded||[] };
+  exclChecked = new Set();
   const wrap=document.createElement('div');
   wrap.innerHTML =
     '<div id="exclBack" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9000"></div>'+
