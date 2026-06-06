@@ -1266,6 +1266,26 @@ function buildCustomerCandidates(opts) {
   const rowRound = (opts.rowRound && typeof opts.rowRound === 'object') ? opts.rowRound : {};
   // 行ごと 掛率（行ルール=掛率×のときのその行の掛率）。{ rowKey: 数値 }。無ければ全体の factor。
   const rowFactor = (opts.rowFactor && typeof opts.rowFactor === 'object') ? opts.rowFactor : {};
+  // 価格帯別ルール（全体反映）：現売価で転嫁ルールを変える。[{max:数値|null, rule, factor}] を max 昇順（null=それ以上は最後）。
+  //  優先順位＝手入力売価 > 行ルール上書き > 価格帯別 > 全体ルール。行ルール上書きが無い行にだけ帯ルールを当てる。
+  let priceBands = [];
+  if (Array.isArray(opts.priceBands)) {
+    priceBands = opts.priceBands
+      .map((b) => ({
+        max: (b && b.max != null && Number.isFinite(Number(b.max))) ? Number(b.max) : null,
+        rule: String((b && b.rule) || '').trim(),
+        factor: (b && Number.isFinite(Number(b.factor)) && Number(b.factor) > 0) ? Number(b.factor) : factor,
+      }))
+      .filter((b) => b.rule);
+    priceBands.sort((a, b) => (a.max == null ? Infinity : a.max) - (b.max == null ? Infinity : b.max));
+  }
+  const bandFor = (curSell) => {
+    if (!priceBands.length) return null;
+    const v = Number(curSell);
+    if (!Number.isFinite(v)) return null;
+    for (const b of priceBands) { if (b.max == null || v <= b.max) return b; }
+    return priceBands[priceBands.length - 1];
+  };
   // keep（見積書に載る）/ review（要確認）へ振り分け（理由つき）
   const itemStatusMap = readItemStatus(); // アイテムの状態（検討中/提出済み）。keep行に status を付ける。
   const byCustomerSplit = new Map(); // name -> { keep:[item], review:[item] }
@@ -1278,9 +1298,12 @@ function buildCustomerCandidates(opts) {
       const rowKey = name + '\u0001' + cand.supplier + '\u0001' + prodKey;
       let newSell = fin(r.newSell) ? r.newSell : null;
       let ruleForRow = ruleType;
-      // 行ごとの上書き：転嫁ルール（行ルール）と まるめ（端数処理）を、それぞれ全体から差し替え可能。
+      // 優先順位：行ルール上書き > 価格帯別ルール（現売価で変える）> 全体ルール。
       const ov = rowRules[rowKey];
-      const effRuleType = (ov && ov !== ruleType) ? ov : ruleType;
+      const hasRowRuleOv = !!(ov && ov !== ruleType);
+      // 価格帯別ルール：行ルール上書きが無い行にだけ、現売価で帯のルール/掛率を当てる。
+      const band = hasRowRuleOv ? null : bandFor(r.currentSell);
+      const effRuleType = hasRowRuleOv ? ov : (band && band.rule ? band.rule : ruleType);
       // まるめの上書き "単位|処理"（例 "1|floor"）を解釈。無ければ全体の rounding。
       let effRounding = rounding;
       const roundOv = rowRound[rowKey];
@@ -1290,14 +1313,17 @@ function buildCustomerCandidates(opts) {
         const u = parseFloat(pr[0]);
         if (Number.isFinite(u) && u > 0) effRounding = { unit: u, mode: pr[1] || 'round' };
       }
-      // 行ごと掛率：行ルールが掛率(markup)のとき、その行の掛率があれば使う（無ければ全体 factor）。
-      const rf = Number(rowFactor[rowKey]);
-      const hasRowFactor = effRuleType === 'markup' && Number.isFinite(rf) && rf > 0;
-      const effFactor = hasRowFactor ? rf : factor;
+      // 掛率（markupのとき）：行掛率 > 帯の掛率 > 全体factor。
+      let effFactor = factor;
+      if (effRuleType === 'markup') {
+        const rf = Number(rowFactor[rowKey]);
+        if (Number.isFinite(rf) && rf > 0) effFactor = rf;
+        else if (band && band.rule === 'markup' && Number.isFinite(Number(band.factor)) && Number(band.factor) > 0) effFactor = Number(band.factor);
+      }
       // ルール／まるめ／掛率 のいずれかが全体と違えば、その行だけ再計算（全体と同じ calcRow 経路＝ズレない）。
       const ruleDiffers = effRuleType !== ruleType;
       const roundDiffers = roundManual && (effRounding.unit !== rounding.unit || effRounding.mode !== rounding.mode);
-      const factorDiffers = hasRowFactor && effFactor !== factor;
+      const factorDiffers = effFactor !== factor;
       if (ruleDiffers || roundDiffers || factorDiffers) {
         const rr = calcRow(r, { default: { type: effRuleType, factor: effFactor }, overrides: [], rounding: effRounding, selfCostUplift: { rate: selfUplift } });
         if (fin(rr.newSell)) { newSell = rr.newSell; ruleForRow = effRuleType; }
@@ -1347,7 +1373,7 @@ function buildCustomerCandidates(opts) {
     }
     byCustomerSplit.set(name, { keep, review });
   }
-  const applied = { ruleType, factor, roundingUnit: rounding.unit, roundingMode: rounding.mode, selfUplift, forceEffectiveDate: forceDate };
+  const applied = { ruleType, factor, roundingUnit: rounding.unit, roundingMode: rounding.mode, selfUplift, forceEffectiveDate: forceDate, priceBands };
   return { byCustomer: byCustomerSplit, fileCount: files.length, errors, thr, applied };
 }
 

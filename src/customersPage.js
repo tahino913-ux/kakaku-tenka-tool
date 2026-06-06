@@ -196,6 +196,10 @@ const CUSTOMERS_PAGE = `<!doctype html>
     </select></div>
   <div class="fld" id="cFactorBox" style="display:none"><label>掛率</label>
     <input id="cFactor" class="num" type="number" step="0.01" value="1.25"></div>
+  <div class="fld" id="cBandFld" style="flex-basis:100%;min-width:100%">
+    <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" id="cBandOn"> 💴 現売価で転嫁ルールを変える（価格帯別・全体反映）</label>
+    <div id="bandBox" style="display:none;margin-top:5px;background:#f6f9fc;border:1px solid #d4e0ec;border-radius:8px;padding:8px"></div>
+  </div>
   <div class="fld"><label>改定後価格 まるめ <span class="h">小数の扱い</span></label>
     <select id="cRound">
       <optgroup label="切り捨て（カット）">
@@ -416,6 +420,10 @@ function rowRoundSelect(p){
 }
 
 // 画面のカスタマイズ操作 → サーバへ渡す計算設定（メインページと同じ項目）
+// 価格帯別ルール（現売価で転嫁ルールを変える）。最後の1件は max=null＝「それ以上」。
+let priceBands=[{max:null, rule:'add_increase', factor:1.25}];
+const BAND_RULES=[['add_increase','上乗せ'],['keep_margin_rate','粗利維持'],['markup','掛率×'],['sell_cost_rate','売価×仕入率'],['keep_sell','据置']];
+function bandsEnabled(){ return !!($('#cBandOn')&&$('#cBandOn').checked); }
 function calcOpts(){
   // 「改定後価格 まるめ」は "単位|処理"（例 1|floor＝小数点以下カット）の1値。単位と処理に分解して送る。
   const rp=String($('#cRound').value||'0.01|round').split('|');
@@ -426,15 +434,44 @@ function calcOpts(){
     roundingMode: rp[1]||'round',
     selfUplift: parseFloat($('#cUplift').value)||0,
     forceEffectiveDate: ($('#cEff').value||'').trim(),
+    priceBands: bandsEnabled() ? priceBands.filter(b=>b.rule) : undefined, // 価格帯別ON時のみ送る
     rowRules, rowSell, rowEff, rowNote, rowRound, rowFactor,
   };
+}
+// 価格帯別ルールの編集UIを描画（max昇順・null=それ以上は最後）。変更で即 load()（再計算）。
+function renderBands(){
+  const box=$('#bandBox'); if(!box) return;
+  priceBands.sort((a,b)=>((a.max==null?Infinity:a.max)-(b.max==null?Infinity:b.max)));
+  const inS='padding:4px 6px;border:1px solid #c7d6e4;border-radius:6px;font-size:13px';
+  const ruleSel=(i,val)=>'<select class="band-rule" data-i="'+i+'" style="'+inS+'">'+BAND_RULES.map(o=>'<option value="'+o[0]+'"'+(o[0]===val?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>';
+  let h='<div style="font-size:11px;color:#5a6b7a;margin-bottom:6px">現売価の小さい順に「〜○○円まで」の帯を作り、各帯の転嫁ルールを選びます。最後の「それ以上」が残り全部です。<br>例：〜100円＝粗利維持／〜500円＝掛率×1.2／それ以上＝上乗せ。</div>';
+  priceBands.forEach((b,i)=>{
+    const isLast=(b.max==null);
+    const mx=isLast?'<b style="min-width:96px;display:inline-block">それ以上</b>'
+      :'〜 <input class="band-max" data-i="'+i+'" type="text" inputmode="decimal" value="'+(b.max==null?'':b.max)+'" style="width:74px;text-align:right;'+inS+'"> 円まで';
+    const fac=(b.rule==='markup')?(' ×<input class="band-factor" data-i="'+i+'" type="text" inputmode="decimal" value="'+(b.factor||'')+'" style="width:56px;text-align:right;'+inS+'">'):'';
+    const del=isLast?'':'<button class="band-del" data-i="'+i+'" title="この帯を削除" style="border:none;background:#e4ebf2;color:#5a6b7a;border-radius:6px;width:24px;height:24px;cursor:pointer">×</button>';
+    h+='<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">'+mx+' ： '+ruleSel(i,b.rule)+fac+' '+del+'</div>';
+  });
+  h+='<button id="bandAdd" style="margin-top:4px;border:1px dashed #9ec3e6;background:#fff;color:#1f6fb2;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px">＋ 帯を追加</button>';
+  box.innerHTML=h;
+  box.querySelectorAll('.band-rule').forEach(el=>el.addEventListener('change',()=>{ priceBands[+el.dataset.i].rule=el.value; renderBands(); load(); }));
+  box.querySelectorAll('.band-max').forEach(el=>el.addEventListener('change',()=>{ const v=parseFloat(el.value); priceBands[+el.dataset.i].max=Number.isFinite(v)?v:null; renderBands(); load(); }));
+  box.querySelectorAll('.band-factor').forEach(el=>el.addEventListener('change',()=>{ const v=parseFloat(el.value); priceBands[+el.dataset.i].factor=Number.isFinite(v)&&v>0?v:1.25; load(); }));
+  box.querySelectorAll('.band-del').forEach(el=>el.addEventListener('click',()=>{ priceBands.splice(+el.dataset.i,1); renderBands(); load(); }));
+  const add=$('#bandAdd'); if(add) add.addEventListener('click',()=>{ priceBands.unshift({max:100,rule:'add_increase',factor:1.25}); renderBands(); load(); });
 }
 const RULE_LABEL={add_increase:'上乗せ',keep_margin_rate:'粗利維持',markup:'掛率×',sell_cost_rate:'売価×仕入率',keep_sell:'据置'};
 const MODE_LABEL={round:'四捨五入',ceil:'切上げ',floor:'切捨て'};
 function toggleFactor(){ $('#cFactorBox').style.display = ($('#cRule').value==='markup')?'flex':'none'; }
 function showApplied(a){
   if(!a){ $('#appliedMsg').textContent=''; return; }
-  const parts=[ (RULE_LABEL[a.ruleType]||a.ruleType)+(a.ruleType==='markup'?(' '+a.factor):''),
+  // 価格帯別ルールが効いているときは、単体ルールの代わりに帯の内容を表示。
+  const bands=Array.isArray(a.priceBands)?a.priceBands:[];
+  const ruleDisp = bands.length
+    ? ('💴 価格帯別: '+bands.map(b=>(b.max==null?'それ以上':('〜'+b.max))+'='+(RULE_LABEL[b.rule]||b.rule)+(b.rule==='markup'?('×'+(b.factor||'')):'')).join(' / '))
+    : ((RULE_LABEL[a.ruleType]||a.ruleType)+(a.ruleType==='markup'?(' '+a.factor):''));
+  const parts=[ ruleDisp,
     '端数 '+a.roundingUnit+'円/'+(MODE_LABEL[a.roundingMode]||a.roundingMode),
     '自社+'+a.selfUplift+'%',
     a.forceEffectiveDate?('実施日 '+a.forceEffectiveDate+' に統一'):'実施日 各行' ];
@@ -880,8 +917,11 @@ async function initControls(){
     const want=u+'|'+md;
     if([...$('#cRound').options].some(o=>o.value===want)) $('#cRound').value=want;
     if(up.rate!=null) $('#cUplift').value=up.rate;
+    // 価格帯別ルールの「それ以上」既定を、全体ルールに合わせて初期化（帯はOFFが既定）。
+    priceBands=[{max:null, rule:(df.type||'add_increase'), factor:(df.factor!=null?Number(df.factor):1.25)}];
   }catch(e){/* 既定のHTML値のまま */}
   toggleFactor();
+  renderBands();
 }
 
 $('#reloadBtn').addEventListener('click',async()=>{ await loadIssueLog(); load(); });
@@ -898,6 +938,15 @@ $('#cLowMargin').addEventListener('input',()=>{
   renderList(); if(selName) selectCust(selName);
 });
 $('#reloadPolicyBtn').addEventListener('click', async ()=>{ await initControls(); load(); }); // メインの全体方針を取り込み直す
+// 価格帯別ルールのON/OFF：ONで帯エディタ表示＋単体ルールを無効化（帯が全体を支配）、OFFで従来の単体ルール。
+$('#cBandOn').addEventListener('change',()=>{
+  const on=bandsEnabled();
+  $('#bandBox').style.display = on?'':'none';
+  $('#cRule').disabled = on; $('#cFactor').disabled = on;
+  $('#cBandFld').querySelector('label').style.color = on?'#1f6fb2':'';
+  if(on) renderBands();
+  load();
+});
 $('#search').addEventListener('input',applyFilter);
 $('#recentYears').addEventListener('change',applyFilter);
 $('#resetIssuedBtn').addEventListener('click',resetAllIssued);
