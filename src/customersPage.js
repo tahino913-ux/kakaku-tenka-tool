@@ -234,10 +234,11 @@ const CUSTOMERS_PAGE = `<!doctype html>
 
 <div class="exportbar">
   <button class="exp" id="exportAllBtn">📄 全得意先の見積書を作成</button>
-  <button class="exp one" id="exportOneBtn" disabled>📄 選択中の得意先だけ作成</button>
   <span class="exphint">上の設定で、得意先ごと1枚（複数メーカー横断）の見積書を出力します。発行前に内容をプレビュー表示します（要確認は除外）。</span>
   <span id="exportMsg" class="muted"></span>
 </div>
+<!-- 「選択中の得意先だけ作成」ボタンは、得意先選択時に下の一括バー右端へ移動する（普段はここに退避）。 -->
+<span id="exportOneHome" style="display:none"><button class="exp one" id="exportOneBtn" disabled>📄 選択中の得意先だけ作成</button></span>
 <div id="exportResult" style="display:none"></div>
 
 <div class="exportbar" id="hanbaiMoved" style="background:#f3f5f8;border-color:#d8dee6;color:#55606e;font-size:12.5px">
@@ -630,7 +631,9 @@ function selectCust(name){
   //  まずホルダーへ退避（ノードを保持＝設定値・配線をそのまま維持）→描画後にスロットへ差し込む。
   const __bar=document.getElementById('calcbar'), __home=document.getElementById('calcbarHome');
   if(__bar && __home) __home.appendChild(__bar);
-  const oneBtn=$('#exportOneBtn');
+  // 「○○だけ作成」ボタンも innerHTML 再描画で消えないようホルダーへ退避（描画後に一括バー右端へ差し込む）。
+  const oneBtn=document.getElementById('exportOneBtn'), __oneHome=document.getElementById('exportOneHome');
+  if(oneBtn && __oneHome) __oneHome.appendChild(oneBtn);
   if(oneBtn){ oneBtn.disabled=false; oneBtn.textContent='📄 「'+(name.length>12?name.slice(0,12)+'…':name)+'」だけ作成'; }
   renderList();
   const c=DATA.find(x=>x.name===name);
@@ -668,6 +671,7 @@ function selectCust(name){
     +'<span class="bulkinfo">☑ 選択 <b id="cntTarget">0</b> 件</span>'
     +'<button class="bulkbtn hold" id="bulkHoldBtn" disabled>🤔 選択をまとめて検討中へ</button>'
     +'<span class="muted">チェックした商品を今回の見積から外します（検討中へ）。</span>'
+    +'<span id="exportOneSlot" style="margin-left:auto"></span>'  // ← ここに「○○だけ作成」ボタンを右端で差し込む
     +'</div>';
   html+='<div class="table-pad"><table><thead>'
     +'<tr><th rowspan="2">操作<br><label class="selall"><input type="checkbox" id="selAllTarget"> 全</label></th><th rowspan="2">仕入先</th><th rowspan="2">商品コード</th><th rowspan="2">商品名</th>'
@@ -713,6 +717,9 @@ function selectCust(name){
   // 退避していた転嫁ルールバーを、社名の下のスロットへ差し込む（該当商品 と 提出済 の間）。
   const __slot=document.getElementById('calcbarSlot');
   if(__bar && __slot) __slot.appendChild(__bar);
+  // 「○○だけ作成」ボタンを 一括バー（チェックして検討中へ）の右端スロットへ差し込む。
+  const __oneSlot=document.getElementById('exportOneSlot');
+  if(oneBtn && __oneSlot) __oneSlot.appendChild(oneBtn);
   // 「🤔 検討中へ」「↩ 対象へ戻す」の配線（1件ずつ）
   $('#detailCol').querySelectorAll('button.hold-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'hold')));
   $('#detailCol').querySelectorAll('button.back-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'')));
