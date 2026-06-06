@@ -58,6 +58,10 @@ function resolveHanbaiSource(p) {
 }
 
 // メーカー見積CSV → matchAll に渡す items[]
+// 容器の仕入単価は「銭（小数2桁）」が基準。メーカー見積の新単価が計算値（例 14.26×1.2=17.112）や
+//  浮動小数（17.111999999999998）のまま取り込まれると、仕入原価CSVが17.112になりメーカー見積(17.11)とズレる。
+//  → 取り込み時に銭(2桁)へ丸めて、照合・表示・基幹CSVをメーカー見積どおり(17.11)に揃える。
+function sen(v) { return Number.isFinite(v) ? Math.round(v * 100) / 100 : v; }
 function loadMakerQuote(csvPath) {
   const { records } = loadCsv(csvPath);
   const get = (r, names) => { for (const n of names) if (r[n] !== undefined && r[n] !== '') return r[n]; return ''; };
@@ -69,8 +73,8 @@ function loadMakerQuote(csvPath) {
     items.push({
       supplier: get(r, ['仕入先', '仕入先（メーカー）', 'メーカー']) || '仕入先不明',
       makerCode, makerName,
-      currentCost: toNum(get(r, ['現単価', '現価格', '現行仕入単価', '現仕入単価'])),
-      newCost: toNum(get(r, ['新単価', '新価格', '新仕入単価'])),
+      currentCost: sen(toNum(get(r, ['現単価', '現価格', '現行仕入単価', '現仕入単価']))),
+      newCost: sen(toNum(get(r, ['新単価', '新価格', '新仕入単価']))),
       switchDate: get(r, ['切替日', '実施日', '適用日']),
     });
   }
