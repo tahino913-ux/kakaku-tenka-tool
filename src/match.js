@@ -305,7 +305,7 @@ function pricesEqual(a, b, tol) {
 //     - 例 大黒工業のメーカー見積(tag=0029) → 末尾29の自社品だけ。
 //       問屋経由(末尾13)の同じ大黒製品は、朝日問屋(tag=0013)側の見積で拾う運用。
 //     - 未設定(空文字列)なら従来通り全件候補（後方互換）。
-//     - productLinks 行はフィルタを bypass（ユーザ明示の意思を優先）。
+//     - productLinks 行・CD一致(品番一致)行はフィルタを bypass（品番一致＝最も確実な手がかりを最優先）。
 //   priceBoost=20 / priceTolerance=0.02:
 //     - 自社原単価 ≒ メーカー現単価 のとき名前スコアに +N（上限100）。
 //     - 67-79% で要確認に落ちていた真の組合せを 80%以上に押し上げる救済信号。
@@ -340,12 +340,17 @@ function matchOne(item, hanbai, opts = {}) {
     const linkOther = linkedMakerName && linkedMakerName !== item.makerName;
     if (linkOther) continue;
     // 仕入先コードフィルタ（productLinks の行は bypass する）
-    if (filterCode && !linkSelf && r.purchaseCode && r.purchaseCode !== filterCode) continue;
+    // CD一致（メーカー品番＝商品マスタ商品名3／伝票埋込品番 が一致）は最も確実な手がかりなので、
+    //  発注先フィルタより優先する。ここで先に判定し、CD一致の行はフィルタを通す（＝手動紐付けと同格）。
+    //  ＝商品名3にメーカー品番を登録しておけば、過去伝票の発注先がズレていても確実に紐づく。
+    const cdHit = !linkSelf && cands.length && codeHit(cands, r.codeNorm || r.norm);
+    // 仕入先コードフィルタ（productLinks の行・CD一致の行は bypass する）
+    if (filterCode && !linkSelf && !cdHit && r.purchaseCode && r.purchaseCode !== filterCode) continue;
     let cd, ns, isLink = false, raw = 0, brandOnlyMiss = false;
     if (linkSelf) {
       cd = false; ns = 100; isLink = true; // 100%紐付け扱い
     } else {
-      cd = cands.length && codeHit(cands, r.codeNorm || r.norm);
+      cd = cdHit;
       if (cd) { ns = 100; raw = 100; }
       else {
         const info = nameScoreInfo(item.makerName, r.coreNorm || r.norm);

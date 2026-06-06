@@ -56,6 +56,17 @@ function getSettings() {
     selfManufacture: Object.assign({}, base.selfManufacture, u.selfManufacture),
     // AI取り込みアシスト設定（config.js 既定 ＋ settings.json 上書き）。既定OFF。
     ai: Object.assign({}, base.ai, u.ai),
+    // コード化（初期登録）レビューの記録：
+    //  confirmed = 人が確定した {仕入先:{自社CD:{code:メーカー品番, name:メーカー商品名, at}}}
+    //  rejected  = 人が却下した {仕入先:{"自社CD|メーカー品番": at}}（候補から消すため）
+    //  確定は同時に productLinks にも登録され、↻照合で 手動紐付け として効く。
+    cdReview:       u.cdReview && typeof u.cdReview === 'object'
+      ? { confirmed: u.cdReview.confirmed || {}, rejected: u.cdReview.rejected || {} }
+      : { confirmed: {}, rejected: {} },
+    // 得意先 除外設定：{ 得意先名: 除外した日時(ISO) }
+    //  すでに取引が無いのに照合に出てくる先を、画面・損益・得意先別・見積書から除外（非表示）する。
+    //  いつでも「復活」で戻せる（記録を消すだけ）。
+    excludedCustomers: (u.excludedCustomers && typeof u.excludedCustomers === 'object') ? u.excludedCustomers : {},
   };
 }
 
@@ -80,6 +91,10 @@ function saveSettings(patch) {
     selfManufacture: patch.selfManufacture !== undefined ? patch.selfManufacture : cur.selfManufacture,
     // AI設定はマージで保持（UI保存で消えないように）。部分patchでも既存を残す。
     ai:             patch.ai !== undefined ? Object.assign({}, cur.ai, patch.ai) : cur.ai,
+    // コード化レビューの記録（UI保存で消えないように保持）。
+    cdReview:       patch.cdReview !== undefined ? patch.cdReview : (cur.cdReview || { confirmed: {}, rejected: {} }),
+    // 得意先 除外設定（UI保存で消えないように保持）。
+    excludedCustomers: patch.excludedCustomers !== undefined ? patch.excludedCustomers : (cur.excludedCustomers || {}),
     _savedAt:       new Date().toISOString(),
   };
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2), 'utf8');
@@ -160,4 +175,81 @@ function saveSelfProfile(profile) {
   return getSelfProfile();
 }
 
-module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile };
+// コード化レビューの記録を読む（{confirmed, rejected} を正規化して返す）。
+function getCdReview() {
+  const u = readUser() || {};
+  const c = (u.cdReview && typeof u.cdReview === 'object') ? u.cdReview : {};
+  return { confirmed: c.confirmed || {}, rejected: c.rejected || {} };
+}
+// 候補を「確定」：productLinks に登録（↻照合で 手動紐付けに）＋ cdReview.confirmed に メーカー品番を記録（書き戻しCSV用）。
+//  同じ候補に対する過去の却下があれば消す。1回の保存にまとめる。
+function confirmCdLink(supplier, selfCode, makerCode, makerName) {
+  const sup = String(supplier || '').trim();
+  const code = String(selfCode || '').trim();
+  if (!sup || !code) return getCdReview();
+  const mCode = String(makerCode == null ? '' : makerCode).trim();
+  const mName = String(makerName == null ? '' : makerName).trim();
+  const cur = readUser() || {};
+  cur.productLinks = cur.productLinks || {};
+  cur.productLinks[sup] = cur.productLinks[sup] || {};
+  if (mName) cur.productLinks[sup][code] = mName; // 紐付けはメーカー商品名（既存仕様）で保存
+  cur.cdReview = (cur.cdReview && typeof cur.cdReview === 'object') ? cur.cdReview : {};
+  cur.cdReview.confirmed = cur.cdReview.confirmed || {};
+  cur.cdReview.rejected = cur.cdReview.rejected || {};
+  cur.cdReview.confirmed[sup] = cur.cdReview.confirmed[sup] || {};
+  cur.cdReview.confirmed[sup][code] = { code: mCode, name: mName, at: new Date().toISOString() };
+  if (cur.cdReview.rejected[sup]) delete cur.cdReview.rejected[sup][code + '|' + mCode];
+  saveSettings({ productLinks: cur.productLinks, cdReview: cur.cdReview });
+  return getCdReview();
+}
+// 候補を「却下」：cdReview.rejected に記録（候補一覧から消す）。productLinks は触らない。
+function rejectCdLink(supplier, selfCode, makerCode) {
+  const sup = String(supplier || '').trim();
+  const code = String(selfCode || '').trim();
+  if (!sup || !code) return getCdReview();
+  const mCode = String(makerCode == null ? '' : makerCode).trim();
+  const cur = readUser() || {};
+  cur.cdReview = (cur.cdReview && typeof cur.cdReview === 'object') ? cur.cdReview : {};
+  cur.cdReview.confirmed = cur.cdReview.confirmed || {};
+  cur.cdReview.rejected = cur.cdReview.rejected || {};
+  cur.cdReview.rejected[sup] = cur.cdReview.rejected[sup] || {};
+  cur.cdReview.rejected[sup][code + '|' + mCode] = new Date().toISOString();
+  saveSettings({ cdReview: cur.cdReview });
+  return getCdReview();
+}
+// 確定の取消：productLinks と cdReview.confirmed の両方から消す。
+function unconfirmCdLink(supplier, selfCode) {
+  const sup = String(supplier || '').trim();
+  const code = String(selfCode || '').trim();
+  if (!sup || !code) return getCdReview();
+  const cur = readUser() || {};
+  if (cur.productLinks && cur.productLinks[sup]) {
+    delete cur.productLinks[sup][code];
+    if (!Object.keys(cur.productLinks[sup]).length) delete cur.productLinks[sup];
+  }
+  if (cur.cdReview && cur.cdReview.confirmed && cur.cdReview.confirmed[sup]) {
+    delete cur.cdReview.confirmed[sup][code];
+    if (!Object.keys(cur.cdReview.confirmed[sup]).length) delete cur.cdReview.confirmed[sup];
+  }
+  saveSettings({ productLinks: cur.productLinks || {}, cdReview: cur.cdReview || { confirmed: {}, rejected: {} } });
+  return getCdReview();
+}
+
+// 得意先 除外設定を読む（{ 得意先名: 除外日時 }）。
+function getExcludedCustomers() {
+  const u = readUser() || {};
+  return (u.excludedCustomers && typeof u.excludedCustomers === 'object') ? u.excludedCustomers : {};
+}
+// 1得意先の除外/復活。exclude=true で除外（日時記録）、false で復活（記録削除）。他設定は保持。
+function setExcludedCustomer(customer, exclude) {
+  const name = String(customer || '').trim();
+  if (!name) return getExcludedCustomers();
+  const cur = readUser() || {};
+  cur.excludedCustomers = (cur.excludedCustomers && typeof cur.excludedCustomers === 'object') ? cur.excludedCustomers : {};
+  if (exclude) cur.excludedCustomers[name] = new Date().toISOString();
+  else delete cur.excludedCustomers[name];
+  saveSettings({ excludedCustomers: cur.excludedCustomers });
+  return getExcludedCustomers();
+}
+
+module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer };

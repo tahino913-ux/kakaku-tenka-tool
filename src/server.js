@@ -21,7 +21,8 @@ const { LIST_PAGE } = require('./listPage');
 const { SUPPLIERS_PAGE } = require('./suppliersPage');
 const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
-const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile } = require('./settings');
+const { CDLINK_PAGE } = require('./cdlinkPage');
+const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer } = require('./settings');
 const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
 const { readXlsxBuffer } = require('./xlsxread');
@@ -357,8 +358,10 @@ function calcAll(body) {
   const upliftRate = Number(body.selfUplift);
   const selfCostUplift = { rate: Number.isFinite(upliftRate) ? upliftRate : 0 }; // 自社コスト上乗せ%
   const over = Array.isArray(body.rows) ? body.rows : null; // 行ごとの上書き(改定額/ルール)
-  // 仕入先名（同一ファイル内は単一仕入先）— 商品紐付け辞書の引き当てに使う
-  const supplier = String((allRecs[0] && allRecs[0].makerSupplier) || '').trim();
+  // 仕入先名（同一ファイル内は単一仕入先）— 商品紐付け辞書の引き当て・画面の「🏢 仕入先」表示に使う。
+  //  レコードに makerSupplier が無いCSVもあるので、無ければファイル名の「<仕入先>_照合結果_…」から補完。
+  let supplier = String((allRecs[0] && allRecs[0].makerSupplier) || '').trim();
+  if (!supplier && body.file) supplier = String(body.file).split('_照合結果_')[0].trim();
   // 自社製造（メーカーコード9000＝日野折箱店）か。原価＝材料費で0扱い・既定は据置(keep_sell)で
   //  「値上げなのに同額」の要確認誤判定を避け（値上げは得意先別ページで手入力）、現単価は販売単価として扱う。
   const isSelfMade = String(((getMakers() || {})[supplier] || {}).purchaseCode || '').trim() === '9000';
@@ -373,6 +376,7 @@ function calcAll(body) {
     return !linkedMaker || linkedMaker === rec.makerName;
   });
 
+  const excludedCust = getExcludedCustomers(); // 取引終了などで除外設定された得意先（画面・損益・見積から外す）
   const rows = recs.map((rec, i) => {
     const o = over && over[i] ? over[i] : {};
     // 自社製造(9000)は原価0固定（仕入＝材料費・現単価は販売単価扱いで原価には入れない）。
@@ -403,7 +407,8 @@ function calcAll(body) {
     const __rk = (r.customerName || '') + '' + supplier + '' + __pk;
     const itemStatus = ((itemStatusMap[r.customerName] || {})[__rk] || {}).s || '';
     return {
-      itemStatus,
+      itemStatus, selfMade: isSelfMade, // 自社製造(9000)＝発注先バッジは材料仕入先が出て紛らわしいので画面側で「🏭 自社製造」に置換
+      supplier, // このメーカー見積の取り込み元（仕入先）＝行に常時持たせ、画面で「🏢 仕入先」を必ず出せるように
       customerName: r.customerName || '', customerCode: r.customerCode || '',
       productName: r.productName || '', productCode: r.productCode || '',
       productNameCore: (rec.masterName && String(rec.masterName).trim()) ? String(rec.masterName).trim() : ps.core, // DB直結時はマスタ商品名(クリーン)を優先＝1/120等のゴミを含まない
@@ -419,7 +424,7 @@ function calcAll(body) {
       switchDate: rec.switchDate || '',
       effectiveDate: (o.effectiveDate != null && String(o.effectiveDate).trim() !== '') ? String(o.effectiveDate).trim() : (rec.switchDate || ''),
     };
-  });
+  }).filter((r) => !(r.customerName && excludedCust[r.customerName])); // 除外設定の得意先の行を外す（休眠/未一致は得意先が無いので残る）
 
   // ---- 同一メーカー品で新仕入が複数ある重複の検知（メーカー見積側のデータ誤り）----
   //  同じメーカー品（品番。無ければメーカー商品名）に新仕入が2種以上あると、見積書出力では
@@ -506,6 +511,28 @@ function impactAllSuppliers(body) {
   };
 }
 
+// ---- 全仕入先 横断「★全部」表示 ---------------------------------------
+//  input/ の各仕入先 最新CSVを calcAll で計算し、全行を1リストに連結して返す（メイン表の「★全部」用）。
+//  各行に supplier（仕入先名）を付与＝どの仕入先のメーカー品かが分かる。
+//  並べ替え（一致品を先頭・得意先別／休眠を末尾）はクライアント側 renderMainRows で行う。
+//  ※calcAll と同じく全体方針（ルール/端数/自社上乗せ%）で計算。行ごとの上書きは扱わない（横断のため）。
+function calcAllSuppliers(body) {
+  const files = listLatestCsv();
+  const rule = body && body.rule ? body.rule : { type: 'add_increase' };
+  const rounding = body && body.rounding ? body.rounding : getSettings().rounding;
+  const selfUplift = body ? body.selfUplift : 0;
+  const rows = [];
+  for (const f of files) {
+    let data;
+    try { data = calcAll({ file: f, rule, rounding, selfUplift }); } catch (e) { continue; }
+    const sup = (data.supplier || (String(f).split('_照合結果_')[0]) || '').trim();
+    for (const r of data.rows) rows.push(Object.assign({ supplier: sup }, r));
+  }
+  const suppliers = getSuppliers();
+  // 紐付け辞書は仕入先ごとに異なる＝全部ビューでは行の matchStatus(📌) で確定判定するため空でよい。
+  return { rows, summary: summarizeRows(rows), supplier: '', productLinks: {}, makerNames: [], suppliers, allView: true };
+}
+
 // 二重登録検知：同じ自社商品コードが複数の仕入先（最新照合結果）にまたがって一致登録されていないか。
 //  例: 修正見積を別の仕入先名で取り込むと、同じ商品が2仕入先に出て損益/見積/CSVが二重になる。
 //  戻り値: [{ code, name, suppliers:[...], prices:{supplier:newCost} }]（2仕入先以上に出た商品だけ）。
@@ -539,6 +566,7 @@ function crossSupplierDupCheck() {
 //  自社CD×メーカー品番 で重複排除。休眠でも品番がある行は自社CD不明なので件数だけ数える（人が確認）。
 function buildCdCandidates() {
   const files = listLatestCsv();
+  const review = getCdReview(); // 人が確定/却下したものは候補から消す
   const fileRecs = [];
   // 先に「既にCD一致しているメーカー品番」を集める＝その品番は正しい自社品に当たっている。
   //  同じ品番が別の自社品に名前一致しているのは“別サイズ/別品の取り違え”なので候補から除外する。
@@ -561,6 +589,8 @@ function buildCdCandidates() {
       if (!/名前一致/.test(st)) continue; // CD一致・手動紐付けは確定済み＝対象外
       if (!makerCode || !selfCode || /^0+$/.test(selfCode)) continue;
       if (cdMakerCodes.has(makerCode)) continue; // その品番は既に正しい自社品にCD一致済み＝別品への取り違え候補なので除外
+      if (review.confirmed[sup] && review.confirmed[sup][selfCode]) continue; // 確定済み(登録済み)は消す
+      if (review.rejected[sup] && review.rejected[sup][selfCode + "|" + makerCode]) continue; // 却下済みは消す
       const key = selfCode + '' + makerCode;
       if (seen.has(key)) continue; seen.add(key);
       const m = st.match(/(\d+)\s*%/);
@@ -1457,6 +1487,25 @@ function aggregateCustomers(opts) {
   return { customers, fileCount, errors, applied };
 }
 
+// 得意先 除外設定モーダル用データ：
+//  active  = いま照合に出ている得意先（＝除外候補。既に除外済みの先は calcAll で消えるので出ない）。
+//            最終売上日・取引有無も付ける＝「取引が無い先」を見つけやすく。
+//  excluded= 現在 除外中の得意先（名前＋除外日時）。ここから「復活」できる。
+function customerExclusionData() {
+  let active = [];
+  try {
+    const agg = aggregateCustomers({});
+    active = (agg.customers || []).map((c) => ({
+      name: c.name, code: c.code || '', lastDate: c.lastDate || '',
+      hasRecent: !!c.hasRecent, productCount: c.productCount || 0, supplierCount: c.supplierCount || 0,
+    }));
+  } catch (e) { active = []; }
+  const ex = getExcludedCustomers();
+  const excluded = Object.keys(ex).map((name) => ({ name, at: ex[name] }))
+    .sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
+  return { active, excluded };
+}
+
 // /customers からの見積書出力。doIssue=false=発行前チェック（要確認の一覧を返すだけ・書かない）、
 //  true=実発行（得意先ごと1枚のxlsxを書く。要確認行は本体から除外＝「発行ストップ→確認」運用の受け皿）。
 //  scope: 'all'（全得意先）/ 'one'（opts.customer の1得意先）。
@@ -1805,6 +1854,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url === '/customers') {
       const buf = Buffer.from(CUSTOMERS_PAGE, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
+      return res.end(buf);
+    }
+    if (req.method === 'GET' && url === '/cdlink') {
+      const buf = Buffer.from(CDLINK_PAGE, 'utf8');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
       return res.end(buf);
     }
@@ -2160,6 +2214,20 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       return sendJson(res, 200, calcAll(body));
     }
+    if (req.method === 'POST' && url === '/api/calc-all') {
+      const body = await readBody(req);
+      return sendJson(res, 200, calcAllSuppliers(body));
+    }
+    if (req.method === 'GET' && url === '/api/customer-list') {
+      return sendJson(res, 200, customerExclusionData());
+    }
+    if (req.method === 'POST' && url === '/api/exclude-customer') {
+      const body = await readBody(req);
+      const customer = String((body && body.customer) || '').trim();
+      if (!customer) return sendJson(res, 200, { ok: false, error: '得意先名が空です' });
+      setExcludedCustomer(customer, !!(body && body.exclude));
+      return sendJson(res, 200, Object.assign({ ok: true }, customerExclusionData()));
+    }
     if (req.method === 'POST' && url === '/api/impact-all') {
       const body = await readBody(req);
       return sendJson(res, 200, impactAllSuppliers(body));
@@ -2210,6 +2278,72 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url === '/api/link-context') {
       try { const sp = new URLSearchParams(req.url.split('?')[1] || ''); return sendJson(res, 200, linkContext(sp.get('supplier') || '')); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    // --- コード化（初期登録）レビュー ---
+    if (req.method === 'POST' && url === '/api/cd-confirm') {
+      // 候補を確定：productLinks に登録（↻照合で手動紐付けに）＋ メーカー品番を記録（書き戻しCSV用）。
+      const body = await readBody(req);
+      const sup = String((body && body.supplier) || '').trim();
+      const sc = String((body && body.selfCode) || '').trim();
+      if (!sup || !sc) return sendJson(res, 200, { ok: false, error: 'supplier と selfCode は必須です' });
+      try { confirmCdLink(sup, sc, (body && body.makerCode) || '', (body && body.makerName) || ''); return sendJson(res, 200, { ok: true }); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    if (req.method === 'POST' && url === '/api/cd-reject') {
+      const body = await readBody(req);
+      const sup = String((body && body.supplier) || '').trim();
+      const sc = String((body && body.selfCode) || '').trim();
+      if (!sup || !sc) return sendJson(res, 200, { ok: false, error: 'supplier と selfCode は必須です' });
+      try { rejectCdLink(sup, sc, (body && body.makerCode) || ''); return sendJson(res, 200, { ok: true }); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    if (req.method === 'POST' && url === '/api/cd-unconfirm') {
+      const body = await readBody(req);
+      const sup = String((body && body.supplier) || '').trim();
+      const sc = String((body && body.selfCode) || '').trim();
+      if (!sup || !sc) return sendJson(res, 200, { ok: false, error: 'supplier と selfCode は必須です' });
+      try { unconfirmCdLink(sup, sc); return sendJson(res, 200, { ok: true }); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    if (req.method === 'GET' && url === '/api/cd-confirmed') {
+      // 確定済み一覧（書き戻し前の確認用）。{ items:[{supplier,selfCode,makerCode,makerName,at}], count }
+      try {
+        const rv = getCdReview();
+        const items = [];
+        for (const sup of Object.keys(rv.confirmed || {})) {
+          for (const sc of Object.keys(rv.confirmed[sup] || {})) {
+            const e = rv.confirmed[sup][sc] || {};
+            items.push({ supplier: sup, selfCode: sc, makerCode: e.code || '', makerName: e.name || '', at: e.at || '' });
+          }
+        }
+        items.sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.selfCode).localeCompare(String(b.selfCode)));
+        return sendJson(res, 200, { ok: true, items, count: items.length });
+      } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), items: [], count: 0 }); }
+    }
+    if (req.method === 'GET' && url === '/api/cd-register.csv') {
+      // 確定済みを「商品マスタ取込用」CSV（UTF-8 BOM）に。商品コード＋メーカー品番（商品名3へ登録）。
+      //  ※販売大臣の商品マスタ取込フォーマット（列名/SJIS要否）は実機で要確認＝まずは汎用CSV。
+      try {
+        const rv = getCdReview();
+        const cell = (v) => { const s = (v == null ? '' : String(v)); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+        const lines = [['商品コード', '商品名3（メーカー品番）', '現商品名（参考）', '仕入先'].join(',')];
+        for (const sup of Object.keys(rv.confirmed || {})) {
+          for (const sc of Object.keys(rv.confirmed[sup] || {})) {
+            const e = rv.confirmed[sup][sc] || {};
+            lines.push([sc, e.code || '', e.name || '', sup].map(cell).join(','));
+          }
+        }
+        const buf = Buffer.from('﻿' + lines.join('\r\n'), 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="cd_register.csv"; filename*=UTF-8\'\'' + encodeURIComponent('商品名3登録用.csv'),
+          'Content-Length': buf.length,
+        });
+        return res.end(buf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('export error: ' + String(e && e.message || e));
+      }
     }
     if (req.method === 'GET' && url === '/api/self-products') {
       // 休眠（メーカー品が未マッチ）の手動紐付け用：販売実績の自社品（自社CD）候補を返す。
@@ -2290,7 +2424,7 @@ if (require.main === module) {
   startOrReuse();
 }
 
-module.exports = { calcAll, impactAllSuppliers, exportQuotes, saveMakerQuote, server };
+module.exports = { calcAll, calcAllSuppliers, impactAllSuppliers, exportQuotes, saveMakerQuote, server };
 
 // =====================================================================
 //  画面（HTML/CSS/JS をひとまとめ。外部ファイル不要）
@@ -2479,6 +2613,7 @@ const PAGE = `<!doctype html>
   <h1>価格転嫁シミュレーション</h1>
   <span class="sub">メーカー改定額を入れて、転嫁後の単価・粗利・年間影響を試算</span>
   <button id="calBtn" style="margin-left:auto" title="実施日カレンダーの表示／非表示を切り替えます（常にページ上部に表示されています）">📅 実施日カレンダー</button>
+  <button id="exclBtn" style="margin-left:0" title="すでに取引が無いのに照合に出てくる得意先を、画面・損益・見積書から隠します（いつでも復活できます）">🚫 得意先 除外設定</button>
   <a href="/manual" id="manualLink" target="_blank" style="margin-left:0" title="このツールの使い方手順書を新しいタブで開きます">📖 使い方</a>
   <a href="/list" id="listLink" style="margin-left:0">📊 一覧・進捗</a>
   <a href="/import" id="importLink" style="margin-left:0">＋ メーカー見積取込</a>
@@ -2679,6 +2814,7 @@ let baseRows = [];      // 画面の行構造（ファイル読込時に確定�
 let lastSummary = null; // 直近の集計（選択中ファイルのみ。カード表示に使用）
 let allImpact = null;   // 全仕入先 横断の損益インパクト（損益パネルが ΔC/ΔS に使用）
 let dateFilter = null;  // 実施日カレンダーで選んだ日(YYYY-MM-DD)。非nullの間は「全仕入先・その実施日」読み取り表示。
+let allView = false;    // 「★全部（全仕入先まとめ）」表示中か。trueなら行ごとに仕入先名を表示＋紐付けは行の仕入先で処理。
 let currentSupplier = ''; // 現在表示中の照合結果CSVの仕入先名（productLinks 引き当てに使用）
 let currentLinks = {};    // 現在の仕入先の productLinks（{自社CD: メーカー商品名}）
 let allMakerNames = [];   // 編集モーダルのドロップダウン候補
@@ -2720,6 +2856,9 @@ function matchPctCell(r){
 
 // 商品名セルのHTML。自社とメーカーの紐付けを2行で並べ、違いを視覚化。
 // 発注先（仕入先コード末尾"13"等）が分かれば、その名前(朝日食品容器等)も併記。
+// 会社名のゆれ（空白・㈱/株式会社 等）を除いて比較できる形に。
+function normSupName(s){ return String(s||'').replace(/[\\s　]/g,'').replace(/株式会社|有限会社|㈱|㈲|（株）|（有）/g,''); }
+function sameSupplier(a,b){ a=normSupName(a); b=normSupName(b); if(!a||!b) return false; return a===b||a.indexOf(b)>=0||b.indexOf(a)>=0; }
 function buildProdNameHtml(r){
   const selfCode = r.productCode ? ('<span style="color:#1976d2;font-weight:600">['+esc(r.productCode)+']</span> ') : '';
   const selfName = r.productNameCore ? esc(r.productNameCore) : (r.productName && r.productName!=='-' ? esc(r.productName) : '');
@@ -2727,18 +2866,35 @@ function buildProdNameHtml(r){
   const mkCode = r.makerCode ? '['+esc(r.makerCode)+'] ' : '';
   const mkName = r.makerName ? esc(r.makerName) : '';
   const status = r.matchStatus ? ' <span style="color:#888;font-size:11px">'+esc(r.matchStatus)+'</span>' : '';
-  // 発注先(末尾コード) → 仕入先マスタで名前解決
-  let purchaseBadge = '';
-  if (r.supplierIdEmbed) {
+  // 仕入先バッジ：
+  //  ・自社製造(9000) → 「🏭 自社製造」
+  //  ・仕入れ品 → 「🏢 {仕入先}」＝このメーカー見積の取り込み元（必ず分かる）。
+  //    過去伝票の発注先(埋め込みコード)が仕入先と違うときだけ、小さく「（過去発注先: …）」を添える
+  //    （同じ／無いときは出さない＝重複や紛らわしさを避ける）。
+  let supplierBadge = '';
+  if (r.selfMade) {
+    supplierBadge = ' <span style="color:#1b6b3a;background:#eaf6ee;padding:1px 6px;border-radius:999px;font-size:11px" title="自社製造品（日野折箱店）。原価は材料費＝0扱い。過去伝票の発注先は材料仕入先なので表示しません">🏭 自社製造</span>';
+  } else if (r.supplier) {
+    supplierBadge = ' <span style="color:#1f6fb2;background:#eaf2fb;padding:1px 6px;border-radius:999px;font-size:11px" title="このメーカー見積の取り込み元＝仕入先">🏢 '+esc(r.supplier)+'</span>';
+    if (r.supplierIdEmbed) {
+      const code4 = String(r.supplierIdEmbed).padStart(4, '0');
+      const sup = currentSuppliers[code4];
+      const nm = sup && sup.name ? sup.name : '';
+      if (nm && !sameSupplier(nm, r.supplier)) {
+        supplierBadge += ' <span style="color:#888;font-size:11px" title="自社販売実績の末尾コード＝過去伝票の発注先（仕入先と異なる）">（過去発注先: '+esc(code4)+' '+esc(nm)+'）</span>';
+      }
+    }
+  } else if (r.supplierIdEmbed) {
+    // 仕入先名が不明な稀なケースのフォールバック＝発注先で代用
     const code4 = String(r.supplierIdEmbed).padStart(4, '0');
     const sup = currentSuppliers[code4];
     const labelName = sup && sup.name ? sup.name : '';
-    purchaseBadge = ' <span style="color:#7a5a00;background:#fff4d6;padding:1px 6px;border-radius:999px;font-size:11px" title="自社販売実績の末尾コード＝発注先">🏢 '+esc(code4)+(labelName?' '+esc(labelName):'')+'</span>';
+    supplierBadge = ' <span style="color:#7a5a00;background:#fff4d6;padding:1px 6px;border-radius:999px;font-size:11px" title="自社販売実績の末尾コード＝発注先">🏢 '+esc(code4)+(labelName?' '+esc(labelName):'')+'</span>';
   }
   if (isUnmatched(r)) {
-    return '<span style="color:#aa6">［メーカー品］</span>'+mkCode+mkName+status;
+    return '<span style="color:#aa6">［メーカー品］</span>'+mkCode+mkName+status+supplierBadge;
   }
-  const line1 = selfCode + selfName + supCode + purchaseBadge;
+  const line1 = selfCode + selfName + supCode + supplierBadge;
   const line2 = mkName
     ? '<div style="color:#5a6975;font-size:12px;margin-top:2px">└メーカー: '+mkCode+mkName+'</div>'
     : '';
@@ -2754,12 +2910,83 @@ function custCellHtml(r){
     +'style="color:#1b6b3a;text-decoration:none;border-bottom:1px dotted #6aa97f">'+esc(nm)+'</a></td>';
 }
 
+// ===== 得意先 除外設定（取引終了の先を隠す／復活する）=====================
+let exclData = { active:[], excluded:[] };
+function exclRender(){
+  const si0=$('#exclSearch'); const q=(si0?si0.value:'').trim().toLowerCase();
+  const norm = (s)=>String(s||'').toLowerCase();
+  // active：取引なし(直近約1年 数量0)を先頭、その後 最終売上が古い順＝隠す候補を見つけやすく
+  const active = exclData.active.slice().filter(c=> !q || norm(c.name).indexOf(q)>=0 || norm(c.code).indexOf(q)>=0)
+    .sort((a,b)=>{ if(a.hasRecent!==b.hasRecent) return a.hasRecent?1:-1; return String(a.lastDate||'').localeCompare(String(b.lastDate||'')); });
+  const ex = exclData.excluded.slice().filter(c=> !q || norm(c.name).indexOf(q)>=0);
+  let h = '';
+  h += '<div style="font-size:12px;color:#6b7785;margin-bottom:8px">すでに取引が無いのに照合に出てくる得意先を隠せます。隠した先は<b>メイン画面・損益・得意先別・見積書</b>から外れます。いつでも「復活」で戻せます。</div>';
+  h += '<input id="exclSearch" placeholder="🔍 得意先名・コードで絞り込み" style="width:100%;padding:6px;margin-bottom:8px;border:1px solid #c7ced8;border-radius:4px;font:inherit;box-sizing:border-box" value="'+esc(q)+'">';
+  h += '<div style="font-weight:700;margin:6px 0 4px">🚫 除外中（'+ex.length+'件）</div>';
+  if(!ex.length) h += '<div style="font-size:12px;color:#aaa;margin-bottom:10px">（なし）</div>';
+  else { h += '<div style="max-height:140px;overflow:auto;border:1px solid #eee;border-radius:6px;margin-bottom:12px">';
+    ex.forEach(c=>{ h += '<div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid #f3f3f3"><span style="flex:1">'+esc(c.name)+'</span><button class="exclRestore" data-name="'+esc(c.name)+'" style="font-size:12px;background:#2f6fb0;color:#fff;border:none;border-radius:6px;padding:3px 10px;cursor:pointer">↩ 復活</button></div>'; });
+    h += '</div>'; }
+  h += '<div style="font-weight:700;margin:6px 0 4px">照合に出ている得意先（'+active.length+'件）<span style="font-weight:400;font-size:11px;color:#888"> ※赤＝直近約1年 取引なし</span></div>';
+  h += '<div style="max-height:300px;overflow:auto;border:1px solid #eee;border-radius:6px"><table style="width:100%;border-collapse:collapse;font-size:12px">';
+  h += '<thead><tr style="background:#f6f6f6"><th style="text-align:left;padding:4px 8px">得意先</th><th style="padding:4px 8px">最終売上</th><th style="padding:4px 8px">品数</th><th style="padding:4px 8px"></th></tr></thead><tbody>';
+  active.forEach(c=>{
+    const no = !c.hasRecent;
+    const last = c.lastDate ? String(c.lastDate).slice(0,7) : '—';
+    h += '<tr style="border-bottom:1px solid #f3f3f3'+(no?';background:#fdecec':'')+'">'
+      + '<td style="padding:4px 8px">'+esc(c.name)+(c.code?' <span style="color:#aaa">['+esc(c.code)+']</span>':'')+(no?' <span style="color:#c0392b;font-size:10px">取引なし</span>':'')+'</td>'
+      + '<td style="padding:4px 8px;text-align:center;color:'+(no?'#c0392b':'#555')+'">'+last+'</td>'
+      + '<td style="padding:4px 8px;text-align:center">'+c.productCount+'</td>'
+      + '<td style="padding:4px 8px;text-align:center"><button class="exclHide" data-name="'+esc(c.name)+'" style="font-size:12px;background:#fff;border:1px solid #c0392b;color:#c0392b;border-radius:6px;padding:3px 10px;cursor:pointer">🚫 隠す</button></td>'
+      + '</tr>';
+  });
+  if(!active.length) h += '<tr><td colspan="4" style="padding:10px;color:#aaa;text-align:center">該当なし</td></tr>';
+  h += '</tbody></table></div>';
+  $('#exclBody').innerHTML = h;
+  const si=$('#exclSearch'); if(si){ si.addEventListener('input', exclRender); si.focus(); si.setSelectionRange(si.value.length, si.value.length); }
+  $('#exclBody').querySelectorAll('.exclHide').forEach(b=> b.addEventListener('click', ()=> exclToggle(b.dataset.name, true)));
+  $('#exclBody').querySelectorAll('.exclRestore').forEach(b=> b.addEventListener('click', ()=> exclToggle(b.dataset.name, false)));
+}
+async function exclToggle(name, exclude){
+  try{
+    const res = await fetch('/api/exclude-customer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name, exclude})}).then(x=>x.json());
+    if(!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
+    exclData = { active:res.active||[], excluded:res.excluded||[] };
+    exclRender();
+    // メイン表・損益を最新に（除外結果を即反映）
+    if(allView) loadAll(); else if(!dateFilter) loadFile();
+    loadAllImpact();
+  }catch(e){ alert('通信に失敗: '+e); }
+}
+async function openExcludeModal(){
+  let data;
+  try{ data = await fetch('/api/customer-list').then(x=>x.json()); }
+  catch(e){ alert('得意先一覧の取得に失敗: '+e); return; }
+  exclData = { active:data.active||[], excluded:data.excluded||[] };
+  const wrap=document.createElement('div');
+  wrap.innerHTML =
+    '<div id="exclBack" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9000"></div>'+
+    '<div id="exclDlg" style="position:fixed;top:5%;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;padding:18px;width:680px;max-width:95%;z-index:9001;box-shadow:0 10px 40px rgba(0,0,0,.2)">'+
+      '<div style="display:flex;align-items:center;margin-bottom:10px"><h3 style="margin:0;flex:1">🚫 得意先 除外設定</h3><button id="exclClose" style="font-size:13px;border:1px solid #ccc;background:#fff;border-radius:6px;padding:4px 10px;cursor:pointer">閉じる</button></div>'+
+      '<div id="exclBody"></div>'+
+    '</div>';
+  document.body.appendChild(wrap);
+  const close=()=>wrap.remove();
+  $('#exclBack').addEventListener('click', close);
+  $('#exclClose').addEventListener('click', close);
+  exclRender();
+}
 async function loadFiles(selectFile){
   const r = await fetch('/api/files').then(x=>x.json());
   const sel = $('#file'); sel.innerHTML='';
+  if(r.files && r.files.length){
+    // 先頭に「★全部（全仕入先まとめ）」＝取り込んでいる全件を1つの表に。既定もこれ。
+    const oAll=document.createElement('option'); oAll.value='*ALL*'; oAll.textContent='★ 全部（全仕入先まとめて表示）'; sel.appendChild(oAll);
+  }
   (r.files||[]).forEach(f=>{ const o=document.createElement('option'); o.value=f; o.textContent=f; sel.appendChild(o); });
   if(!r.files || !r.files.length){ $('#msg').textContent='input フォルダに照合結果CSVがありません。「↻ 照合を実行」でメーカー見積から作れます。'; return; }
-  if(selectFile && r.files.indexOf(selectFile)>=0) sel.value=selectFile;
+  // 指定があればその仕入先ファイル、無ければ既定＝★全部。
+  sel.value = (selectFile && r.files.indexOf(selectFile)>=0) ? selectFile : '*ALL*';
   await loadFile();
 }
 // メーカー見積×販売実績を照合し、新しい照合結果CSVを作って読み込む
@@ -2794,8 +3021,7 @@ function buildMainRow(r, i, readOnly){
   const tr = document.createElement('tr');
   tr.id='row'+i;
   if(isUnmatched(r)) tr.className='unmatched';
-  let prodName = buildProdNameHtml(r);
-  if(readOnly && r.supplier) prodName += '<div style="font-size:10px;color:#1f6fb2;margin-top:2px">🏢 '+esc(r.supplier)+'</div>';
+  let prodName = buildProdNameHtml(r); // 仕入先は商品名内の「🏢 仕入先」バッジで全ビュー共通に表示（buildProdNameHtml）
   if(readOnly) prodName += progressBadge(r.itemStatus);
   // メイン画面は照合・紐付けの確認用＝価格は編集しない（改定後仕入は読み取り表示）。
   //  価格の設定・行ごとの転嫁ルールは得意先別ページに集約した。
@@ -2819,16 +3045,41 @@ function buildMainRow(r, i, readOnly){
     '<td class="r" id="asi'+i+'"></td>';
   return tr;
 }
+// 区切り見出しの行（一致品／休眠の境目）。セルIDを持たないので updateView は素通り。
+function sectionHeaderRow(text, bg, fg){
+  const tr=document.createElement('tr'); tr.className='secthead';
+  tr.innerHTML='<td colspan="15" style="background:'+bg+';color:'+fg+';font-weight:700;font-size:12px;padding:6px 10px;border-top:2px solid '+fg+'">'+text+'</td>';
+  return tr;
+}
 // baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
+//  並び順：①一致品（得意先別＝同じ得意先がまとまる）を先頭、②休眠・未一致を末尾、の2ブロックに分ける。
+//  ※並べ替えても buildMainRow には元のインデックス i を渡す（セルIDが updateView と対応＝値がズレない）。
 function renderMainRows(readOnly){
   const tb = $('#tbody'); tb.innerHTML='';
   // 見積書を作成済み（提出済み）の行は通常表示では出さない（作業中の品だけに絞る）。
   //  ※実施日カレンダーの横断（読み取り）ビューでは進捗確認のため従来どおり表示する。
   let hiddenIssued=0;
+  const matched=[], dormant=[];
   baseRows.forEach((r,i)=>{
     if(!readOnly && r.itemStatus==='issued'){ hiddenIssued++; return; }
-    tb.appendChild(buildMainRow(r, i, readOnly));
+    (isUnmatched(r)?dormant:matched).push(i);
   });
+  const col = new Intl.Collator('ja');
+  // 一致品＝得意先別（同名がまとまる）→ 仕入先 → 商品名 で安定ソート
+  matched.sort((a,b)=> col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
+    || col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
+    || col.compare(baseRows[a].productName||'', baseRows[b].productName||''));
+  // 休眠＝仕入先 → メーカー商品名 で並べる（誰の未一致品か分かりやすく）
+  dormant.sort((a,b)=> col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
+    || col.compare(baseRows[a].makerName||'', baseRows[b].makerName||''));
+  if(matched.length){
+    tb.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（得意先別に並べています）', '#eaf6ee', '#1b6b3a'));
+    matched.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
+  }
+  if(dormant.length){
+    tb.appendChild(sectionHeaderRow('💤 休眠・未一致 '+dormant.length+'件（販売実績なし／商品名が一致せず＝見積対象外。紐付けで救済できます）', '#f1f1f1', '#7a7a7a'));
+    dormant.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
+  }
   const note=$('#issuedHideNote');
   if(note){
     if(hiddenIssued && !readOnly){ note.style.display=''; note.innerHTML='✅ <b>見積書 作成済み '+hiddenIssued+' 件</b>は非表示です（提出済み）。得意先別ページの「✅提出済み」で確認・対象へ戻せます。'; }
@@ -2838,8 +3089,27 @@ function renderMainRows(readOnly){
   // 紐付けボタンは読み取り（実施日フィルタ）ビューでも有効（openLinkModal が行の仕入先で処理）
   tb.querySelectorAll('.linkBtn').forEach(el=> el.addEventListener('click', (e)=> openLinkModal(Number(e.currentTarget.dataset.i))));
 }
+// 「★全部」＝全仕入先まとめて1つの表に（取り込んでいる全件）。
+async function loadAll(){
+  clearDateFilter();
+  $('#msg').textContent='';
+  const s = settings();
+  const res = await fetch('/api/calc-all',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ rule:s.rule, rounding:s.rounding, selfUplift:s.selfUplift })}).then(x=>x.json());
+  if(res.error){ $('#msg').textContent='エラー: '+res.error; return; }
+  allView = true;
+  baseRows = res.rows;
+  currentSupplier = ''; currentLinks = {};
+  allMakerNames = res.makerNames || [];
+  currentSuppliers = res.suppliers || {};
+  renderMainRows(false); // 全部ビューでも提出済みは隠す＝作業中の品だけ
+  updateView(res.rows, res.summary);
+  syncHScroll();
+}
 // ファイルを読み込み、表の“構造”を作る（入力欄やルール選択を配置）
 async function loadFile(){
+  if($('#file').value==='*ALL*'){ return loadAll(); } // ★全部 を選んだら横断表示へ
+  allView = false;
   clearDateFilter(); // 通常のファイル表示に入る＝実施日フィルタは解除
   $('#msg').textContent='';
   const s = settings();
@@ -2943,8 +3213,8 @@ function linkDecisiveDiff(selfCore, maker){
 //     ＝休眠（メーカー品が自社品に1つも当たっていない）を、画面から直接 手動紐付けで救済できる。
 async function openLinkModal(idx){
   const r = baseRows[idx]; if(!r) return;
-  // 仕入先の確定（横断ビューは行の仕入先、通常は選択中ファイルの仕入先）
-  const supplier = dateFilter ? (r.supplier || '') : (currentSupplier || '');
+  // 仕入先の確定（横断ビュー・★全部ビューは行の仕入先、通常は選択中ファイルの仕入先）
+  const supplier = (dateFilter || allView) ? (r.supplier || '') : (currentSupplier || '');
   if (!supplier){ alert('仕入先が確定できない行です（紐付けは保存できません）'); return; }
   const mode = r.productCode ? 'maker' : 'self';
   if (mode === 'self' && !r.makerName){ alert('この行はメーカー商品名が無いため紐付けできません'); return; }
@@ -3076,7 +3346,7 @@ async function openLinkModal(idx){
         // 休眠の解消は再照合が必要（紐付けた自社品は今のCSVに居ないため、その場再描画では出ない）
         $('#msg').textContent='📌 紐付けを保存しました（'+v+' ⇔ '+(r.makerName||'')+'）。「↻ 照合を実行」で休眠が解消されます。';
         if (confirm('📌 紐付けを保存しました。\\n今すぐ照合して反映しますか？（販売実績の読み込みに数秒かかります）')) await runShogo();
-      } else if (dateFilter) { await loadByDate(dateFilter); } else { await loadFile(); } // 横断ビューはその日を再描画
+      } else if (dateFilter) { await loadByDate(dateFilter); } else if (allView) { await loadAll(); } else { await loadFile(); } // 横断/★全部 はその表を再描画
     } catch (e) { alert('保存に失敗: '+e); }
   });
 }
@@ -3084,6 +3354,7 @@ async function openLinkModal(idx){
 // 現在の画面値を集めてサーバへ → 計算結果のセルだけ更新
 async function recalc(){
   if(dateFilter){ await loadByDate(dateFilter); return; } // 実施日フィルタ中は横断ビューを方針変更で取り直す
+  if(allView){ await loadAll(); return; }                 // ★全部 表示中は全仕入先を方針変更で取り直す
   const s = settings();
   const rows = baseRows.map((_,i)=>{
     // 提出済みなどで非表示の行は入力欄が無い → 空で送る（サーバは rec の値で再計算）。
@@ -3598,6 +3869,7 @@ $('#dateFilterClear').addEventListener('click', ()=>{
 });
 // カレンダーの操作配線（常時表示パネル）
 $('#calBtn').addEventListener('click', toggleCalPanel);
+$('#exclBtn').addEventListener('click', openExcludeModal);
 $('#calToggle').addEventListener('click', toggleCalPanel);
 // 当日バナーをクリック＝畳んでいれば開き、本日の改定をその場で表示（カレンダーへスクロール）
 $('#calTodayBanner').addEventListener('click', (e)=>{
@@ -3707,8 +3979,9 @@ async function loadCdCandidates(){
     box.style.display='block';
     box.innerHTML='🏷 <b>メーカー品番を商品マスタ(商品名3)に登録すると「CD一致(高精度)」にできる品 '+r.count+'件</b>'
       +(r.dormantWithCode?'（ほか 品番ありの休眠 '+r.dormantWithCode+'件＝自社品の確認が必要）':'')
+      +' <a class="dl" href="/cdlink">🏷 コード化ページで1件ずつ確定 →</a>'
       +' <a class="dl" href="/api/cd-candidates.csv" download>📥 候補CSV</a>'
-      +'<div style="font-size:11px;margin-top:3px;color:#3a567a">CSVを確認 → 販売大臣の商品マスタ取込で「商品名3」に登録 → 「↻ 照合を実行」でCD一致に昇格します（今は名前一致＝確度は高いが、CDにすると確実）。</div>';
+      +'<div style="font-size:11px;margin-top:3px;color:#3a567a">「コード化ページ」で1件ずつ確認→確定（確定はすぐ手動紐付けで効きます）→ たまったら商品名3登録用CSVで販売大臣に登録 → 「↻ 照合を実行」でCD一致に昇格。</div>';
   }catch(e){ box.style.display='none'; }
 }
 (async ()=>{
