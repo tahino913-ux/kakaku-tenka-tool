@@ -195,6 +195,32 @@ function colorMismatch(makerName, selfName) {
   return true;
 }
 
+// ラテン1〜2文字サイズ（S/M/L/SS/LL/2L/3L 等）を“独立トークン”として抽出する。
+//  色マーカー(colorMarkersIn)と同じ思想：両側に明示サイズがあり共有が0なら「サイズ違い＝別商品」。
+//  背景：tokenize は1文字ラテンを捨てるため「ﾊﾞｯｸﾞ S」↔「ﾊﾞｯｸﾞ L」が本体トークンだけで100%一致して
+//        サイズ取り違えになる。ここで明示サイズだけを境界付きで拾い、別サイズの名前一致を除外する。
+//  ※ 漢字サイズ(大/中/小/特)は isCriticalToken で既に区別されるのでここではラテン専用。
+//  ※ 区切りは「空白・カッコ・かな漢字の境界」＝まるごと1語がサイズのときだけ採用。
+//     ハイフン内(M20-16 / L-50)は1語のままなので拾わない＝品番プレフィックスを誤ってサイズ扱いしない。
+const SIZE_TOKEN_RE = /^[0-9]?(?:LL|SS|S|M|L)$/;
+function latinSizeMarkers(name) {
+  const out = new Set();
+  // 空白・各種カッコ・読点で区切る（ハイフンは区切らない＝品番を割らない）。
+  const toks = nfkc(String(name || '')).toUpperCase().split(/[\s　()（）\[\]【】「」『』、,]+/);
+  for (const t of toks) { if (t && SIZE_TOKEN_RE.test(t)) out.add(t); }
+  return out;
+}
+// 両側に明示サイズがあり、共有が1つも無ければ「サイズ違い」（別商品）と判定。
+//  片側にしかサイズが無い/どちらも無いときは不確定 → false（取りこぼし防止＝従来通り照合させる）。
+function sizeMismatch(makerName, selfName) {
+  const a = latinSizeMarkers(makerName);
+  if (!a.size) return false;
+  const b = latinSizeMarkers(selfName);
+  if (!b.size) return false;
+  for (const t of a) if (b.has(t)) return false;
+  return true;
+}
+
 // 名前一致スコア(%)：メーカー名のトークンのうち、販売実績名に含まれる割合。
 //  事前に「品番アンカー」が rec に完全一致しているかを判定し、tokenFoundへ渡す。
 //  ※ 決定的トークン(サイズ/部位/数字)が自社側にない場合、スコアは 50% に抑える
@@ -372,6 +398,10 @@ function matchOne(item, hanbai, opts = {}) {
       Number.isFinite(item.currentCost) && item.currentCost > 0 && r.currentSell < item.currentCost;
     let pmTag = false;
     if (!cd && !isLink) {
+      // サイズ違いガード：両側に明示サイズ(S/M/L等)があり食い違う名前一致は別商品として除外。
+      //  例「ﾆｭｰｲｰｼﾞｰﾊﾞｯｸﾞﾊﾞｲｵ25 S」↔ 自社「…ﾊﾞｲｵ25 L」の100%取り違えを防ぐ。
+      //  CD一致・手動紐付けは上で確定済み＝この除外を受けない（高信頼を尊重）。
+      if (sizeMismatch(item.makerName, r.productName)) continue;
       if (belowCost && ns < priceVetoBelow) continue; // 赤字 × 弱い一致 → 除外
       if (pm === true && !colorMis) {
         // 価格一致：抑制原因が英字ブランド語だけなら抑制を解除して救済（英↔カナ表記差を救う）。
@@ -474,4 +504,4 @@ function toCsv(rows) {
   return '﻿' + lines.join('\r\n');
 }
 
-module.exports = { matchAll, matchOne, nameScore, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER, padSelfCode };
+module.exports = { matchAll, matchOne, nameScore, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER, padSelfCode, latinSizeMarkers, sizeMismatch };
