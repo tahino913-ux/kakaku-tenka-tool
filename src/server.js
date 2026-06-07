@@ -2733,11 +2733,6 @@ const PAGE = `<!doctype html>
       <button id="shogoBtn" class="ghost" style="white-space:nowrap" title="maker_quotes に取り込んだメーカー見積を販売実績と照合し、新しい照合結果CSVを作ります（販売実績が旧Excelなら自動変換）">↻ 照合を実行</button>
     </div>
     <span id="shogoMsg" style="font-size:11px;color:#6b7785"></span></div>
-  <div class="field" style="flex:1;min-width:220px"><label>転嫁ルール（全体方針）</label>
-    <div style="font-size:12px;color:#5a6b7d;line-height:1.5">
-      価格の計算ルール（転嫁ルール・端数・自社上乗せ%）は <b>⚙ 設定</b> に集約しました。<br>
-      損益は設定の全体方針で自動計算します。<span class="hint">個別の価格・見積書は「得意先別ページ」で。</span>
-    </div></div>
 </div>
 
 <!-- 見積書作成への導線（メインは照合確認用 → 見積書は得意先別ページで）。独立バナーで目立たせる。 -->
@@ -2796,7 +2791,7 @@ const PAGE = `<!doctype html>
   <thead><tr>
     <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th>商品名</th><th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
     <th class="r">現仕入</th><th class="c">改定後 仕入単価</th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
-    <th class="c">年間数量</th><th class="r">仕入 年影響</th><th class="r">増収 年影響</th>
+    <th class="c">年間数量</th><th class="r">仕入 年影響</th>
   </tr></thead>
   <tbody id="tbody"></tbody>
 </table></div>
@@ -3089,14 +3084,13 @@ function buildMainRow(r, i, readOnly){
     costCell+
     '<td class="r" id="ci'+i+'"></td>'+
     '<td class="c" id="qt'+i+'"></td>'+
-    '<td class="r" id="aci'+i+'"></td>'+
-    '<td class="r" id="asi'+i+'"></td>';
+    '<td class="r" id="aci'+i+'"></td>';
   return tr;
 }
 // 区切り見出しの行（一致品／休眠の境目）。セルIDを持たないので updateView は素通り。
 function sectionHeaderRow(text, bg, fg){
   const tr=document.createElement('tr'); tr.className='secthead';
-  tr.innerHTML='<td colspan="10" style="background:'+bg+';color:'+fg+';font-weight:700;font-size:12px;padding:6px 10px;border-top:2px solid '+fg+'">'+text+'</td>';
+  tr.innerHTML='<td colspan="9" style="background:'+bg+';color:'+fg+';font-weight:700;font-size:12px;padding:6px 10px;border-top:2px solid '+fg+'">'+text+'</td>';
   return tr;
 }
 // baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
@@ -3438,7 +3432,6 @@ function updateView(rows, sm){
       } else q.textContent='—';
     }
     setCell('aci'+i, yen(r.annualCostImpact), signCls(r.annualCostImpact));
-    setCell('asi'+i, yen(r.annualSellImpact), signCls(r.annualSellImpact));
   });
   const pa=$('#priceAlert');
   if(pa){
