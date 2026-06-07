@@ -2752,10 +2752,6 @@ const PAGE = `<!doctype html>
 
 <div id="msg"></div>
 
-<div id="exportSummary" style="display:none;margin:0 16px 12px;border:1px solid #cfe1d3;background:#f3f9f4;border-radius:10px;padding:10px 14px;font-size:12px;color:#1f2733">
-  <!-- 見積書出力後のサマリ。フォルダを開いたりタブを切替えても残るよう、ここに表示し続ける。 -->
-</div>
-
 <div class="cards" id="cards"></div>
 
 <div class="plpanel">
@@ -2800,17 +2796,14 @@ const PAGE = `<!doctype html>
   <thead><tr>
     <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th>商品名</th><th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
     <th class="r">現仕入</th><th class="c">改定後 仕入単価</th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
-    <th class="r">現売単価</th><th class="r">転嫁後 売単価</th><th class="r">値上額<br><span class="hint">(改定%)</span></th>
-    <th class="r">現粗利</th><th class="r">転嫁後 粗利</th>
     <th class="c">年間数量</th><th class="r">仕入 年影響</th><th class="r">増収 年影響</th>
   </tr></thead>
   <tbody id="tbody"></tbody>
 </table></div>
 
 <div class="foot hint">
-  ※ 「改定後 仕入単価」を直接書き換えると、その行だけ即時に再計算します（“もしこの額なら”の試算）。<br>
-  ※ 年間数量は、CSVに「年間数量」列があれば<span class="badge act">実</span>その値、無ければ<span class="badge est">推</span>「年間金額÷現売単価」で推定します。<br>
-  ※ 「行ルール」は空欄なら全体ルールに従います。得意先・商品ごとに個別ルールを試せます。
+  ※ メイン画面は「照合・紐付けの確認」用です。売価・粗利・見積書の作成は <a href="/customers" target="_blank">得意先別ページ</a> で行います。<br>
+  ※ 年間数量は、CSVに「年間数量」列があれば<span class="badge act">実</span>その値、無ければ<span class="badge est">推</span>「年間金額÷現売単価」で推定します。
 </div>
 
 <script>
@@ -3084,7 +3077,8 @@ function buildMainRow(r, i, readOnly){
   if(readOnly) prodName += progressBadge(r.itemStatus);
   // メイン画面は照合・紐付けの確認用＝価格は編集しない（改定後仕入は読み取り表示）。
   //  価格の設定・行ごとの転嫁ルールは得意先別ページに集約した。
-  const costCell = '<td class="r">'+num(r.newCost)+'</td>';
+  // 改定後仕入単価セルにはメーカーデータの疑わしさ警告（赤/黄）も出すので id を付ける（updateView で設定）。
+  const costCell = '<td class="r" id="nc'+i+'">'+num(r.newCost)+'</td>';
   const linkCell = '<td class="c">'+linkCellHtml(r, i)+'</td>'; // 横断（読み取り）ビューでも紐付けは可能
   tr.innerHTML =
     custCellHtml(r)+
@@ -3094,11 +3088,6 @@ function buildMainRow(r, i, readOnly){
     '<td class="r">'+num(r.currentCost)+'</td>'+
     costCell+
     '<td class="r" id="ci'+i+'"></td>'+
-    '<td class="r">'+num(r.currentSell)+'</td>'+
-    '<td class="r hi" id="ns'+i+'"></td>'+
-    '<td class="r" id="si'+i+'"></td>'+
-    '<td class="r">'+pct(r.currentMarginRate)+'</td>'+
-    '<td class="r" id="nm'+i+'"></td>'+
     '<td class="c" id="qt'+i+'"></td>'+
     '<td class="r" id="aci'+i+'"></td>'+
     '<td class="r" id="asi'+i+'"></td>';
@@ -3107,7 +3096,7 @@ function buildMainRow(r, i, readOnly){
 // 区切り見出しの行（一致品／休眠の境目）。セルIDを持たないので updateView は素通り。
 function sectionHeaderRow(text, bg, fg){
   const tr=document.createElement('tr'); tr.className='secthead';
-  tr.innerHTML='<td colspan="15" style="background:'+bg+';color:'+fg+';font-weight:700;font-size:12px;padding:6px 10px;border-top:2px solid '+fg+'">'+text+'</td>';
+  tr.innerHTML='<td colspan="10" style="background:'+bg+';color:'+fg+';font-weight:700;font-size:12px;padding:6px 10px;border-top:2px solid '+fg+'">'+text+'</td>';
   return tr;
 }
 // baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
@@ -3431,18 +3420,16 @@ function updateView(rows, sm){
   const warnIdx=[], rateIdx=[];
   rows.forEach((r,i)=>{
     setAmtRate('ci'+i, r.costIncrease, rateOf(r.currentCost, r.newCost)); // 仕入値上額＋改定%
-    setCell('ns'+i, num(r.newSell));
-    // 改定単価セルの色分け：赤＝価格異常/メーカー重複（出力時に除外）、黄＝値上率が大きい（注意のみ）
-    const nsEl=$('#ns'+i);
-    if(nsEl){
+    // 改定後仕入単価セルの色分け：赤＝メーカーデータ疑わしい/重複（出力時に除外）、黄＝値上率が大きい（注意のみ）
+    setCell('nc'+i, num(r.newCost));
+    const ncEl=$('#nc'+i);
+    if(ncEl){
+      ncEl.classList.remove('pricewarn','ratewarn');
       const red=r.priceWarning||r.costConflict||'';
-      nsEl.classList.remove('pricewarn','ratewarn');
-      if(red){ nsEl.classList.add('pricewarn'); nsEl.title='⚠ '+red; nsEl.innerHTML='⚠ '+nsEl.textContent; warnN++; warnIdx.push(i); }
-      else if(r.rateWarning){ nsEl.classList.add('ratewarn'); nsEl.title='注意: '+r.rateWarning; nsEl.innerHTML='▲ '+nsEl.textContent; rateN++; rateIdx.push(i); }
-      else { nsEl.title=''; }
+      if(red){ ncEl.classList.add('pricewarn'); ncEl.title='⚠ '+red; ncEl.innerHTML='⚠ '+ncEl.textContent; warnN++; warnIdx.push(i); }
+      else if(r.rateWarning){ ncEl.classList.add('ratewarn'); ncEl.title='注意: '+r.rateWarning; ncEl.innerHTML='▲ '+ncEl.textContent; rateN++; rateIdx.push(i); }
+      else { ncEl.title=''; }
     }
-    setAmtRate('si'+i, r.sellIncrease, rateOf(r.currentSell, r.newSell)); // 値上額＋改定%
-    setCell('nm'+i, pct(r.newMarginRate));
     const q = $('#qt'+i);
     if(q){
       if(Number.isFinite(r.qty) && r.qty>0){
@@ -3455,12 +3442,12 @@ function updateView(rows, sm){
   });
   const pa=$('#priceAlert');
   if(pa){
-    if(warnN>0){ pa.style.display='block'; pa.innerHTML='⚠ メーカー側データが疑わしい行が '+warnN+' 件あります（赤い改定単価セル＝売単価0/値下げ/同一商品で新仕入が食い違い）。見積書出力時は自動で「要確認」に分離されます。<span class="jumphint">▶ クリックで該当行へ</span>'; bindJump(pa, warnIdx); }
+    if(warnN>0){ pa.style.display='block'; pa.innerHTML='⚠ メーカー側データが疑わしい行が '+warnN+' 件あります（赤い「改定後 仕入単価」セル＝売単価0/値下げ/同一商品で新仕入が食い違い）。見積書出力時は自動で「要確認」に分離されます。<span class="jumphint">▶ クリックで該当行へ</span>'; bindJump(pa, warnIdx); }
     else pa.style.display='none';
   }
   const ra=$('#rateAlert');
   if(ra){
-    if(rateN>0){ ra.style.display='block'; ra.innerHTML='▲ 値上率が大きい行が '+rateN+' 件あります（黄色い改定単価セル）。メーカーの値上げ幅が正しいか確認してください。※これは注意のみで、見積書には通常どおり載ります。<span class="jumphint">▶ クリックで該当行へ</span>'; bindJump(ra, rateIdx); }
+    if(rateN>0){ ra.style.display='block'; ra.innerHTML='▲ 値上率が大きい行が '+rateN+' 件あります（黄色い「改定後 仕入単価」セル）。メーカーの値上げ幅が正しいか確認してください。※これは注意のみで、見積書には通常どおり載ります。<span class="jumphint">▶ クリックで該当行へ</span>'; bindJump(ra, rateIdx); }
     else ra.style.display='none';
   }
   renderCards(sm);
@@ -3606,41 +3593,6 @@ $('#shogoBtn').addEventListener('click', runShogo);
 })();
 
 // 見積書出力後のサマリ表示。フォルダ/要確認.xlsx を画面から直接開けるボタン付き。
-function renderExportSummary(res){
-  const el = $('#exportSummary'); if(!el) return;
-  const sup = res.supplier ? '<span style="color:#1f4e78;font-weight:700">'+esc(res.supplier)+'</span>' : '<span class="hint">仕入先不明</span>';
-  const stats = '見積書 <b>'+res.count+'</b> 件'
-    + (res.dupRemoved ? ' / 重複整理 <b>'+res.dupRemoved+'</b> 件' : '')
-    + (res.reviewCount ? ' / 要確認 <b style="color:#8a5a12">'+res.reviewCount+'</b> 件（しきい値 '+res.threshold+'%未満）' : ' / 要確認なし');
-  const btnStyle = "background:#eaf1f8;color:#1f4e78;border:1px solid #c7d6e4;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;margin-right:6px";
-  const folderBtn = '<button style="'+btnStyle+'" onclick="openFolderPath(\\''+esc('output/'+res.folderName)+'\\')">📁 見積書フォルダを開く</button>';
-  const reviewBtn = res.reviewCount ? '<button style="'+btnStyle+'" onclick="openFolderPath(\\''+esc('output/'+res.folderName+'/'+res.reviewFile)+'\\')">📄 要確認.xlsx を開く</button>' : '';
-  // 顧客別の内訳（多い順 上位、長すぎたら畳む）
-  const pc = Array.isArray(res.perCustomer) ? res.perCustomer : [];
-  const top = pc.slice(0, 8);
-  const more = pc.length - top.length;
-  const list = top.map(p => '<span style="display:inline-block;background:#fff;border:1px solid #cfe1d3;border-radius:999px;padding:2px 8px;margin:2px 4px 0 0">'
-    + esc(p.customer) + ' <b>'+p.kept+'</b>' + (p.review?'<span style="color:#8a5a12;margin-left:4px">+要'+p.review+'</span>':'') + '</span>').join('');
-  // 要確認の中身プレビュー（最大5件）
-  const rs = Array.isArray(res.reviewSummary) ? res.reviewSummary.slice(0, 5) : [];
-  const rsHtml = rs.length ? '<div style="margin-top:6px;color:#8a5a12"><b>要確認プレビュー:</b><ul style="margin:4px 0 0 18px;padding:0">'
-    + rs.map(r => '<li>'+esc(r.customerName||'')+'：[' + esc(r.productCode||'') + '] ' + esc(r.productName||'') + ' ↔ ' + esc(r.makerName||'') + ' <span class="hint">('+esc(r.matchStatus||'')+')</span></li>').join('')
-    + '</ul>' + (res.reviewCount > rs.length ? '<div class="hint" style="margin-top:2px">…ほか '+(res.reviewCount - rs.length)+' 件 (要確認.xlsx を開いてください)</div>' : '') + '</div>' : '';
-  const closeBtn = '<button style="'+btnStyle+';float:right;margin-right:0" onclick="document.getElementById(\\'exportSummary\\').style.display=\\'none\\'">× 閉じる</button>';
-  el.innerHTML = closeBtn
-    + '<div style="font-weight:700;margin-bottom:4px">✓ '+sup+' の見積書を出力しました</div>'
-    + '<div>'+stats+'</div>'
-    + '<div style="margin-top:6px">'+folderBtn+reviewBtn+'</div>'
-    + (list ? '<div style="margin-top:8px"><span class="hint">得意先別の採用件数:</span><br>'+list+(more>0?' <span class="hint">…ほか '+more+' 社</span>':'')+'</div>' : '')
-    + rsHtml;
-  el.style.display = 'block';
-}
-async function openFolderPath(p){
-  try{
-    const r = await fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p})}).then(x=>x.json());
-    if(!r.ok) alert('開けませんでした: '+(r.error||''));
-  }catch(e){ alert('開けませんでした: '+e); }
-}
 $('#plUnit').addEventListener('change', renderPL);
 ['#plSales','#plVar','#plFixed','#plSelfCost'].forEach(s=> $(s).addEventListener('input', debounce(renderPL,150)));
 
