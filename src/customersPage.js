@@ -101,6 +101,14 @@ const CUSTOMERS_PAGE = `<!doctype html>
   /* 提出済みバッジ（得意先一覧・ヘッダー） */
   .cust .issued{display:inline-block;background:#e1f3df;color:#1f6b35;border:1px solid #bfe0c4;border-radius:999px;font-size:10px;font-weight:700;padding:0 6px;margin-left:6px}
   .cust.done{background:#f5fbf6}
+  /* 実施日バッジ（並び替えの根拠を見える化）＝超過は赤・控えは青 */
+  .cust .effb{display:inline-block;border-radius:999px;font-size:10px;font-weight:700;padding:0 6px;margin-left:6px;white-space:nowrap}
+  .cust .effb.over{background:#fdecea;color:#c0392b;border:1px solid #f2b8b1}
+  .cust .effb.soon{background:#eef4fb;color:#1f5fa6;border:1px solid #c6d8ef}
+  /* 一覧のグループ区切り見出し（実施日 超過／控え／なし・提出済） */
+  .listgrp{position:sticky;top:0;z-index:1;background:#eef1f5;color:#33425a;font-size:11px;font-weight:700;padding:5px 12px;border-top:1px solid #d8dee7;border-bottom:1px solid #d8dee7}
+  .listgrp.over{background:#fdecea;color:#a5311f;border-color:#f2b8b1}
+  .listgrp.soon{background:#eef4fb;color:#1f5fa6;border-color:#c6d8ef}
   .issuednote{margin:8px 16px;padding:8px 12px;border-radius:8px;background:#eef7ef;border:1px solid #bfe0c4;color:#1f6b35;font-size:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .issuednote .un{background:#fff;border:1px solid #9fcbab;color:#1f6b35;border-radius:7px;padding:2px 9px;font-weight:700;cursor:pointer;font-size:11px}
   .issuednote .openq{background:#1f6b35;border:1px solid #1f6b35;color:#fff;border-radius:7px;padding:2px 10px;font-weight:700;cursor:pointer;font-size:11px}
@@ -542,6 +550,33 @@ function withinYears(c, years){
   if(c.lastDate) return c.lastDate >= cutoffIso(years);
   return !!c.hasRecent; // 最終売上日が無いときは直近1年(hasRecent)で代用
 }
+// 今日(ISO) ・ ISO日付判定 ・ M/D短縮（正規表現は使わない＝テンプレ配信での \\d 事故回避）
+function todayIso(){ const d=new Date(); const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
+function isIsoDate(e){ if(!e||e.length!==10||e[4]!=='-'||e[7]!=='-') return false; for(let i=0;i<10;i++){ if(i===4||i===7) continue; if(e[i]<'0'||e[i]>'9') return false; } return true; }
+function mdShort(iso){ if(!isIsoDate(iso)) return iso||''; return String(parseInt(iso.slice(5,7),10))+'/'+String(parseInt(iso.slice(8,10),10)); }
+// 得意先の並び替え区分：1=実施日を超過(上)／2=実施日が控えている(中)／3=実施日なし or 提出済(下)。
+//  代表日＝対象アイテム中で最も早い有効な実施日（直近の締切）。提出済み(ISSUED)は下段へ。
+function custEffInfo(c){
+  let earliest='';
+  const items=(c&&c.products)||[];
+  for(let i=0;i<items.length;i++){ const e=items[i]&&items[i].effectiveDate; if(isIsoDate(e)){ if(!earliest||e<earliest) earliest=e; } }
+  const issued=!!(ISSUED&&ISSUED[c.name]);
+  if(issued||!earliest) return { group:3, date:earliest||'', issued };
+  return { group: (earliest < todayIso() ? 1 : 2), date:earliest, issued };
+}
+// 区分→日付昇順（超過は古い順／控えは近い順）→同点は名前順 で並べ替え。
+function sortByEff(list){
+  return list.map(c=>({c,e:custEffInfo(c)})).sort((A,B)=>{
+    if(A.e.group!==B.e.group) return A.e.group-B.e.group;
+    if(A.e.group!==3 && A.e.date!==B.e.date) return A.e.date<B.e.date?-1:1;
+    return String(A.c.name).localeCompare(String(B.c.name),'ja');
+  }).map(x=>x.c);
+}
+function effBadge(ef){
+  if(ef.group===1) return '<span class="effb over" title="実施日 '+esc(ef.date)+'（超過）">⏰ '+mdShort(ef.date)+' 超過</span>';
+  if(ef.group===2) return '<span class="effb soon" title="実施日 '+esc(ef.date)+'">📅 '+mdShort(ef.date)+'</span>';
+  return '';
+}
 function applyFilter(){
   const q=($('#search').value||'').trim();
   const years = parseInt(($('#recentYears') && $('#recentYears').value) || '1', 10);
@@ -549,6 +584,7 @@ function applyFilter(){
   hiddenNoRecent = 0;
   if(years>0){ const before=list.length; list=list.filter(c=>withinYears(c,years)); hiddenNoRecent = before-list.length; }
   filtered = q ? list.filter(c=>matchCust(c,q)) : list;
+  filtered = sortByEff(filtered); // 実施日 超過→控え→なし/提出済 の順に並べ替え
   renderList();
 }
 // 提出（発行）履歴をサーバから取得
@@ -605,7 +641,15 @@ function renderList(){
     : '';
   if(!filtered.length){ $('#listCol').innerHTML=note+'<div class="empty">該当する得意先がありません。'+(hiddenNoRecent?'<br>表示期間を「全期間」にすると過去客も表示されます。':'<br>照合結果がない場合は「↻ 照合を実行」してください。')+'</div>'; return; }
   let html=note;
+  let lastG=0; // 直前の区分（グループ区切り見出しの挿入用）
   for(const c of filtered){
+    const ef = custEffInfo(c);
+    if(ef.group!==lastG){
+      lastG=ef.group;
+      const lbl = ef.group===1?'⏰ 実施日を超過（至急）':ef.group===2?'📅 実施日が控えている':'— 実施日なし・提出済み';
+      const gcls = ef.group===1?'over':ef.group===2?'soon':'';
+      html+='<div class="listgrp '+gcls+'">'+lbl+'</div>';
+    }
     const sel = c.name===selName ? ' sel' : '';
     const rev = c.reviewCount ? '<span class="rev">要確認'+c.reviewCount+'</span>' : '';
     const lowN = lowMarginCount(c);
@@ -615,9 +659,10 @@ function renderList(){
     const code = c.code ? '<span class="ccode" title="得意先コード">'+esc(c.code)+'</span>' : '';
     const iss = ISSUED[c.name];
     const issBadge = iss ? '<span class="issued" title="最終提出 '+esc(iss.lastIssuedAt||'')+(iss.count>1?' / 提出'+iss.count+'回':'')+'">✅ 提出済 '+issuedShort(iss.lastIssuedAt)+(iss.count>1?'×'+iss.count:'')+'</span>' : '';
+    const effb = effBadge(ef); // 実施日バッジ（超過=赤/控え=青）
     html+='<div class="cust'+sel+(iss?' done':'')+'" data-name="'+esc(c.name)+'" onclick="selectCust(this.getAttribute(\\'data-name\\'))">'
       +'<div style="min-width:0"><div class="nm">'+esc(c.name)+'</div>'
-      +'<div class="meta">'+code+'仕入先 '+c.supplierCount+' 社'+rev+low+hold+nrec+issBadge+'</div></div>'
+      +'<div class="meta">'+code+'仕入先 '+c.supplierCount+' 社'+effb+rev+low+hold+nrec+issBadge+'</div></div>'
       +'<span class="cnt">'+c.productCount+'</span>'
       +'</div>';
   }
