@@ -242,8 +242,12 @@ function nameScoreInfo(makerName, recNorm) {
     else if (isCriticalToken(t)) missedCrit.push(t);
   }
   const raw = Math.round((hit / toks.length) * 100);
-  const capped = missedCrit.length > 0 && raw < 100;
-  return { raw, score: capped ? Math.min(raw, 50) : raw, critical: capped, missedCrit };
+  const hadMiss = missedCrit.length > 0 && raw < 100;
+  // 段階減点：決定的トークンの欠けが「1個」なら 要確認ゾーン(<=72) に残す（休眠で消さず人が確認）。
+  //  「2個以上」の欠けは別商品の可能性が高いので従来どおり 50 上限（=floor60未満で休眠）。
+  //  ※ raw 自体が低い短名のサイズ違い（角小↔角特大=raw50 等）は min() で据え置き＝引き続き休眠。
+  const cap = missedCrit.length >= 2 ? 50 : 72;
+  return { raw, score: hadMiss ? Math.min(raw, cap) : raw, critical: hadMiss, missedCrit };
 }
 function nameScore(makerName, recNorm) { return nameScoreInfo(makerName, recNorm).score; }
 
@@ -372,7 +376,7 @@ function matchOne(item, hanbai, opts = {}) {
     const cdHit = !linkSelf && cands.length && codeHit(cands, r.codeNorm || r.norm);
     // 仕入先コードフィルタ（productLinks の行・CD一致の行は bypass する）
     if (filterCode && !linkSelf && !cdHit && r.purchaseCode && r.purchaseCode !== filterCode) continue;
-    let cd, ns, isLink = false, raw = 0, brandOnlyMiss = false;
+    let cd, ns, isLink = false, raw = 0, brandOnlyMiss = false, criticalMiss = false;
     if (linkSelf) {
       cd = false; ns = 100; isLink = true; // 100%紐付け扱い
     } else {
@@ -380,7 +384,7 @@ function matchOne(item, hanbai, opts = {}) {
       if (cd) { ns = 100; raw = 100; }
       else {
         const info = nameScoreInfo(item.makerName, r.coreNorm || r.norm);
-        ns = info.score; raw = info.raw;
+        ns = info.score; raw = info.raw; criticalMiss = info.critical;
         // 抑制の原因が「英字を含み数字を含まない語」だけ＝英↔カナのブランド表記差の可能性
         //  （例 メーカー「Fresh+」↔ 自社「フレッシュプラス」）。サイズ/型番(数字含む)違いは含めないので
         //  WSR-110↔WSR-90 のような誤救済は起きない。
@@ -408,7 +412,8 @@ function matchOne(item, hanbai, opts = {}) {
         //  それ以外はフロア超の名前一致にブースト（67-79%→80%以上＝見積書へ）。
         //  ※ サイズ/型番(数字)違いは raw を上げないので救済対象にならない＝誤マッチを生まない。
         if (brandOnlyMiss) ns = Math.min(100, raw + priceBoost);
-        else if (ns >= nameFloor) ns = Math.min(100, ns + priceBoost);
+        // 決定的トークンの欠けがある行は、価格一致でも見積ゾーン(80+)へは上げない＝要確認に留め人が確認。
+        else if (!criticalMiss && ns >= nameFloor) ns = Math.min(100, ns + priceBoost);
         pmTag = true;
       } else if (pm === false && ns < priceVetoBelow) {
         // 価格不一致 ＝ 別商品の可能性大。しきい値未満の弱い名前一致（見積書に乗らない要確認ノイズ）は
@@ -504,4 +509,4 @@ function toCsv(rows) {
   return '﻿' + lines.join('\r\n');
 }
 
-module.exports = { matchAll, matchOne, nameScore, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER, padSelfCode, latinSizeMarkers, sizeMismatch };
+module.exports = { matchAll, matchOne, nameScore, nameScoreInfo, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER, padSelfCode, latinSizeMarkers, sizeMismatch };
