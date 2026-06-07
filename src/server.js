@@ -3319,7 +3319,9 @@ async function openLinkModal(idx){
   let list = [];
   if (mode === 'maker'){
     let makerNames, links;
-    if (dateFilter){
+    if (dateFilter || allView){
+      // 横断（実施日フィルタ）／★全部ビューは行ごとに仕入先が違い、allMakerNames が空なので、
+      //  その行の仕入先のメーカー商品名候補を /api/link-context から取得する。
       const ctx = await fetch('/api/link-context?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
       if (!ctx || !ctx.ok){ warn.style.display='block'; warn.textContent='⚠ 紐付け候補の取得に失敗しました'; return; }
       makerNames = ctx.makerNames || []; links = ctx.links || {};
