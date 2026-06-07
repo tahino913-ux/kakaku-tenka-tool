@@ -2472,11 +2472,13 @@ const PAGE = `<!doctype html>
   .hbar::-webkit-scrollbar-thumb:hover{ background:#71889f; }
   #hbarInner{ height:1px; }
   table{ border-collapse:separate; border-spacing:0; width:100%; min-width:1500px; background:var(--card); font-size:12px; }
-  /* メイン表は列を9個まで減らしたので、グローバルの幅(100%/1500px)で引き伸ばさず中身ぴったりに。
-     幅が枠に収まれば hbar は自動で隠れる（syncHScroll が scrollWidth で判定）。 */
-  #tbl{ width:auto; min-width:0; }
-  /* 商品名は内容（コード＋名称＋🏢仕入先バッジ）が長いと列を独占しがち→最大幅＋折り返しで横幅を抑える。 */
-  #tbl td.pn, #tbl th.pn{ white-space:normal; word-break:break-word; max-width:340px; }
+  /* メイン表は9列。width:100% で枠いっぱいに広げて右の空白を埋め、余り幅は全列に分散させる
+     （大きいモニターでスペースを使う）。min-width:0 で旧来の 1500px 強制を解除＝はみ出す時だけ
+     横スクロール（hbar は syncHScroll が scrollWidth で判定して自動で出し入れ）。 */
+  #tbl{ width:100%; min-width:0; }
+  /* 商品名は内容（コード＋名称＋🏢仕入先バッジ）が長いと列を独占しがち→最大幅＋折り返しで
+     横幅をキャップ。これで余り幅が商品名に集中せず全列へ分散する。 */
+  #tbl td.pn, #tbl th.pn{ white-space:normal; word-break:break-word; max-width:420px; }
   th,td{ border-right:1px solid var(--line); border-bottom:1px solid var(--line); padding:5px 7px; white-space:nowrap; }
   th:first-child,td:first-child{ border-left:1px solid var(--line); }
   th{ background:#eef2f7; position:sticky; top:0; z-index:2; font-weight:700; color:#2a3a4a; }
