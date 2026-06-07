@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const { readXlsx } = require('./xlsxread');
+const { isNoiseRow } = require('./noiserow');
 
 const norm = (s) => String(s == null ? '' : s).replace(/[\s　]/g, '').normalize('NFKC');
 
@@ -88,6 +89,8 @@ function convert(xlsxPath, outDir) {
       const nw = idx.nw != null ? (row[idx.nw] || '') : '';
       const code = idx.code != null ? String(row[idx.code] || '').trim() : '';
       if (!name) continue;
+      // 運賃・返品案内・再掲見出しなどの非商品行を取り込まない（商品らしい数値価格が無い注記/見出し）。
+      if (isNoiseRow({ name, makerCode: code, currentCost: cur, newCost: nw })) continue;
       if (String(cur).trim() === '' && String(nw).trim() === '') continue;
       const sup = (idx.sup != null && norm(row[idx.sup])) ? String(row[idx.sup]).trim() : sheetMaker;
       if (!bySupplier.has(sup)) bySupplier.set(sup, []);

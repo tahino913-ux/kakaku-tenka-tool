@@ -17,6 +17,7 @@ const { matchAll, toCsv, padSelfCode } = require('./match');
 const { xlsToCsv, isXls } = require('./xls2csv');
 const { convert: convertMakerXlsx } = require('./makerXlsx');
 const { getSettings, getMakers } = require('./settings');
+const { isNoiseRow } = require('./noiserow');
 
 const ROOT = path.join(__dirname, '..');
 const MAKER_DIR = path.join(ROOT, 'maker_quotes');
@@ -69,12 +70,16 @@ function loadMakerQuote(csvPath) {
   for (const r of records) {
     const makerName = get(r, ['メーカー商品名', '商品名']);
     const makerCode = get(r, ['メーカー品番', 'メーカー商品CD', 'メーカー商品コード', '品番']);
-    if (!makerName && !makerCode) continue;
+    const rawCur = get(r, ['現単価', '現価格', '現行仕入単価', '現仕入単価']);
+    const rawNew = get(r, ['新単価', '新価格', '新仕入単価']);
+    // 非商品行（運賃・返品案内などの注記文／再掲見出し／名前もコードも無い行）は照合対象から除外。
+    //  数値価格を持つ行は商品として残す＝コードのみ(GL06等)の規格品も拾える。
+    if (isNoiseRow({ name: makerName, makerCode, currentCost: rawCur, newCost: rawNew })) continue;
     items.push({
       supplier: get(r, ['仕入先', '仕入先（メーカー）', 'メーカー']) || '仕入先不明',
       makerCode, makerName,
-      currentCost: sen(toNum(get(r, ['現単価', '現価格', '現行仕入単価', '現仕入単価']))),
-      newCost: sen(toNum(get(r, ['新単価', '新価格', '新仕入単価']))),
+      currentCost: sen(toNum(rawCur)),
+      newCost: sen(toNum(rawNew)),
       switchDate: get(r, ['切替日', '実施日', '適用日']),
     });
   }
