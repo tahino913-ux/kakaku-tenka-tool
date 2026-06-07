@@ -159,6 +159,7 @@ const IMPORT_PAGE = `<!doctype html>
     <button id="bulkDateBtn" type="button" class="go" style="background:#2f6fb0">全商品に反映</button>
     <span id="bulkDateMsg" style="font-size:11px"></span>
   </div>
+  <div id="dateAlert" style="display:none;margin:6px 0 10px;padding:9px 13px;background:#fdecea;border:1px solid #f0b3aa;border-radius:7px;font-size:12.5px;color:#8a2a1a;line-height:1.6"></div>
   <div class="wrap"><table id="grid"></table></div>
 </div>
 
@@ -188,6 +189,7 @@ function clearImportData(){
   $('#src').value=''; grid=[]; originalRows=[]; forcedSwitchDate=null; loadedForSupplier='';
   if($('#bulkDate')) $('#bulkDate').value=''; if($('#bulkDateMsg')) $('#bulkDateMsg').textContent='';
   if($('#grid')) $('#grid').innerHTML='';
+  if($('#dateAlert')){ $('#dateAlert').style.display='none'; $('#dateAlert').innerHTML=''; }
   if($('#mapArea')) $('#mapArea').style.display='none';
   if($('#skipRow')) $('#skipRow').style.display='none';
   if($('#fileMsg')) $('#fileMsg').textContent='';
@@ -415,6 +417,30 @@ function jpDateToISO(s,refDate){
   if(m){ const mo=+m[1], da=+m[2]; if(mo>=1&&mo<=12&&da>=1&&da<=31){ const Y=(refDate||new Date()).getFullYear(); return Y+'-'+p2(mo)+'-'+p2(da); } }
   return s; // 未対応の形は素通り
 }
+// --- 実施日が「3か月以上先」の行を検出してアラート（年の打ち間違い 2027→2026 等を取込時に気づける）---
+//  正規表現は使わない（テンプレ配信での \\d 事故回避）。
+function isIso10(e){ if(!e||e.length!==10||e[4]!=='-'||e[7]!=='-') return false; for(let i=0;i<10;i++){ if(i===4||i===7) continue; if(e[i]<'0'||e[i]>'9') return false; } return true; }
+function plus3moIso(){ const d=new Date(); d.setMonth(d.getMonth()+3); const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
+// 現在のマッピングで実施日が3か月以上先の行を返す（[{name,date}]）。
+function farFutureDates(){
+  let items=[]; try{ items=(collect().items)||[]; }catch(e){ items=[]; }
+  const lim=plus3moIso(); const ref=new Date(); const bad=[];
+  items.forEach(it=>{ const iso=jpDateToISO(it.switchDate,ref); if(isIso10(iso) && iso>lim) bad.push({name:it.makerName||it.makerCode||it.selfCode||'(無名)', date:iso}); });
+  return {bad, lim};
+}
+// アラート枠の表示／非表示を更新（保存はブロックしない＝注意喚起のみ）。
+function checkFarFutureDates(){
+  const el=$('#dateAlert'); if(!el) return 0;
+  const {bad,lim}=farFutureDates();
+  if(!bad.length){ el.style.display='none'; el.innerHTML=''; return 0; }
+  const list=bad.slice(0,10).map(b=>'<li>'+esc(b.date)+'　'+esc(String(b.name).slice(0,44))+'</li>').join('');
+  el.innerHTML='⚠ <b>実施日が3か月以上先（'+esc(lim)+' より後）の行が '+bad.length+' 件</b> あります。'
+    +'<b>年の打ち間違い（例 2027→2026）</b>ではないか確認してください。'
+    +'<ul style="margin:5px 0 0 18px;padding:0">'+list+(bad.length>10?'<li>…ほか '+(bad.length-10)+' 件</li>':'')+'</ul>'
+    +'<span style="color:#a5512a;font-size:11px">※ 必要なら上の「📅 実施日を一括入力」で正しい日付に直してから保存してください。</span>';
+  el.style.display='block';
+  return bad.length;
+}
 
 // 二次元配列を表として描画（ファイル読み込み・貼り付け共通の入口）
 // A: 見出し検出 → skipN を自動セット　B+C: applySkipAndRender で適用
@@ -458,6 +484,7 @@ function applySkipAndRender(){
   grid=sliced.map(r=>{ const a=r.slice(); while(a.length<cols) a.push(''); return a.map(c=>String(c==null?'':c)); });
   const skippedPadded=skippedRaw.map(r=>{ const a=r.slice(); while(a.length<cols) a.push(''); return a; });
   render(cols, skippedPadded); if(!suppressProfile) applyProfile();
+  checkFarFutureDates(); // applyProfile で列対応が変わった後も実施日アラートを最新化
 }
 // 適切なCSVパーサ（クォート対応）。ファイル選択でのCSV読み込みに使用。
 function csvParseRows(text){
@@ -577,6 +604,7 @@ function render(cols, skippedRows){
   $('#grid').innerHTML=html;
   $('#mapArea').style.display='block';
   applyForcedDateToGrid(); // 一括 実施日が設定済みなら、再描画後も切替日列へ反映し続ける
+  checkFarFutureDates();   // 実施日が3か月以上先の行があれば警告（年の打ち間違い検知）
 }
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function collect(){
@@ -690,6 +718,11 @@ $('#bulkDateBtn').addEventListener('click',()=>{
   msg.textContent = (n>=0)
     ? '✓ 切替日列の '+n+' 行に '+iso+' を反映しました（保存時に書き込まれます）'
     : '✓ 実施日の列が無いので、保存時に全商品へ '+iso+' を付与します';
+  checkFarFutureDates(); // 一括反映後に再チェック（正しい日付に直したら警告が消える）
+});
+// 列の再マップ（thead select）やセルの直接編集（tbody input）で実施日アラートを再判定。
+$('#grid').addEventListener('change',e=>{
+  if(e.target && (e.target.tagName==='SELECT' || e.target.tagName==='INPUT')) checkFarFutureDates();
 });
 $('#fileBtn').addEventListener('click',()=>{ if($('#fileBtn').disabled) return; $('#file').click(); });
 $('#file').addEventListener('change',onFilePicked);
@@ -763,6 +796,9 @@ $('#saveBtn').addEventListener('click',async()=>{
   // 取り違えガード：表示中のデータを読み込んだ仕入先と、保存先の仕入先が違うときは確認する。
   if(loadedForSupplier && loadedForSupplier!==supplier &&
      !confirm('表示中のデータは「'+loadedForSupplier+'」で読み込んだものです。\\nこれを「'+supplier+'」として保存します。よろしいですか？')){ return; }
+  // 実施日が3か月以上先の行があれば、年の打ち間違いの可能性を確認（保存はブロックしない）。
+  const ff=checkFarFutureDates();
+  if(ff>0 && !confirm('実施日が3か月以上先の行が '+ff+' 件あります。\\n年の打ち間違い（例 2027→2026）ではありませんか？\\nこのまま保存しますか？')){ return; }
   $('#msg').style.color='#6b7785'; $('#msg').textContent='保存中…';
   const purchaseCode=$('#purchaseCodeSel').value.trim();
   const payload={supplier,items,map,delim:$('#delim').value,hasHeader:$('#hasHeader').checked,purchaseCode};
