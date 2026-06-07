@@ -2475,6 +2475,8 @@ const PAGE = `<!doctype html>
   /* メイン表は列を9個まで減らしたので、グローバルの幅(100%/1500px)で引き伸ばさず中身ぴったりに。
      幅が枠に収まれば hbar は自動で隠れる（syncHScroll が scrollWidth で判定）。 */
   #tbl{ width:auto; min-width:0; }
+  /* 商品名は内容（コード＋名称＋🏢仕入先バッジ）が長いと列を独占しがち→最大幅＋折り返しで横幅を抑える。 */
+  #tbl td.pn, #tbl th.pn{ white-space:normal; word-break:break-word; max-width:340px; }
   th,td{ border-right:1px solid var(--line); border-bottom:1px solid var(--line); padding:5px 7px; white-space:nowrap; }
   th:first-child,td:first-child{ border-left:1px solid var(--line); }
   th{ background:#eef2f7; position:sticky; top:0; z-index:2; font-weight:700; color:#2a3a4a; }
@@ -2792,7 +2794,7 @@ const PAGE = `<!doctype html>
 <div class="hbar" id="hbar"><div id="hbarInner"></div></div>
 <div class="wrap" id="wrap"><table id="tbl">
   <thead><tr>
-    <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th>商品名</th><th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
+    <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th class="pn">商品名</th><th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
     <th class="r">現仕入</th><th class="c">改定後 仕入単価</th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
     <th class="c">年間数量</th><th class="r">仕入 年影響</th>
   </tr></thead>
@@ -3081,7 +3083,7 @@ function buildMainRow(r, i, readOnly){
   tr.innerHTML =
     custCellHtml(r)+
     '<td class="c">'+matchPctCell(r)+'</td>'+
-    '<td>'+prodName+'</td>'+
+    '<td class="pn">'+prodName+'</td>'+
     linkCell+
     '<td class="r">'+num(r.currentCost)+'</td>'+
     costCell+
