@@ -69,8 +69,9 @@ const SELF_PAGE = `<!doctype html>
   </div>
 </div>
 
-<div class="card">
-  <h3 style="margin:0 0 6px">🔍 別ファイルをプレビュー（取込ルールの確認用）<span class="hint" style="font-weight:normal">※DB直結時は予備（ファイル方式/DBなしPC用）</span></h3>
+<details class="prevwrap" style="border:1px solid #e2e6ec;border-radius:8px;padding:8px 14px;margin-bottom:14px;background:#fff">
+<summary style="cursor:pointer;font-weight:700;font-size:14px;color:#33415a;padding:4px 0">🔍 別ファイルをプレビュー（取込ルールの確認用）　<span class="hint" style="font-weight:normal">※DB直結時は予備（ファイル方式・DBなしPC用）— クリックで開く</span></summary>
+<div style="padding-top:6px">
   <div class="hint" style="margin-bottom:8px">
     上の本番ファイルとは別に、任意のファイルを開いて列構成・パース結果を確認できます。<br>
     ここで保存した「列の役割」は <code>settings.json:selfProfile</code> に書き込まれ、次回以降の取込で使われます。
@@ -137,11 +138,7 @@ const SELF_PAGE = `<!doctype html>
     <span id="saveMsg" class="muted"></span>
   </div>
 </div>
-
-<div class="card">
-  <h3 style="margin:0 0 6px">現在の selfProfile</h3>
-  <pre id="currentProfile" class="hint" style="background:#f5f7fa;padding:8px;border-radius:4px;white-space:pre-wrap">読込中…</pre>
-</div>
+</details>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -200,6 +197,7 @@ function guessRole(header, ci) {
 
 function renderAll() {
   $('#previewCard').style.display = '';
+  const pv=document.querySelector('.prevwrap'); if(pv) pv.open=true; // 折りたたみ内なので、読み込んだら自動で開く
   $('#previewSum').textContent = pendingGrid.length+'行を表示（全'+pendingGrid.length+'件中）';
 
   // 生データテーブル
@@ -266,18 +264,11 @@ $('#saveBtn').addEventListener('click', async () => {
   }).then(x => x.json());
   if (res.ok) {
     $('#saveMsg').textContent = '✓ 保存しました'; $('#saveMsg').className = 'ok';
-    await loadCurrent();
   } else {
     $('#saveMsg').textContent = '保存失敗: '+(res.error||''); $('#saveMsg').className = 'err';
   }
 });
 
-async function loadCurrent() {
-  const res = await fetch('/api/self-profile').then(x => x.json());
-  const sp = res && res.selfProfile;
-  if (!sp) { $('#currentProfile').textContent = '（まだ保存されていません。上で取込してください）'; return; }
-  $('#currentProfile').textContent = JSON.stringify(sp, null, 2);
-}
 function fmtBytes(n){
   if(!Number.isFinite(n)) return '';
   if(n < 1024) return n + ' B';
@@ -383,7 +374,6 @@ async function loadHanbaiSource(){
     target.innerHTML = '<span class="err">読込失敗: '+esc(String(e))+'</span>';
   }
 }
-loadCurrent();
 loadHanbaiSource();
 </script>
 </body></html>`;
