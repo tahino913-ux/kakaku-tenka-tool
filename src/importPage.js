@@ -61,7 +61,7 @@ const IMPORT_PAGE = `<!doctype html>
     <span id="purchaseCodeBadge" style="font-size:12px;color:#7a5a00;font-weight:700"></span>
   </div>
   <div class="hint" style="font-size:11px;color:#6b7785;margin-top:4px;line-height:1.6">
-    選んだ仕入先(発注先)の <b>末尾4桁コード</b>（例: 13=朝日食品容器 / 29=大黒工業 / 47=ハウスホールドジャパン）に一致する自社品だけを照合候補にします。
+    選ぶと、<b>その仕入先から仕入れている自社商品だけ</b>を照合の対象にするので、紐付けの精度が上がります。
   </div>
   <div class="row" style="margin-top:8px">
     <label>この見積の仕入先名：</label>
@@ -115,7 +115,7 @@ const IMPORT_PAGE = `<!doctype html>
       <button class="go" id="manualToggle" type="button" disabled style="padding:4px 10px">✏ 手入力をひらく</button>
     </div>
     <div class="hint">貼り付けが使えないとき（口頭・メモ・FAX・電話連絡など）に、項目ごとに直接入力できます。最低でも <b>メーカー商品名</b> と <b>新単価</b> を入れてください。<br>
-      <b>自社コード</b>（任意）を入れると、その商品は照合で <b>「📌 手動紐付け（100%確定）」</b> として扱われます（後で「📊 一覧・進捗」から解除できます）。</div>
+      <b>自社コード</b>（任意）を入れておくと、その商品はメーカー品と<b>確実に紐付き</b>ます（あとで「📊 一覧・進捗」ページで解除できます）。</div>
     <div id="manualArea" style="display:none">
       <div class="wrap" style="max-height:42vh"><table id="manualTbl"></table></div>
       <div class="row">
