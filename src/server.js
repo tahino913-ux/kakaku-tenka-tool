@@ -395,11 +395,14 @@ function calcAll(body) {
     // 提出対象（得意先あり・一致）行だけ価格異常を判定（休眠/未一致は売単価が無くて当然なので対象外）
     const isQuoteRow = !!r.customerName && r.customerName !== '-' && !/未一致/.test(matchStatus);
     const priceWarning = isQuoteRow ? priceRowAnomaly(r.currentSell, r.newSell, r.ruleType, isSelfMade) : '';
-    // 値上率が大きい行の「注意」（エラーではない＝除外しない）。メーカー値上げ幅が正しいかの確認喚起。
+    // 値上率が大きい行の「注意」（エラーではない＝除外しない）。メーカーの値上げ幅が正しいかの確認喚起。
+    //  メイン画面は照合・仕入コストの確認用なので、判定は「メーカー仕入(原価)の値上率」で行う。
+    //  ※売価ベースだと自社の転嫁ルール次第で過剰に点灯し、メッセージ「メーカーの値上げ幅」とも食い違うため。
+    //  自社製造(9000)は原価0なので currentCost>0 ガードで自動的に対象外（従来どおり要確認に落とさない）。
     let rateWarning = '';
-    if (isQuoteRow && !priceWarning && fin(r.currentSell) && r.currentSell > 0 && fin(r.newSell)) {
-      const upPct = (r.newSell / r.currentSell - 1) * 100;
-      if (upPct >= RATE_CAUTION_PCT) rateWarning = '値上率が大きい（' + upPct.toFixed(0) + '%）。メーカーの値上げ幅が正しいか確認';
+    if (isQuoteRow && !priceWarning && fin(r.currentCost) && r.currentCost > 0 && fin(r.newCost)) {
+      const upPct = (r.newCost / r.currentCost - 1) * 100;
+      if (upPct >= RATE_CAUTION_PCT) rateWarning = 'メーカー仕入の値上率が大きい（' + upPct.toFixed(0) + '%）。メーカーの値上げ幅が正しいか確認';
     }
     // 得意先別ページと同じ rowKey で状態を引く（''=未提出/対象・hold=検討中・issued=提出済み）。
     //  メイン表で「見積書を作成した（提出済み）」行を隠すのに使う。
