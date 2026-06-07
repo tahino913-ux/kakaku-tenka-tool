@@ -2472,6 +2472,9 @@ const PAGE = `<!doctype html>
   .hbar::-webkit-scrollbar-thumb:hover{ background:#71889f; }
   #hbarInner{ height:1px; }
   table{ border-collapse:separate; border-spacing:0; width:100%; min-width:1500px; background:var(--card); font-size:12px; }
+  /* メイン表は列を9個まで減らしたので、グローバルの幅(100%/1500px)で引き伸ばさず中身ぴったりに。
+     幅が枠に収まれば hbar は自動で隠れる（syncHScroll が scrollWidth で判定）。 */
+  #tbl{ width:auto; min-width:0; }
   th,td{ border-right:1px solid var(--line); border-bottom:1px solid var(--line); padding:5px 7px; white-space:nowrap; }
   th:first-child,td:first-child{ border-left:1px solid var(--line); }
   th{ background:#eef2f7; position:sticky; top:0; z-index:2; font-weight:700; color:#2a3a4a; }
