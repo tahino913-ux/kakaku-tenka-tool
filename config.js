@@ -51,7 +51,9 @@ module.exports = {
   // （.XLS は旧Excel形式なので、照合.bat 実行時に自動でCSVへ変換します）。
   // ファイルを直接指定してもOK。
   hanbai: {
-    path: 'G:\\マイドライブ\\価格改定\\価格改定AI\\販売大臣CSV',
+    // 既定は汎用的な例。実際の販売実績フォルダは settings.json の hanbai.path で上書きする
+    // （settings.json は .gitignore 対象なので、各環境固有のパスをコミットせずに済む）。
+    path: './販売実績',
     nameFloor: 60, // 名前一致がこれ未満は「休眠」として見積から外す
 
     // 販売実績の取得元：'file'（既定＝エクスポートしたCSV/XLSを読む）/ 'db'（販売大臣SQL Server直結・読み取り専用）。
