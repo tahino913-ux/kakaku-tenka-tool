@@ -34,7 +34,7 @@ const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, norm
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
 const { describeNoiseRow } = require('./noiserow');
-const { getImportSkips, lookupImportSkip, updateImportSkips } = require('./importSkip');
+const { getImportSkips, lookupImportSkip, updateImportSkips, removeImportSkip } = require('./importSkip');
 // 配信HTMLの版（/api/ping の rev と一致＝古いサーバが残っていないか確認用）
 const SIM_PAGE_REV = '20260608a';
 const { buildCostCsv } = require('./cost_export');
@@ -2403,6 +2403,18 @@ const server = http.createServer(async (req, res) => {
       const supplier = (sp.get('supplier') || '').trim();
       const skips = getImportSkips(supplier);
       return sendJson(res, 200, { supplier, skips, count: skips.length });
+    }
+    if (req.method === 'POST' && url === '/api/import-skip-remove') {
+      const body = await readBody(req);
+      const supplier = String((body && body.supplier) || '').trim();
+      const key = String((body && body.key) || '').trim();
+      if (!supplier || !key) return sendJson(res, 200, { ok: false, error: '仕入先と key が必要です' });
+      try {
+        const skips = removeImportSkip(supplier, key);
+        return sendJson(res, 200, { ok: true, supplier, count: skips.length });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
     }
     if (req.method === 'GET' && url === '/api/maker-list') {
       return sendJson(res, 200, { items: listMakerQuotes() });

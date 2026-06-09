@@ -11,7 +11,20 @@
 // 商品名が「見出し語そのもの」なら再掲ヘッダ＝非商品。
 const HEADER_RE = /^(品番|コード|商品コード|商品名|品名|メーカー(名|品番|商品名)?|規格|現単価|新単価|現行(価格|単価)?|新(価格|単価)|改定(価格|単価)?|単価|金額|切替日|実施日|備考|数量|No|NO|＃)$/;
 // 価格の無い行のうち、これらの注記語を含む商品名は非商品（運賃・送料・返品案内など）。
-const NOTE_RE = /(運賃|送料|元払|着払|手数料|返品|納品書|指定(場所|倉庫)|別途|未満|以上|ご負担|御見積|次回|地域|エリア|お客様|振込|実費|合計|小計|消費税|備考欄|休暇|祝日|年末年始|夏季休業|冬季休業|お盆|ゴールデンウィーク|ＧＷ|GW)/;
+// ※「休暇」「祝日」は単独では入れない（商品名の部分一致で誤除外しやすい）→ VACATION_RE で告知文だけ拾う。
+const NOTE_RE = /(運賃|送料|元払|着払|手数料|返品|納品書|指定(場所|倉庫)|別途|未満|以上|ご負担|御見積|次回|地域|エリア|お客様|振込|実費|合計|小計|消費税|備考欄|年末年始|夏季休業|冬季休業|お盆|ゴールデンウィーク|ＧＷ|GW)/;
+// 休暇・祝日の「告知文」パターン（休暇主賓 等の商品名は対象外）
+const VACATION_RE = /(祝日休|祝日の(?:お知らせ|ご案内|について)|休暇の(?:お知らせ|ご案内|について|期間|中|案内)|休暇について|休暇期間|休暇中|GW休|GW期間)/;
+
+function isVacationNote(name) {
+  return !!(name && VACATION_RE.test(String(name)));
+}
+
+function hasNoteKeyword(name) {
+  if (!name) return false;
+  if (isVacationNote(name)) return true;
+  return NOTE_RE.test(String(name));
+}
 
 // 文字列が「数値の価格」か（カンマ・空白・¥・円 を除いて数値ならtrue）。
 function isNumericPrice(v) {
@@ -28,7 +41,7 @@ function isNoiseRow(row) {
   if (name && HEADER_RE.test(name)) return true;    // 名前が見出し語そのもの（再掲ヘッダ）
   if (isNumericPrice(row && row.newCost) || isNumericPrice(row && row.currentCost)) return false; // 数値価格あり＝商品
   // ここから先は「商品らしい数値価格が無い」行
-  if (name && NOTE_RE.test(name)) return true;      // 注記文（運賃・返品案内 等）
+  if (hasNoteKeyword(name)) return true;           // 注記文（運賃・返品案内・休暇告知 等）
   const cp = String(row && row.currentCost != null ? row.currentCost : '');
   const np = String(row && row.newCost != null ? row.newCost : '');
   if (/価格|単価/.test(cp) || /価格|単価/.test(np)) return true; // 価格列が見出しテキスト（現行価格 等）
@@ -42,11 +55,34 @@ function describeNoiseRow(row) {
   if (!name && !code) return { noise: true, reason: '名前も品番も空の行' };
   if (name && HEADER_RE.test(name)) return { noise: true, reason: '見出しの再掲行（品番・商品名など）' };
   if (isNumericPrice(row && row.newCost) || isNumericPrice(row && row.currentCost)) return { noise: false, reason: '' };
-  if (name && NOTE_RE.test(name)) return { noise: true, reason: '運賃・返品案内・休暇告知などの注記文' };
+  if (isVacationNote(name)) return { noise: true, reason: '休暇・祝日の告知文' };
+  if (name && NOTE_RE.test(name)) return { noise: true, reason: '運賃・返品案内などの注記文' };
   const cp = String(row && row.currentCost != null ? row.currentCost : '');
   const np = String(row && row.newCost != null ? row.newCost : '');
   if (/価格|単価/.test(cp) || /価格|単価/.test(np)) return { noise: true, reason: '価格列が見出しテキスト（現行価格 等）' };
   return { noise: false, reason: '' };
 }
 
-module.exports = { isNoiseRow, isNumericPrice, describeNoiseRow };
+function selfTest() {
+  const ok = [
+    [isNoiseRow({ name: '返品手数料について' }), true],
+    [isNoiseRow({ name: '休暇のお知らせ' }), true],
+    [isNoiseRow({ name: '夏季休業のご案内' }), true],
+    [isNoiseRow({ name: '休暇主賓' }), false],
+    [isNoiseRow({ name: 'CF寿司容器' }), false],
+    [isNoiseRow({ name: '品番' }), true],
+    [isNoiseRow({ name: '', makerCode: '' }), true],
+    [isNoiseRow({ name: '送料込みセット', newCost: '120' }), false],
+  ];
+  for (const [got, exp] of ok) {
+    if (got !== exp) {
+      console.error('noiserow selfTest FAILED', { got, exp });
+      process.exit(1);
+    }
+  }
+  console.log('noiserow selfTest OK');
+}
+
+if (require.main === module) selfTest();
+
+module.exports = { isNoiseRow, isNumericPrice, describeNoiseRow, isVacationNote, hasNoteKeyword, selfTest };

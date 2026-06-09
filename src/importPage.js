@@ -43,6 +43,12 @@ const IMPORT_PAGE = `<!doctype html>
   tr.noise-row td.incell, tr.saved-skip-row td.incell{ text-align:center }
   tr.noise-row:has(input.rowinc:not(:checked)) td:not(.incell), tr.saved-skip-row:has(input.rowinc:not(:checked)) td:not(.incell){ color:#8a7a6a }
   #noiseBar{ display:none; margin:6px 0 10px; padding:8px 12px; background:#fff8e6; border:1px solid #e6c200; border-radius:6px; font-size:12px; color:#5a4200; line-height:1.65 }
+  #skipRecordPanel{ margin-top:8px; padding:8px 12px; background:#f6f0fa; border:1px solid #d8c8e8; border-radius:8px; font-size:12px; color:#3a3048; line-height:1.55 }
+  #skipRecordPanel summary{ font-weight:700; color:#4a3560; cursor:pointer }
+  #skipPanelBody table th,#skipPanelBody table td{ padding:4px 8px; font-size:11px; vertical-align:top }
+  #skipPanelBody .skipRmBtn{ border:1px solid #c7b8d8; border-radius:5px; background:#fff; color:#4a3560; cursor:pointer }
+  #skipPanelBody .skipRmBtn:hover{ background:#ede4f4 }
+  a.skipPanelLink{ color:#1f4e78; font-weight:700 }
 </style></head><body>
 <header>
   <h1>メーカー見積 取り込み</h1>
@@ -84,6 +90,10 @@ const IMPORT_PAGE = `<!doctype html>
     </div>
   </div>
   <div id="profSummary" style="display:none;margin-top:8px;padding:8px 10px;background:#eef7ee;border:1px solid #cfe6cf;border-radius:6px;font-size:12px;color:#2e5a2e"></div>
+  <details id="skipRecordPanel" style="display:none">
+    <summary>📝 取込対象外の記録 <span id="skipPanelCnt">0</span> 品を見る（一覧・解除）</summary>
+    <div id="skipPanelBody" style="margin-top:8px"></div>
+  </details>
 </div>
 
 <div class="step" id="step2">
@@ -217,10 +227,12 @@ function priorMeta(res){
 function renderImportHintHtml(res, detailed){
   if(!res) return { html:'', kind:'', style:'' };
   if(!res.hasExisting&&!(res.savedSkipCount>0)) return { html:'', kind:'', style:'' };
+  const skipLink='<br><a href="#" class="skipPanelLink">📝 記録の一覧・解除はこちら</a>';
   if(!res.hasExisting&&res.savedSkipCount>0){
     let html='📝 <b>取込対象外の記録 '+res.savedSkipCount+' 品</b>（この仕入先）';
     if(detailed) html+='<br>この表に該当品があれば<b>自動でチェック OFF</b>（紫背景）で表示します。';
     else html+='<br>前回チェックを外して保存した品は、次に同じ品番・商品名が表に出たら<b>自動でチェック OFF</b>にします。';
+    html+=skipLink;
     return { html, kind:'prior_only', style: importHintBoxStyle('prior_only') };
   }
   if(!res.hasExisting) return { html:'', kind:'', style:'' };
@@ -230,7 +242,7 @@ function renderImportHintHtml(res, detailed){
   if(!detailed){
     html='ℹ️ <b>この仕入先は過去に取込済みです</b>'+meta;
     html+='<br><b>ファイル名やシートが同じでも、内容はまだ確認していません。</b>表を読み込むと品番・商品名で重複をチェックします。';
-    if(res.savedSkipCount>0) html+='<br>📝 <b>取込対象外の記録 '+res.savedSkipCount+' 品</b>あり。次に同じ品が表に出たら自動でチェック OFF にします。';
+    if(res.savedSkipCount>0) html+='<br>📝 <b>取込対象外の記録 '+res.savedSkipCount+' 品</b>あり。次に同じ品が表に出たら自動でチェック OFF にします。'+skipLink;
   } else if(kind==='reimport'&&res.overlap){
     const o=res.overlap;
     html='⚠️ <b>再取込の可能性が高い</b>'+meta;
@@ -343,6 +355,54 @@ async function refreshNoiseRows(){
   }catch(e){ if(bar) bar.style.display='none'; }
 }
 function scheduleNoiseRefresh(){ clearTimeout(noiseTimer); noiseTimer=setTimeout(refreshNoiseRows, 320); }
+let skipPanelTimer=null;
+function scheduleSkipRecordPanel(){ clearTimeout(skipPanelTimer); skipPanelTimer=setTimeout(refreshSkipRecordPanel, 200); }
+function openSkipRecordPanel(){
+  const p=$('#skipRecordPanel');
+  if(p){ p.open=true; p.scrollIntoView({behavior:'smooth',block:'nearest'}); }
+}
+async function refreshSkipRecordPanel(){
+  const panel=$('#skipRecordPanel');
+  const body=$('#skipPanelBody');
+  const cnt=$('#skipPanelCnt');
+  if(!panel||!body) return;
+  const supplier=$('#supplier').value.trim();
+  if(!supplier){ panel.style.display='none'; if(cnt) cnt.textContent='0'; return; }
+  try{
+    const res=await fetch('/api/import-skips?supplier='+encodeURIComponent(supplier)).then(x=>x.json());
+    const skips=res.skips||[];
+    if(cnt) cnt.textContent=String(skips.length);
+    if(!skips.length){ panel.style.display='none'; return; }
+    panel.style.display='block';
+    let h='<p style="margin:0 0 8px;font-size:11px;color:#6b5785">チェックを外して保存した品です。次回同じ品番・商品名が表に出ると<b>自動でチェック OFF</b>（紫背景）になります。<br>「解除」すると記録から消え、次回は自動除外されません。</p>';
+    h+='<div class="wrap" style="max-height:220px"><table style="width:100%"><thead><tr><th>品番</th><th>商品名</th><th>理由</th><th>記録日</th><th>回</th><th></th></tr></thead><tbody>';
+    const show=skips.slice(0, 80);
+    show.forEach(s=>{
+      h+='<tr><td>'+esc(s.makerCode||'—')+'</td><td>'+esc(s.makerName||'—')+'</td><td>'+esc(s.reason||'')+'</td><td nowrap>'+esc(fmtImportDate(s.at))+'</td><td style="text-align:center">'+esc(String(s.times||1))+'</td>';
+      h+='<td><button type="button" class="skipRmBtn" data-key="'+esc(s.key)+'">解除</button></td></tr>';
+    });
+    h+='</tbody></table></div>';
+    if(skips.length>80) h+='<p style="font-size:11px;color:#8a7a9a;margin:6px 0 0">…ほか '+(skips.length-80)+' 件（古い記録は省略）</p>';
+    body.innerHTML=h;
+    body.querySelectorAll('.skipRmBtn').forEach(btn=>{
+      btn.onclick=()=>removeImportSkipRecord(btn.getAttribute('data-key'));
+    });
+  }catch(e){ panel.style.display='none'; }
+}
+async function removeImportSkipRecord(key){
+  const supplier=$('#supplier').value.trim();
+  if(!supplier||!key) return;
+  if(!confirm('この取込対象外の記録を解除しますか？\\n次回、この品は自動ではチェック OFF になりません。')) return;
+  try{
+    const res=await fetch('/api/import-skip-remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,key})}).then(x=>x.json());
+    if(res.ok){
+      await refreshSkipRecordPanel();
+      refreshImportHintEarly();
+      if(grid.length) scheduleNoiseRefresh();
+      scheduleImportHint();
+    }else alert(res.error||'解除に失敗しました');
+  }catch(e){ alert('解除に失敗: '+(e&&e.message||e)); }
+}
 // 列マッピング前のざっくり重複チェック（見出し自動検出で品番・商品名列を拾う）
 function previewItemsFromGrid(){
   if(!grid.length) return [];
@@ -489,6 +549,7 @@ function onPurchaseCodePick(){
   updateStep2Lock();
   warnSupplierMismatch();
   refreshImportHintEarly();
+  scheduleSkipRecordPanel();
 }
 function updatePurchaseBadge(){
   const code=$('#purchaseCodeSel').value;
@@ -504,7 +565,7 @@ function onSupplierPick(){
     //  （問屋の下のメーカー名を手入力するケース＝コードは問屋のまま）。
     activeProfile=null; $('#supplier').value=''; $('#supplier').focus();
     $('#profMsg').textContent='';
-    showProfSummary(); updateStep2Lock(); return;
+    showProfSummary(); updateStep2Lock(); scheduleSkipRecordPanel(); return;
   }
   $('#supplier').value=v;
   activeProfile=MAKERS[v]||null;
@@ -522,6 +583,7 @@ function onSupplierPick(){
   updateStep2Lock();
   warnSupplierMismatch();
   refreshImportHintEarly();
+  scheduleSkipRecordPanel();
 }
 // ① の入力状態に応じて ② のフォームを有効／無効化
 function updateStep2Lock(){
@@ -976,7 +1038,10 @@ $('#manualTbl').addEventListener('input',(e)=>{
 
 $('#parseBtn').addEventListener('click',parse);
 $('#supplierSel').addEventListener('change',onSupplierPick);
-$('#supplier').addEventListener('input',()=>{ updateStep2Lock(); warnSupplierMismatch(); scheduleImportHint(); });
+$('#supplier').addEventListener('input',()=>{ updateStep2Lock(); warnSupplierMismatch(); scheduleImportHint(); scheduleSkipRecordPanel(); });
+document.addEventListener('click',(e)=>{
+  if(e.target.closest&&e.target.closest('.skipPanelLink')){ e.preventDefault(); openSkipRecordPanel(); }
+});
 $('#resetBtn').addEventListener('click',()=>{
   if((grid.length || $('#supplier').value.trim()) && !confirm('入力中の仕入先・取り込みデータをすべて消して、別の仕入先を最初から取り込みますか？')) return;
   resetImport(); hideTop(); $('#supplier').focus();
@@ -1093,6 +1158,7 @@ document.addEventListener('input',(e)=>{
 loadMakers();
 loadSuppliersMaster();
 updateStep2Lock(); // 初期状態（仕入先未選択）でロック
+scheduleSkipRecordPanel();
 $('#saveBtn').addEventListener('click',async()=>{
   const supplier=$('#supplier').value.trim();
   if(!supplier){ $('#msg').style.color='#c0392b'; $('#msg').textContent='① 仕入先名を入れてください'; return; }
@@ -1148,6 +1214,7 @@ $('#saveBtn').addEventListener('click',async()=>{
       resetImport();
       showTop(okMsg, kind);
       loadMakers();             // 新しく登録した書式をプルダウンに反映
+      scheduleSkipRecordPanel();
     }
     else { $('#msg').style.color='#c0392b'; $('#msg').textContent='保存失敗: '+(res.error||''); }
   }catch(e){ $('#msg').style.color='#c0392b'; $('#msg').textContent='保存失敗: '+e; }

@@ -53,6 +53,16 @@ function updateImportSkips(supplier, includedItems, skippedItems) {
   return merged;
 }
 
+// 1件の記録を解除（次回の自動除外を止める）
+function removeImportSkip(supplier, key) {
+  const sup = String(supplier || '').trim();
+  const k = String(key || '').trim();
+  if (!sup || !k) return getImportSkips(sup);
+  const merged = getImportSkips(sup).filter((x) => x.key !== k);
+  saveMakerProfile(sup, { importSkips: merged });
+  return merged;
+}
+
 // 単体検証（settings.json は触らない＝キー生成の整合のみ）
 function selfTest() {
   const kCd = makerProdKey({ makerCode: '  AbC12  ', makerName: '無視される' });
@@ -77,4 +87,4 @@ function selfTest() {
 
 if (require.main === module) selfTest();
 
-module.exports = { getImportSkips, lookupImportSkip, updateImportSkips, selfTest };
+module.exports = { getImportSkips, lookupImportSkip, updateImportSkips, removeImportSkip, selfTest };
