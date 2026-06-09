@@ -34,6 +34,7 @@ const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, norm
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
 const { describeNoiseRow } = require('./noiserow');
+const { getImportSkips, lookupImportSkip, updateImportSkips } = require('./importSkip');
 // 配信HTMLの版（/api/ping の rev と一致＝古いサーバが残っていないか確認用）
 const SIM_PAGE_REV = '20260608a';
 const { buildCostCsv } = require('./cost_export');
@@ -1259,8 +1260,9 @@ function listMakerQuotes() {
 function buildMakerImportHint(supplier, previewItems) {
   supplier = String(supplier || '').trim();
   if (!supplier) return { hasExisting: false };
+  const savedSkipCount = getImportSkips(supplier).length;
   const listed = listMakerQuotes().find((x) => x.supplier === supplier);
-  if (!listed) return { hasExisting: false, supplier };
+  if (!listed) return { hasExisting: false, supplier, savedSkipCount };
   const res = {
     hasExisting: true,
     supplier,
@@ -1269,6 +1271,7 @@ function buildMakerImportHint(supplier, previewItems) {
     sourceCount: (listed.sources || []).length,
     status: listed.status,
     needsRematch: !!listed.needsRematch,
+    savedSkipCount: getImportSkips(supplier).length,
   };
   const items = Array.isArray(previewItems) ? previewItems : [];
   if (items.length) {
@@ -1390,6 +1393,14 @@ function saveMakerQuote(body) {
   }
   const result = { ok: true, count: items.length, file: 'maker_quotes/' + fname, linkedCount };
   invalidateMakerCaches(); // 新CSV追加＝統合キャッシュを破棄（照合前でも取込ヒントに反映）
+  const skippedItems = Array.isArray(body && body.skippedItems) ? body.skippedItems : [];
+  if (skippedItems.length || items.length) {
+    try {
+      const saved = updateImportSkips(supplier, items, skippedItems);
+      if (skippedItems.length) result.recordedSkips = skippedItems.length;
+      result.savedSkipTotal = saved.length;
+    } catch (_) { /* 記録失敗でも見積保存は成功 */ }
+  }
   // 防止策②（警告）：自社製造で、補完しても自社コードが全く無い商品は照合できず休眠になる→重複の原因。
   if (isSelfMade) {
     const missing = items.filter((it) => !String((it && it.makerCode) || '').trim()).length;
@@ -2364,14 +2375,34 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url === '/api/noise-rows') {
       const body = await readBody(req);
+      const supplier = String((body && body.supplier) || '').trim();
       const rows = Array.isArray(body && body.rows) ? body.rows : [];
-      const flags = rows.map((r) => describeNoiseRow({
-        name: r.makerName,
-        makerCode: r.makerCode,
-        currentCost: r.currentCost,
-        newCost: r.newCost,
-      }));
-      return sendJson(res, 200, { flags });
+      const flags = rows.map((r) => {
+        const base = describeNoiseRow({
+          name: r.makerName,
+          makerCode: r.makerCode,
+          currentCost: r.currentCost,
+          newCost: r.newCost,
+        });
+        const saved = supplier ? lookupImportSkip(supplier, r) : null;
+        if (saved) {
+          return {
+            noise: base.noise || true,
+            reason: base.reason || saved.reason || '前回取込対象外',
+            remembered: true,
+            savedAt: saved.at,
+            savedTimes: saved.times || 1,
+          };
+        }
+        return Object.assign({ remembered: false }, base);
+      });
+      return sendJson(res, 200, { flags, savedSkipCount: supplier ? getImportSkips(supplier).length : 0 });
+    }
+    if (req.method === 'GET' && url.startsWith('/api/import-skips')) {
+      const sp = new URLSearchParams(req.url.split('?')[1] || '');
+      const supplier = (sp.get('supplier') || '').trim();
+      const skips = getImportSkips(supplier);
+      return sendJson(res, 200, { supplier, skips, count: skips.length });
     }
     if (req.method === 'GET' && url === '/api/maker-list') {
       return sendJson(res, 200, { items: listMakerQuotes() });

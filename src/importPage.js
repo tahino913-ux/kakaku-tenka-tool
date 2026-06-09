@@ -39,8 +39,9 @@ const IMPORT_PAGE = `<!doctype html>
   tr.divider td{ background:#fff4d6; color:#8a5a00; padding:4px 8px; font-weight:700;
     font-size:11px; text-align:center; border-top:2px dashed #c4a464; border-bottom:2px dashed #c4a464 }
   tr.noise-row td{ background:#f8f4ef }
-  tr.noise-row td.incell{ text-align:center }
-  tr.noise-row:has(input.rowinc:not(:checked)) td:not(.incell){ color:#8a7a6a }
+  tr.saved-skip-row td{ background:#f3eef8 }
+  tr.noise-row td.incell, tr.saved-skip-row td.incell{ text-align:center }
+  tr.noise-row:has(input.rowinc:not(:checked)) td:not(.incell), tr.saved-skip-row:has(input.rowinc:not(:checked)) td:not(.incell){ color:#8a7a6a }
   #noiseBar{ display:none; margin:6px 0 10px; padding:8px 12px; background:#fff8e6; border:1px solid #e6c200; border-radius:6px; font-size:12px; color:#5a4200; line-height:1.65 }
 </style></head><body>
 <header>
@@ -214,13 +215,21 @@ function priorMeta(res){
   return s+'）';
 }
 function renderImportHintHtml(res, detailed){
-  if(!res||!res.hasExisting) return { html:'', kind:'', style:'' };
+  if(!res) return { html:'', kind:'', style:'' };
+  if(!res.hasExisting&&!(res.savedSkipCount>0)) return { html:'', kind:'', style:'' };
+  if(!res.hasExisting&&res.savedSkipCount>0&&!detailed){
+    let html='📝 <b>取込対象外の記録 '+res.savedSkipCount+' 品</b>（この仕入先）';
+    html+='<br>前回チェックを外して保存した品は、次に同じ品番・商品名が表に出たら<b>自動でチェック OFF</b>にします。';
+    return { html, kind:'prior_only', style: importHintBoxStyle('prior_only') };
+  }
+  if(!res.hasExisting) return { html:'', kind:'', style:'' };
   const meta=priorMeta(res);
   const kind=detailed?(res.hintKind||'prior_only'):'prior_only';
   let html='';
   if(!detailed){
     html='ℹ️ <b>この仕入先は過去に取込済みです</b>'+meta;
     html+='<br><b>ファイル名やシートが同じでも、内容はまだ確認していません。</b>表を読み込むと品番・商品名で重複をチェックします。';
+    if(res.savedSkipCount>0) html+='<br>📝 <b>取込対象外の記録 '+res.savedSkipCount+' 品</b>あり。次に同じ品が表に出たら自動でチェック OFF にします。';
   } else if(kind==='reimport'&&res.overlap){
     const o=res.overlap;
     html='⚠️ <b>再取込の可能性が高い</b>'+meta;
@@ -259,39 +268,72 @@ function previewRowsFromGrid(){
 }
 function updateNoiseBarCount(){
   const bar=$('#noiseBar'); if(!bar||bar.style.display==='none') return;
-  const noise=$('#grid').querySelectorAll('tr.noise-row').length;
   const off=$('#grid').querySelectorAll('input.rowinc:not(:checked)').length;
+  const remembered=$('#grid').querySelectorAll('tr.saved-skip-row').length;
+  const noise=$('#grid').querySelectorAll('tr.noise-row').length;
+  const parts=[];
+  if(remembered) parts.push('前回記録 '+remembered);
+  if(noise) parts.push('非商品 '+noise);
+  if(off) parts.push('除外中 '+off);
   const span=bar.querySelector('.noiseCnt');
-  if(span) span.textContent=String(noise)+' 件検出・除外中 '+String(off)+' 件';
+  if(span&&parts.length) span.textContent=parts.join('・');
 }
 function bindNoiseBarButtons(){
   const ex=$('#noiseExcludeAll'), inc=$('#noiseIncludeAll');
   if(ex) ex.onclick=()=>{ $('#grid').querySelectorAll('tr.noise-row input.rowinc').forEach(c=>{ c.checked=false; }); updateNoiseBarCount(); scheduleImportHint(); };
   if(inc) inc.onclick=()=>{ $('#grid').querySelectorAll('input.rowinc').forEach(c=>{ c.checked=true; }); updateNoiseBarCount(); scheduleImportHint(); };
 }
+function collectSkipped(){
+  const rows=previewRowsFromGrid();
+  const skipped=[];
+  rows.forEach(row=>{
+    const cb=$('#grid').querySelector('input.rowinc[data-r="'+row.ri+'"]');
+    if(cb&&!cb.checked){
+      skipped.push({makerCode:row.makerCode,makerName:row.makerName,reason:String(cb.title||'').trim()||'取込対象外'});
+    }
+  });
+  return skipped;
+}
 async function refreshNoiseRows(){
   const bar=$('#noiseBar'); const rows=previewRowsFromGrid();
+  const supplier=$('#supplier').value.trim();
   if(!rows.length){ if(bar) bar.style.display='none'; return; }
   try{
-    const res=await fetch('/api/noise-rows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rows:rows.map(({ri,...rest})=>rest)})}).then(x=>x.json());
-    let noiseCount=0;
+    const res=await fetch('/api/noise-rows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,rows:rows.map(({ri,...rest})=>rest)})}).then(x=>x.json());
+    let noiseCount=0, rememberedCount=0;
     rows.forEach((row,i)=>{
       const info=(res.flags||[])[i]||{};
       const cb=$('#grid').querySelector('input.rowinc[data-r="'+row.ri+'"]');
       const tr=cb&&cb.closest('tr');
-      if(info.noise){
-        noiseCount++;
+      const exclude=!!info.noise||!!info.remembered;
+      if(info.remembered) rememberedCount++;
+      if(info.noise&&!info.remembered) noiseCount++;
+      if(exclude){
         if(cb && !cb.dataset.userToggled){ cb.checked=false; }
-        if(cb){ cb.title=info.reason||'非商品（取り込み対象外）'; }
-        if(tr){ tr.classList.add('noise-row'); tr.title=info.reason||''; }
+        if(cb){
+          let tip=info.reason||'取り込み対象外';
+          if(info.remembered) tip='📝 前回取込対象外：'+tip;
+          cb.title=tip;
+        }
+        if(tr){
+          tr.classList.toggle('noise-row', !!info.noise&&!info.remembered);
+          tr.classList.toggle('saved-skip-row', !!info.remembered);
+          tr.title=cb?cb.title:'';
+        }
       } else {
         if(cb && !cb.dataset.userToggled){ cb.checked=true; cb.title='取り込む'; }
-        if(tr){ tr.classList.remove('noise-row'); tr.title=''; }
+        if(tr){ tr.classList.remove('noise-row','saved-skip-row'); tr.title=''; }
       }
     });
-    if(noiseCount>0&&bar){
+    const savedTotal=res.savedSkipCount||0;
+    if((noiseCount>0||rememberedCount>0)&&bar){
       bar.style.display='block';
-      bar.innerHTML='⚠ <b>非商品の可能性 <span class="noiseCnt">'+noiseCount+' 件</span></b>（運賃案内・見出し再掲・休暇告知など）— <b>チェックを外した行は保存されません</b>。'
+      let msg='';
+      if(rememberedCount>0) msg+='📝 <b>前回取込対象外 '+rememberedCount+' 件</b>をこの表で検出（自動でチェック OFF）。記録済みは合計 '+savedTotal+' 品。';
+      if(noiseCount>0) msg+=(msg?'<br>':'')+'⚠ <b>非商品の可能性 '+noiseCount+' 件</b>（運賃案内・見出し再掲・休暇告知など）。';
+      msg+=' <b>チェックを外した行は保存されません</b>（次回も記憶します）。';
+      bar.innerHTML=msg
+        +' <span class="noiseCnt" style="display:none"></span>'
         +' <button type="button" id="noiseExcludeAll" class="go" style="background:#8a6d3b;padding:4px 10px;font-size:11px;margin-left:6px">非商品候補をすべて除外</button>'
         +' <button type="button" id="noiseIncludeAll" style="padding:4px 10px;font-size:11px;margin-left:4px;border:1px solid #c7ced8;border-radius:6px;background:#fff;cursor:pointer">すべて対象にする</button>';
       bindNoiseBarButtons();
@@ -323,7 +365,7 @@ async function refreshImportHintEarly(){
   if(!supplier||grid.length){ el.style.display='none'; return; }
   try{
     const res=await fetch('/api/maker-import-hint?supplier='+encodeURIComponent(supplier)).then(x=>x.json());
-    if(!res.hasExisting){ el.style.display='none'; return; }
+    if(!res.hasExisting&&!(res.savedSkipCount>0)){ el.style.display='none'; return; }
     const h=renderImportHintHtml(res, false);
     el.setAttribute('style', h.style);
     el.innerHTML=h.html;
@@ -1071,7 +1113,8 @@ $('#saveBtn').addEventListener('click',async()=>{
   if(ff>0 && !confirm('実施日が3か月以上先の行が '+ff+' 件あります。\\n年の打ち間違い（例 2027→2026）ではありませんか？\\nこのまま保存しますか？')){ return; }
   $('#msg').style.color='#6b7785'; $('#msg').textContent='保存中…';
   const purchaseCode=$('#purchaseCodeSel').value.trim();
-  const payload={supplier,items,map,delim:$('#delim').value,hasHeader:$('#hasHeader').checked,purchaseCode};
+  const skippedItems=collectSkipped();
+  const payload={supplier,items,map,delim:$('#delim').value,hasHeader:$('#hasHeader').checked,purchaseCode,skippedItems};
   try{
     const res=await fetch('/api/maker-quote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(x=>x.json());
     if(res.ok){
@@ -1084,7 +1127,8 @@ $('#saveBtn').addEventListener('click',async()=>{
         kind='warn';
       }
       const linkMsg=(res.linkedCount>0)?' ／ 📌 自社コード入力 '+res.linkedCount+'件を手動紐付け（100%確定）として登録しました。':'';
-      let okMsg='✓ <b>'+esc(supplier)+'</b> を保存しました（'+res.count+'件'+(excludedCount?('・除外 '+excludedCount+' 行'):'')+'）。書式（列の対応）も登録したので次回から自動適用されます。 → '+esc(res.file||'')+linkMsg+extra
+      let okMsg='✓ <b>'+esc(supplier)+'</b> を保存しました（'+res.count+'件'+(excludedCount?('・除外 '+excludedCount+' 行'):'')+'）。書式（列の対応）も登録したので次回から自動適用されます。 → '+esc(res.file||'')+linkMsg+extra;
+      if(res.recordedSkips) okMsg+='<br>📝 取込対象外 <b>'+res.recordedSkips+' 件</b>を記録しました（次回同じ品は自動で除外）。'+(res.savedSkipTotal!=null?' 記録合計 '+res.savedSkipTotal+' 品。':'');
         +'<br><b>続けて別の仕入先を取り込めます</b>（入力はクリアしました。① で次の仕入先を選んでください）。';
       // 二重登録の警告：同じ商品が「別の仕入先」にも登録されている＝取り違えの可能性。
       const dw=res.dupWarning;
