@@ -3092,6 +3092,7 @@ let allMakerNames = [];   // 編集モーダルのドロップダウン候補
 let currentSuppliers = {}; // 仕入先マスタ {コード: {name, ...}} ：発注先名の解決に使用
 let linkUpgradeMap = {};   // 手動紐付けより確実な候補 { 仕入先\\x01自社CD: issue }
 let linkSuspectMap = {};   // 手動紐付けの勘違いの疑い { 仕入先\\x01自社CD: issue }
+let linkIssues = [];       // 紐付け監査の全issue（別枠「要見直し」パネル用）
 let mainSortMode = '';     // 一致品の並び：''=得意先順 / 'matchDesc'=一致度高い順 / 'matchAsc'=低い順
 
 const yen = (v) => Number.isFinite(v) ? '¥' + Math.round(v).toLocaleString('ja-JP') : '—';
@@ -3605,7 +3606,7 @@ function linkDecisiveDiff(selfCore, maker){
 //   ・maker（自社CDがある行）= 従来。自社品に対して「確定するメーカー商品」を選ぶ。
 //   ・self （自社CDが無い休眠行）= 新。メーカー品(固定)に対して「実績のある自社品」を販売実績から選ぶ。
 //     ＝休眠（メーカー品が自社品に1つも当たっていない）を、画面から直接 手動紐付けで救済できる。
-async function openLinkModal(idx){
+async function openLinkModal(idx, preselect){
   const r = baseRows[idx]; if(!r) return;
   // 仕入先の確定（横断ビュー・★全部ビューは行の仕入先、通常は選択中ファイルの仕入先）
   const supplier = (dateFilter || allView) ? (r.supplier || '') : (currentSupplier || '');
@@ -3757,6 +3758,11 @@ async function openLinkModal(idx){
     if (hit) initVal = hit.value;
   }
   if (!initVal) initVal = (scored[0] && scored[0].value) || '';
+  // 「✏ 直す」で推奨候補を指定して開いたときは、それを選択済みにする（中身を見て保存するだけ）。
+  if (preselect) {
+    const hp = scored.find((x) => linkEq(x.value, preselect));
+    initVal = hp ? hp.value : preselect;
+  }
   renderOptions('');
   sel.value = initVal;
   if (sel.value !== initVal && initVal) {
@@ -3794,6 +3800,7 @@ async function openLinkModal(idx){
         const pl = res.productLinks[supplier];
         if (pl && typeof pl === 'object') currentLinks = pl;
       }
+      loadLinkCheck(); // 監査バナー・⚠マークを取り直す（直した分は消える）
     } catch (e) { alert('保存に失敗: '+e); }
   });
 }
@@ -4385,6 +4392,7 @@ async function loadLinkCheck(){
   try{
     const r=await fetch('/api/link-check').then(x=>x.json());
     const issues=(r&&r.issues)||[];
+    linkIssues = issues;
     linkUpgradeMap = {};
     issues.filter(i=>i.kind==='better_cd'||i.kind==='better_name').forEach(i=>{
       linkUpgradeMap[i.supplier+'\x01'+i.code] = i;
@@ -4406,29 +4414,179 @@ async function loadLinkCheck(){
           return x.k;
         }).join('・');
       };
-      const ss=suspect.slice(0,6).map(i=>'　・'+esc(i.supplier)+' '+esc(i.code)+'：自社「'+esc(i.selfName||'')+'」に 手動「'+esc(i.linked)+'」＝<b>'+esc(reasonLabel(i.reasons))+'</b>').join('<br>');
+      const ss=suspect.slice(0,6).map(i=>'<div style="padding:2px 0">　・'+esc(i.supplier)+' '+esc(i.code)+'：自社「'+esc(i.selfName||'')+'」に 手動「'+esc(i.linked)+'」＝<b>'+esc(reasonLabel(i.reasons))+'</b>'+linkRowBtns(i)+'</div>').join('');
       html+='🚨 <b>手動紐付けの勘違いの疑い '+suspect.length+'件</b>：紐付け先のメーカー品が<b>自社商品とそもそも別物</b>の可能性があります（別商品に📌した取り違え）。'
         +'「✏ 紐付け」で正しいメーカー品に直す（取り違えなら一旦解除）と安全です。<br>'+ss+(suspect.length>6?'<br>　…ほか '+(suspect.length-6)+' 件':'')+'<br>';
     }
     if(better.length){
       const bs=better.slice(0,5).map(i=>{
         const lbl = i.kind==='better_cd' ? 'CD一致候補' : ('名前一致 '+i.betterScore+'%');
-        return '　・'+esc(i.supplier)+' '+esc(i.code)+'：手動「'+esc(i.linked)+'」→ より確実「'+esc(i.betterMaker)+'」（'+lbl+'）';
-      }).join('<br>');
+        return '<div style="padding:2px 0">　・'+esc(i.supplier)+' '+esc(i.code)+'：手動「'+esc(i.linked)+'」→ より確実「'+esc(i.betterMaker)+'」（'+lbl+'）'+linkRowBtns(i)+'</div>';
+      }).join('');
       html+='🔔 <b>手動紐付けより確実な候補 '+better.length+'件</b>：自動照合では別のメーカー品の方が信頼度が高いです。'
         +'「✏ 紐付け」で切り替えるか、商品マスタ(商品名3)に品番を登録してCD一致にしてください。<br>'+bs+(better.length>5?'<br>　…ほか '+(better.length-5)+' 件':'')+'<br>';
     }
     if(mism.length){
-      const ms=mism.slice(0,5).map(i=>'　・'+esc(i.supplier)+' '+esc(i.code)+'：登録「'+esc(i.linked)+'」→ 照合は「'+esc(i.hint||i.makers[0]||'?')+'」').join('<br>');
+      const ms=mism.slice(0,5).map(i=>'<div style="padding:2px 0">　・'+esc(i.supplier)+' '+esc(i.code)+'：登録「'+esc(i.linked)+'」→ 照合は「'+esc(i.hint||i.makers[0]||'?')+'」'+linkRowBtns(i)+'</div>').join('');
       html+='🔗 <b>手動紐付けの表記ずれ '+mism.length+'件</b>：登録名とメーカー品名が一致していません。'
         +'「✏ 紐付け」で<b>候補リストから選び直す</b>と安全です。<br>'+ms+(mism.length>5?'<br>　…ほか '+(mism.length-5)+' 件':'');
     }
+    const totalN = suspect.length+better.length+mism.length;
+    html = '<div style="margin-bottom:8px"><button id="linkReviewOpen" style="font-size:12px;font-weight:700;padding:4px 12px;background:#1976d2;color:#fff;border:none;border-radius:5px;cursor:pointer">📋 まとめて見直す（'+totalN+'件）</button>'
+      +' <span style="font-size:11px;color:#8a6d1a">各行の「✅切替／解除／✏直す／🔍確認」でもその場で直せます。反映は会社PCで「↻ 照合」。</span></div>' + html;
     box.style.display='block';
     box.innerHTML=html;
+    // バナー各行のボタンを配線（ジャンプ／一括切替／解除／編集）
+    box.querySelectorAll('.linkJump').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; jumpToLinkRow(t.dataset.sup,t.dataset.code);}));
+    box.querySelectorAll('.linkSwitch').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; switchLinkTo(t.dataset.sup,t.dataset.code,t.dataset.better);}));
+    box.querySelectorAll('.linkUnlink').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; switchLinkTo(t.dataset.sup,t.dataset.code,'');}));
+    box.querySelectorAll('.linkEdit').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; editLinkRow(t.dataset.sup,t.dataset.code,t.dataset.better||'');}));
+    const ro=$('#linkReviewOpen'); if(ro) ro.addEventListener('click', openLinkReviewPanel);
     // 表の 📌 セルに ⚠ を付け直す（すでに描画済みのとき）
     if(baseRows.length && !dateFilter) renderMainRows(!!dateFilter);
-  }catch(e){ box.style.display='none'; linkUpgradeMap={}; linkSuspectMap={}; }
+  }catch(e){ box.style.display='none'; linkUpgradeMap={}; linkSuspectMap={}; linkIssues=[]; }
 }
+// 紐付け監査の各行に付ける操作ボタン（バナー・別枠パネル共通）。data-* に仕入先/自社CD/推奨候補を持たせる。
+function linkRowBtns(i){
+  const sup=escAttr(i.supplier||''), code=escAttr(i.code||'');
+  const pre=escAttr(i.betterMaker||i.hint||'');
+  const bs='font-size:11px;margin-left:6px;padding:1px 7px;border:1px solid #c7ced8;border-radius:4px;background:#fff;cursor:pointer';
+  let h=' <button class="linkJump" data-sup="'+sup+'" data-code="'+code+'" style="'+bs+'">🔍 確認</button>';
+  if(i.kind==='better_cd'||i.kind==='better_name'){
+    h+='<button class="linkSwitch" data-sup="'+sup+'" data-code="'+code+'" data-better="'+escAttr(i.betterMaker||'')+'" style="'+bs+';color:#1565c0;border-color:#90caf9;font-weight:700">✅ この候補に切替</button>';
+  }
+  if(i.kind==='suspect'){
+    h+='<button class="linkUnlink" data-sup="'+sup+'" data-code="'+code+'" style="'+bs+';color:#b71c1c;border-color:#ef9a9a;font-weight:700">解除</button>';
+  }
+  h+='<button class="linkEdit" data-sup="'+sup+'" data-code="'+code+'" data-better="'+pre+'" style="'+bs+'">✏ 直す</button>';
+  return h;
+}
+// reasons 配列 → 日本語ラベル（別枠パネル用）。loadLinkCheck 内の reasonLabel と同等。
+function reasonLabelText(rs){
+  return (rs||[]).map(function(x){
+    if(x.k==='low_name') return '名前がほぼ別物('+x.v+'%)';
+    if(x.k==='size_mismatch') return 'サイズ違い';
+    if(x.k==='color_mismatch') return '色違い';
+    if(x.k==='price_gap') return '原価が約'+x.v+'倍ズレ('+x.self+'→'+x.maker+')';
+    return x.k;
+  }).join('・');
+}
+// 自社CDの正規化（数字のみは6桁ゼロ詰め）＝行検索の突合キー。
+function codePadN(c){ const s=String(c||'').trim(); return /^\\d+$/.test(s) ? s.padStart(6,'0') : s; }
+// baseRows から 仕入先＋自社CD に一致する行の index を探す（見つからなければ -1）。
+function findLinkRowIdx(supplier, code){
+  const nc=codePadN(code), nsup=String(supplier||'');
+  for(let i=0;i<baseRows.length;i++){
+    const r=baseRows[i];
+    if(codePadN(r.productCode)!==nc) continue;
+    if(allView && nsup && String(r.supplier||'')!==nsup) continue;
+    return i;
+  }
+  return -1;
+}
+// 該当行が今の表に無ければ「★全部」ビューへ切り替えてから探し直す。戻り値 idx（-1=見つからず）。
+async function ensureLinkRowVisible(supplier, code){
+  let idx=findLinkRowIdx(supplier,code);
+  if(idx>=0) return idx;
+  $('#file').value='*ALL*';
+  await loadAll();
+  return findLinkRowIdx(supplier,code);
+}
+// バナー/パネルから「🔍 確認」＝該当行へジャンプ＆ハイライト。
+async function jumpToLinkRow(supplier, code){
+  closeLinkReview();
+  const idx=await ensureLinkRowVisible(supplier,code);
+  if(idx<0){ $('#msg').style.color='#9a6a00'; $('#msg').textContent='該当行が見つかりませんでした（提出済みで非表示／別の照合結果の可能性）。'; return; }
+  const tr=document.getElementById('row'+idx);
+  if(!tr){
+    if(baseRows[idx] && baseRows[idx].itemStatus==='issued'){ $('#msg').style.color='#1f6b35'; $('#msg').textContent='この商品は「見積書 作成済み（提出済み）」のためメイン表では非表示です（得意先別ページで確認できます）。'; }
+    else { $('#msg').style.color='#9a6a00'; $('#msg').textContent='該当行は現在の表に表示されていません。'; }
+    return;
+  }
+  tr.scrollIntoView({behavior:'smooth', block:'center'});
+  tr.classList.add('focusrow'); setTimeout(()=>{ tr.classList.remove('focusrow'); }, 6000);
+  $('#msg').textContent='';
+}
+// バナー/パネルから「✏ 直す」＝該当行の紐付けモーダルを推奨候補を選択済みで開く。
+async function editLinkRow(supplier, code, better){
+  closeLinkReview();
+  const idx=await ensureLinkRowVisible(supplier,code);
+  if(idx<0){ $('#msg').style.color='#9a6a00'; $('#msg').textContent='該当行が見つかりませんでした（提出済みで非表示／別の照合結果の可能性）。'; return; }
+  openLinkModal(idx, better||'');
+}
+// バナー/パネルから「✅ この候補に切替」（better=推奨メーカー名）／「解除」（better=''）＝ワンクリック保存（確認つき）。
+async function switchLinkTo(supplier, code, better){
+  const isUnlink=!better;
+  const msg=isUnlink
+    ? '「'+supplier+'  '+code+'」の手動紐付けを\\n解除します（自動マッチに戻す）。よろしいですか？\\n\\n※照合結果への反映には 会社PC(DBあり) で「↻ 照合」が必要です。'
+    : '「'+supplier+'  '+code+'」の紐付けを\\n「'+better+'」に切り替えます。よろしいですか？\\n\\n※照合結果への反映には 会社PC(DBあり) で「↻ 照合」が必要です。';
+  if(!confirm(msg)) return;
+  try{
+    const res=await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ supplier:supplier, productCode:code, makerName:better||'' })}).then(x=>x.json());
+    if(!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
+    if(res.linkWarn){ alert('⚠ '+res.linkWarn); }
+    $('#msg').style.color='#1f6b35';
+    $('#msg').textContent=(isUnlink?'📌 紐付けを解除しました':'📌 紐付けを「'+better+'」に切り替えました')+'（'+supplier+' '+code+'）。反映は会社PCで「↻ 照合」を押してください。';
+    const reopen=!!document.getElementById('linkRevDlg');
+    closeLinkReview();
+    await loadLinkCheck();                                  // 監査を取り直す（直した分は一覧から消える）
+    if(allView) await loadAll(); else if(!dateFilter) await loadFile(); // 表の 📌 表示を更新
+    if(reopen && linkIssues.length) openLinkReviewPanel();  // パネルから操作したなら開き直す
+  }catch(e){ alert('保存に失敗: '+e); }
+}
+// 別枠「要見直し」パネル：suspect/better/mismatch を1つの表に並べ、その場で切替・解除・編集できる。
+function openLinkReviewPanel(){
+  closeLinkReview();
+  // バナーと同じ3カテゴリだけ（孤立 orphan 等は除外＝古い紐付けでここでは扱わない）。
+  const order={ suspect:0, better_cd:1, better_name:1, name_mismatch:2 };
+  const items=linkIssues.filter(i=>order[i.kind]!=null).slice().sort((a,b)=>order[a.kind]-order[b.kind]);
+  if(!items.length) return;
+  const nsus=linkIssues.filter(i=>i.kind==='suspect').length;
+  const nbet=linkIssues.filter(i=>i.kind==='better_cd'||i.kind==='better_name').length;
+  const nmis=linkIssues.filter(i=>i.kind==='name_mismatch').length;
+  const rows=items.map(i=>{
+    let prob='', rec='';
+    if(i.kind==='better_cd'){ prob='🔔 CD一致の方が確実'; rec=esc(i.betterMaker||''); }
+    else if(i.kind==='better_name'){ prob='🔔 名前一致 '+i.betterScore+'% の方が高い'; rec=esc(i.betterMaker||''); }
+    else if(i.kind==='suspect'){ prob='🚨 '+esc(reasonLabelText(i.reasons)); rec='<span style="color:#b71c1c">取り違えの疑い → 解除を推奨</span>'; }
+    else { prob='🔗 登録名とメーカー名が不一致'; rec=esc(i.hint||(i.makers&&i.makers[0])||'?'); }
+    const self=i.selfName? esc(i.selfName) : '<span class="hint">—</span>';
+    return '<tr>'
+      +'<td>'+esc(i.supplier||'')+'</td>'
+      +'<td>'+esc(i.code||'')+'</td>'
+      +'<td>'+self+'</td>'
+      +'<td>'+esc(i.linked||'')+'</td>'
+      +'<td>'+prob+'</td>'
+      +'<td>'+rec+'</td>'
+      +'<td style="white-space:nowrap">'+linkRowBtns(i)+'</td>'
+      +'</tr>';
+  }).join('');
+  const wrap=document.createElement('div'); wrap.id='linkRevWrap';
+  wrap.innerHTML=
+    '<div id="linkRevBack" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9000"></div>'+
+    '<div id="linkRevDlg" style="position:fixed;top:4%;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;padding:18px;width:1000px;max-width:96%;max-height:88vh;overflow:auto;z-index:9001;box-shadow:0 10px 40px rgba(0,0,0,.2)">'+
+      '<h3 style="margin:0 0 8px">📋 紐付けの 要見直し 一覧</h3>'+
+      '<div style="font-size:12px;color:#6b7785;margin-bottom:10px">🚨 勘違いの疑い '+nsus+' ／ 🔔 より確実 '+nbet+' ／ 🔗 表記ずれ '+nmis+' 件。'+
+        '「✅ この候補に切替」「解除」はその場で保存します（<b>照合結果への反映には 会社PC(DBあり) で「↻ 照合」</b>が必要）。</div>'+
+      '<table id="linkRevTbl" style="width:100%;border-collapse:collapse;font-size:12px">'+
+        '<thead><tr style="background:#f1f4f8;text-align:left">'+
+          '<th style="padding:5px 6px">仕入先</th><th style="padding:5px 6px">自社CD</th><th style="padding:5px 6px">自社品名</th>'+
+          '<th style="padding:5px 6px">今の紐付け</th><th style="padding:5px 6px">問題</th><th style="padding:5px 6px">推奨</th><th style="padding:5px 6px">操作</th>'+
+        '</tr></thead><tbody>'+rows+'</tbody>'+
+      '</table>'+
+      '<div style="text-align:right;margin-top:12px"><button id="linkRevClose" style="padding:6px 14px">閉じる</button></div>'+
+    '</div>';
+  document.body.appendChild(wrap);
+  wrap.querySelectorAll('#linkRevTbl tbody td').forEach(td=>{ td.style.padding='5px 6px'; td.style.borderTop='1px solid #eef1f5'; td.style.verticalAlign='top'; });
+  $('#linkRevBack').addEventListener('click', closeLinkReview);
+  $('#linkRevClose').addEventListener('click', closeLinkReview);
+  wrap.querySelectorAll('.linkJump').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; jumpToLinkRow(t.dataset.sup,t.dataset.code);}));
+  wrap.querySelectorAll('.linkSwitch').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; switchLinkTo(t.dataset.sup,t.dataset.code,t.dataset.better);}));
+  wrap.querySelectorAll('.linkUnlink').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; switchLinkTo(t.dataset.sup,t.dataset.code,'');}));
+  wrap.querySelectorAll('.linkEdit').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; editLinkRow(t.dataset.sup,t.dataset.code,t.dataset.better||'');}));
+}
+function closeLinkReview(){ const w=document.getElementById('linkRevWrap'); if(w) w.remove(); }
 // CD一致化 候補：メーカー品番をマスタ(商品名3)に登録すればCD一致にできる品の案内＋CSVダウンロード。
 async function loadCdCandidates(){
   const box=$('#cdCand'); if(!box) return;

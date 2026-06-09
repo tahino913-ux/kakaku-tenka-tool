@@ -24,6 +24,9 @@ const CUSTOMERS_PAGE = `<!doctype html>
   button.go{background:#1f4e78;color:#fff;border:none;border-radius:8px;padding:7px 13px;font-weight:700;cursor:pointer}
   button.go:disabled{opacity:.5;cursor:not-allowed}
   #search{padding:7px 10px;border:1px solid #c7d6e4;border-radius:8px;font-size:13px;width:200px}
+  /* 得意先一覧カラムの上部に固定する検索バー（一覧の見出し「実施日を超過」のすぐ上＝名前一覧の直上） */
+  .listsearchbar{position:sticky;top:0;z-index:3;background:#fff;padding:8px;border-bottom:1px solid #e2e6ec}
+  .listsearchbar #search{width:100%;box-sizing:border-box}
   /* 計算カスタマイズ バー（メインページと同じ項目） */
   .calcbar{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;background:#f7fafd;border-bottom:1px solid #e2e6ec;padding:10px 16px}
   .calcbar .fld{display:flex;flex-direction:column;gap:3px}
@@ -200,7 +203,6 @@ const CUSTOMERS_PAGE = `<!doctype html>
 <div class="toolbar">
   <button class="go" id="toggleListBtn" style="background:#5b6b8b" title="左の得意先一覧を隠して、右の明細を広く使えます（もう一度押すと表示）">◀ 一覧を隠す</button>
   <button class="go" id="reloadBtn">🔄 最新の状態を読み込む</button>
-  <input id="search" type="text" placeholder="得意先を検索（名前・コード・カナ）…">
   <label style="font-size:12px;color:#5a6b7d;display:flex;align-items:center;gap:4px;white-space:nowrap" title="この期間に取引のある得意先だけ表示します（最終売上日で判定・DB直結時）。照合は全期間で拾うので、ここで何年ぶんを見るか決められます。"><span>表示期間</span>
     <select id="recentYears" style="padding:5px 8px;border:1px solid #c7d6e4;border-radius:8px;font-size:13px">
       <option value="1">過去1年（取引あり）</option>
@@ -309,7 +311,10 @@ const CUSTOMERS_PAGE = `<!doctype html>
 </div>
 
 <div class="wrap">
-  <div class="col-list" id="listCol"><div class="empty">読み込み中…</div></div>
+  <div class="col-list">
+    <div class="listsearchbar"><input id="search" type="text" placeholder="得意先を検索（名前・コード・カナ）…"></div>
+    <div id="listCol"><div class="empty">読み込み中…</div></div>
+  </div>
   <div class="col-detail" id="detailCol"><div class="empty">左の一覧から得意先を選んでください。</div></div>
 </div>
 
