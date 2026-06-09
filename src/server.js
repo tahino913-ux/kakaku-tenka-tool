@@ -1283,12 +1283,21 @@ function buildMakerImportHint(supplier, previewItems) {
       withKey++;
       if (keySet.has(makerProdKey({ makerCode: mc, makerName: mn }))) matched++;
     }
+    const newItems = withKey - matched;
+    const ratio = withKey ? Math.round((matched / withKey) * 100) : 0;
     res.overlap = {
       incoming: withKey,
       matched,
+      newItems,
       existingTotal: existing.length,
-      ratio: withKey ? Math.round((matched / withKey) * 100) : 0,
+      ratio,
     };
+    // 表の内容に基づく分類（仕入先名だけでは「再取込」と断定しない）
+    if (ratio >= 50 || matched >= 5) res.hintKind = 'reimport';
+    else if (matched > 0) res.hintKind = 'append';
+    else res.hintKind = 'all_new';
+  } else {
+    res.hintKind = 'prior_only'; // 過去に取込あり・今回の表は未比較
   }
   return res;
 }

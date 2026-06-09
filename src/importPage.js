@@ -197,25 +197,44 @@ function fmtImportDate(iso){
   if(isNaN(d.getTime())) return '';
   return d.getFullYear()+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');
 }
-function renderImportHintHtml(res, detailed){
-  if(!res||!res.hasExisting) return '';
-  let html='📋 <b>この仕入先は既に取り込み済みです</b>';
+function importHintBoxStyle(kind){
+  if(kind==='reimport') return 'margin:8px 0 10px;padding:9px 13px;background:#fff8e6;border:1px solid #e6c200;border-radius:7px;font-size:12.5px;color:#5a4200;line-height:1.65';
+  if(kind==='all_new'||kind==='append') return 'margin:8px 0 10px;padding:9px 13px;background:#eef8ee;border:1px solid #8bc78b;border-radius:7px;font-size:12.5px;color:#1a4a2a;line-height:1.65';
+  return 'margin:6px 0 0;padding:8px 12px;background:#eef6ff;border:1px solid #a8c8e8;border-radius:7px;font-size:12px;color:#1a4a6a;line-height:1.65';
+}
+function priorMeta(res){
   const dt=fmtImportDate(res.importedAt);
-  html+='（'+(dt?('最終 '+dt+'・'):'')+res.count+'品';
-  if(res.sourceCount>1) html+='・CSV '+res.sourceCount+'本';
-  html+='）<br>同じ見積を保存すると<b>最新版として上書き更新</b>されます（損益・見積の二重計上にはなりません）。';
-  if(detailed && res.overlap && res.overlap.incoming>0){
+  let s='（'+(dt?('最終取込 '+dt+'・'):'')+'登録済み '+res.count+'品';
+  if(res.sourceCount>1) s+='・CSV '+res.sourceCount+'本';
+  return s+'）';
+}
+function renderImportHintHtml(res, detailed){
+  if(!res||!res.hasExisting) return { html:'', kind:'', style:'' };
+  const meta=priorMeta(res);
+  const kind=detailed?(res.hintKind||'prior_only'):'prior_only';
+  let html='';
+  if(!detailed){
+    html='ℹ️ <b>この仕入先は過去に取込済みです</b>'+meta;
+    html+='<br><b>ファイル名やシートが同じでも、内容はまだ確認していません。</b>表を読み込むと品番・商品名で重複をチェックします。';
+  } else if(kind==='reimport'&&res.overlap){
     const o=res.overlap;
-    if(o.ratio>=50||o.matched>=5){
-      html+='<br>今回の表 <b>'+o.incoming+'品</b>のうち <b>'+o.matched+'品</b> が既存データと一致（<b>再取込の可能性が高い</b>です）。';
-    } else if(o.matched>0){
-      html+='<br>今回の表のうち '+o.matched+'/'+o.incoming+' 品が既存と一致（一部が重複の可能性）。';
-    } else {
-      html+='<br>今回の表は既存（'+o.existingTotal+'品）と一致する品番・商品名がありません＝<b>新規取込</b>の可能性が高いです。';
-    }
+    html='⚠️ <b>再取込の可能性が高い</b>'+meta;
+    html+='<br>今回の表 <b>'+o.incoming+'品</b>のうち <b>'+o.matched+'品</b>（'+o.ratio+'%）が既存と一致。保存すると一致品は<b>最新版で上書き更新</b>されます（二重計上にはなりません）。';
+  } else if(kind==='append'&&res.overlap){
+    const o=res.overlap;
+    const nw=o.newItems!=null?o.newItems:(o.incoming-o.matched);
+    html='📋 <b>追加取込</b>'+meta;
+    html+='<br>今回 <b>'+o.incoming+'品</b>のうち <b>'+nw+'品</b> は新規・<b>'+o.matched+'品</b> は既存と一致（一致分は上書き更新）。';
+  } else if(kind==='all_new'&&res.overlap){
+    const o=res.overlap;
+    html='✅ <b>新規取込（既存データへの追加）</b>'+meta;
+    html+='<br>今回の表 <b>'+o.incoming+'品</b>は、既存（'+o.existingTotal+'品）と一致する品番・商品名がありません。別シートの追加分として<b>そのまま追加</b>できます。';
+  } else {
+    html='ℹ️ <b>この仕入先は過去に取込済みです</b>'+meta;
+    html+='<br>表を読み込むと品番・商品名で重複をチェックします。';
   }
   if(res.needsRematch) html+='<br><span style="color:#7a5300">※ 前回の取込後、まだ再照合されていません（保存後は自動照合されます）。</span>';
-  return html;
+  return { html, kind, style: importHintBoxStyle(kind) };
 }
 // 列マッピング前のざっくり重複チェック（見出し自動検出で品番・商品名列を拾う）
 function previewItemsFromGrid(){
@@ -241,7 +260,9 @@ async function refreshImportHintEarly(){
   try{
     const res=await fetch('/api/maker-import-hint?supplier='+encodeURIComponent(supplier)).then(x=>x.json());
     if(!res.hasExisting){ el.style.display='none'; return; }
-    el.innerHTML=renderImportHintHtml(res, false);
+    const h=renderImportHintHtml(res, false);
+    el.setAttribute('style', h.style);
+    el.innerHTML=h.html;
     el.style.display='block';
   }catch(e){ el.style.display='none'; }
 }
@@ -260,7 +281,9 @@ async function refreshImportHint(){
       ? await fetch('/api/maker-import-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,items})}).then(x=>x.json())
       : await fetch('/api/maker-import-hint?supplier='+encodeURIComponent(supplier)).then(x=>x.json());
     if(!res.hasExisting){ el.style.display='none'; return; }
-    el.innerHTML=renderImportHintHtml(res, true);
+    const h=renderImportHintHtml(res, !!items.length);
+    el.setAttribute('style', h.style);
+    el.innerHTML=h.html;
     el.style.display='block';
   }catch(e){ el.style.display='none'; }
 }
