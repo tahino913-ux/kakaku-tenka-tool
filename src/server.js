@@ -33,6 +33,7 @@ const { priceRowAnomaly } = require('./anomaly');
 const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode } = require('./productLink');
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
+const { describeNoiseRow } = require('./noiserow');
 // 配信HTMLの版（/api/ping の rev と一致＝古いサーバが残っていないか確認用）
 const SIM_PAGE_REV = '20260608a';
 const { buildCostCsv } = require('./cost_export');
@@ -2360,6 +2361,17 @@ const server = http.createServer(async (req, res) => {
       const supplier = String((body && body.supplier) || '').trim();
       const items = Array.isArray(body && body.items) ? body.items : [];
       return sendJson(res, 200, buildMakerImportHint(supplier, items));
+    }
+    if (req.method === 'POST' && url === '/api/noise-rows') {
+      const body = await readBody(req);
+      const rows = Array.isArray(body && body.rows) ? body.rows : [];
+      const flags = rows.map((r) => describeNoiseRow({
+        name: r.makerName,
+        makerCode: r.makerCode,
+        currentCost: r.currentCost,
+        newCost: r.newCost,
+      }));
+      return sendJson(res, 200, { flags });
     }
     if (req.method === 'GET' && url === '/api/maker-list') {
       return sendJson(res, 200, { items: listMakerQuotes() });

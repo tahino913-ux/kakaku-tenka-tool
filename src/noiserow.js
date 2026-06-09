@@ -11,7 +11,7 @@
 // 商品名が「見出し語そのもの」なら再掲ヘッダ＝非商品。
 const HEADER_RE = /^(品番|コード|商品コード|商品名|品名|メーカー(名|品番|商品名)?|規格|現単価|新単価|現行(価格|単価)?|新(価格|単価)|改定(価格|単価)?|単価|金額|切替日|実施日|備考|数量|No|NO|＃)$/;
 // 価格の無い行のうち、これらの注記語を含む商品名は非商品（運賃・送料・返品案内など）。
-const NOTE_RE = /(運賃|送料|元払|着払|手数料|返品|納品書|指定(場所|倉庫)|別途|未満|以上|ご負担|御見積|次回|地域|エリア|お客様|振込|実費|合計|小計|消費税|備考欄)/;
+const NOTE_RE = /(運賃|送料|元払|着払|手数料|返品|納品書|指定(場所|倉庫)|別途|未満|以上|ご負担|御見積|次回|地域|エリア|お客様|振込|実費|合計|小計|消費税|備考欄|休暇|祝日|年末年始|夏季休業|冬季休業|お盆|ゴールデンウィーク|ＧＷ|GW)/;
 
 // 文字列が「数値の価格」か（カンマ・空白・¥・円 を除いて数値ならtrue）。
 function isNumericPrice(v) {
@@ -35,4 +35,18 @@ function isNoiseRow(row) {
   return false;
 }
 
-module.exports = { isNoiseRow, isNumericPrice };
+// UI用：非商品かどうかと理由（取込画面のチェックボックス案内に使う）。
+function describeNoiseRow(row) {
+  const name = String(row && row.name != null ? row.name : '').trim();
+  const code = String(row && row.makerCode != null ? row.makerCode : '').trim();
+  if (!name && !code) return { noise: true, reason: '名前も品番も空の行' };
+  if (name && HEADER_RE.test(name)) return { noise: true, reason: '見出しの再掲行（品番・商品名など）' };
+  if (isNumericPrice(row && row.newCost) || isNumericPrice(row && row.currentCost)) return { noise: false, reason: '' };
+  if (name && NOTE_RE.test(name)) return { noise: true, reason: '運賃・返品案内・休暇告知などの注記文' };
+  const cp = String(row && row.currentCost != null ? row.currentCost : '');
+  const np = String(row && row.newCost != null ? row.newCost : '');
+  if (/価格|単価/.test(cp) || /価格|単価/.test(np)) return { noise: true, reason: '価格列が見出しテキスト（現行価格 等）' };
+  return { noise: false, reason: '' };
+}
+
+module.exports = { isNoiseRow, isNumericPrice, describeNoiseRow };
