@@ -345,4 +345,4 @@ if (require.main === module) {
   try { run(process.argv); }
   catch (e) { console.error('✗ ' + (e && e.message || e)); process.exit(1); }
 }
-module.exports = { run, loadHanbaiRecords, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey, fileTimeOf, shogoRequiresDb, assertShogoHanbaiSafe, SELF_HANBAI_MIN_POOL };
+module.exports = { run, loadHanbaiRecords, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey, fileTimeOf, shogoRequiresDb, assertShogoHanbaiSafe, SELF_HANBAI_MIN_POOL }; // makerProdKey=取込重複ヒント用

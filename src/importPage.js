@@ -93,6 +93,7 @@ const IMPORT_PAGE = `<!doctype html>
     <span id="fileMsg" style="font-size:11px;color:#6b7785"></span>
     <select id="sheetSel" style="display:none"></select>
   </div>
+  <div id="importHintEarly" style="display:none;margin:6px 0 0;padding:8px 12px;background:#eef6ff;border:1px solid #a8c8e8;border-radius:7px;font-size:12px;color:#1a4a6a;line-height:1.65"></div>
   <textarea id="src" rows="6" placeholder="または、ここに貼り付け（Ctrl+V）― PDFの表もOK" disabled></textarea>
   <div class="row">
     区切り：<select id="delim" disabled><option value="auto">自動</option><option value="tab">タブ</option><option value="comma">カンマ</option><option value="space">連続スペース</option></select>
@@ -138,6 +139,7 @@ const IMPORT_PAGE = `<!doctype html>
       <div id="msg" style="margin-top:4px;font-size:11px"></div>
     </div>
   </div>
+  <div id="importHint" style="display:none;margin:8px 0 10px;padding:9px 13px;background:#eef6ff;border:1px solid #a8c8e8;border-radius:7px;font-size:12.5px;color:#1a4a6a;line-height:1.65"></div>
   <div style="margin:8px 0 10px;padding:8px 12px;background:#fff8e1;border:1px solid #f0d68a;border-radius:6px;font-size:12px;color:#5a4a1a;line-height:1.7">
     <b>⚠ ここまでは未保存です。</b>「この内容で保存」を押すと次の2つがディスクに書き込まれます：<br>
     　① <b>メーカー見積データ本体</b> → <code>maker_quotes\\メーカー見積_&lt;仕入先&gt;_&lt;日時&gt;.csv</code>（あとで「照合」に使う材料）<br>
@@ -184,6 +186,84 @@ function showTop(html, kind){
   b.innerHTML=html;
 }
 function hideTop(){ const b=$('#topMsg'); if(b){ b.style.display='none'; b.innerHTML=''; } }
+function hideImportHints(){
+  const e=$('#importHintEarly'), m=$('#importHint');
+  if(e){ e.style.display='none'; e.innerHTML=''; }
+  if(m){ m.style.display='none'; m.innerHTML=''; }
+}
+function fmtImportDate(iso){
+  if(!iso) return '';
+  const d=new Date(iso);
+  if(isNaN(d.getTime())) return '';
+  return d.getFullYear()+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');
+}
+function renderImportHintHtml(res, detailed){
+  if(!res||!res.hasExisting) return '';
+  let html='📋 <b>この仕入先は既に取り込み済みです</b>';
+  const dt=fmtImportDate(res.importedAt);
+  html+='（'+(dt?('最終 '+dt+'・'):'')+res.count+'品';
+  if(res.sourceCount>1) html+='・CSV '+res.sourceCount+'本';
+  html+='）<br>同じ見積を保存すると<b>最新版として上書き更新</b>されます（損益・見積の二重計上にはなりません）。';
+  if(detailed && res.overlap && res.overlap.incoming>0){
+    const o=res.overlap;
+    if(o.ratio>=50||o.matched>=5){
+      html+='<br>今回の表 <b>'+o.incoming+'品</b>のうち <b>'+o.matched+'品</b> が既存データと一致（<b>再取込の可能性が高い</b>です）。';
+    } else if(o.matched>0){
+      html+='<br>今回の表のうち '+o.matched+'/'+o.incoming+' 品が既存と一致（一部が重複の可能性）。';
+    } else {
+      html+='<br>今回の表は既存（'+o.existingTotal+'品）と一致する品番・商品名がありません＝<b>新規取込</b>の可能性が高いです。';
+    }
+  }
+  if(res.needsRematch) html+='<br><span style="color:#7a5300">※ 前回の取込後、まだ再照合されていません（保存後は自動照合されます）。</span>';
+  return html;
+}
+// 列マッピング前のざっくり重複チェック（見出し自動検出で品番・商品名列を拾う）
+function previewItemsFromGrid(){
+  if(!grid.length) return [];
+  const idx=jsDetectColumns(grid);
+  if(!idx) return [];
+  const hr=idx.headerRow||0;
+  const items=[];
+  for(let r=hr+1;r<grid.length;r++){
+    const row=grid[r]||[];
+    const mc=idx.makerCode!=null?String(row[idx.makerCode]||'').trim():'';
+    const mn=idx.makerName!=null?String(row[idx.makerName]||'').trim():'';
+    if(mc||mn) items.push({makerCode:mc,makerName:mn});
+  }
+  return items;
+}
+let hintTimer=null;
+function scheduleImportHint(){ clearTimeout(hintTimer); hintTimer=setTimeout(refreshImportHint, 280); }
+async function refreshImportHintEarly(){
+  const el=$('#importHintEarly'); if(!el) return;
+  const supplier=$('#supplier').value.trim();
+  if(!supplier||grid.length){ el.style.display='none'; return; }
+  try{
+    const res=await fetch('/api/maker-import-hint?supplier='+encodeURIComponent(supplier)).then(x=>x.json());
+    if(!res.hasExisting){ el.style.display='none'; return; }
+    el.innerHTML=renderImportHintHtml(res, false);
+    el.style.display='block';
+  }catch(e){ el.style.display='none'; }
+}
+async function refreshImportHint(){
+  const el=$('#importHint'); if(!el) return;
+  const supplier=$('#supplier').value.trim();
+  if(!supplier||!grid.length){ if(el) el.style.display='none'; refreshImportHintEarly(); return; }
+  $('#importHintEarly').style.display='none';
+  let items=[];
+  if($('#mapArea').style.display!=='none'){
+    try{ const c=collect(); items=(c.items||[]).filter(it=>String(it.makerCode||'').trim()||String(it.makerName||'').trim()); }catch(e){}
+  }
+  if(!items.length) items=previewItemsFromGrid();
+  try{
+    const res=items.length
+      ? await fetch('/api/maker-import-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,items})}).then(x=>x.json())
+      : await fetch('/api/maker-import-hint?supplier='+encodeURIComponent(supplier)).then(x=>x.json());
+    if(!res.hasExisting){ el.style.display='none'; return; }
+    el.innerHTML=renderImportHintHtml(res, true);
+    el.style.display='block';
+  }catch(e){ el.style.display='none'; }
+}
 // 取り込みデータ部分だけクリア（仕入先の選択はそのまま）。②③・貼り付け・手入力・一括実施日を初期化。
 function clearImportData(){
   $('#src').value=''; grid=[]; originalRows=[]; forcedSwitchDate=null; loadedForSupplier='';
@@ -197,6 +277,7 @@ function clearImportData(){
   if($('#manualArea')){ $('#manualArea').style.display='none'; $('#manualTbl').innerHTML=''; }
   if($('#manualToggle')) $('#manualToggle').textContent='✏ 手入力をひらく';
   if($('#manualMsg')) $('#manualMsg').textContent='';
+  hideImportHints();
 }
 // すべてクリア（仕入先の選択も）＝別の仕入先を最初から取り込む。
 function resetImport(){
@@ -276,6 +357,7 @@ function onPurchaseCodePick(){
   showProfSummary();
   updateStep2Lock();
   warnSupplierMismatch();
+  refreshImportHintEarly();
 }
 function updatePurchaseBadge(){
   const code=$('#purchaseCodeSel').value;
@@ -308,6 +390,7 @@ function onSupplierPick(){
   showProfSummary();
   updateStep2Lock();
   warnSupplierMismatch();
+  refreshImportHintEarly();
 }
 // ① の入力状態に応じて ② のフォームを有効／無効化
 function updateStep2Lock(){
@@ -510,6 +593,7 @@ function loadRows(rows){
     ? '✓ '+auto+' 行の挨拶文・余白を自動で除外しました（違う場合は数字を変更できます）'
     : '（必要なら数字を変えて先頭行を捨てられます）';
   applySkipAndRender();
+  scheduleImportHint();
 }
 function applySkipAndRender(){
   if(!originalRows.length) return;
@@ -545,6 +629,7 @@ function applySkipAndRender(){
   if(!suppressProfile) applyProfile();
   else applyPriceFormatToGrid();
   checkFarFutureDates();
+  scheduleImportHint();
 }
 // 適切なCSVパーサ（クォート対応）。ファイル選択でのCSV読み込みに使用。
 function csvParseRows(text){
@@ -671,6 +756,8 @@ function render(cols, skippedRows){
   applyPriceFormatToGrid(); // 列対応プルダウンに合わせて現・新単価を銭表示に
   applyForcedDateToGrid(); // 一括 実施日が設定済みなら、再描画後も切替日列へ反映し続ける
   checkFarFutureDates();   // 実施日が3か月以上先の行があれば警告（年の打ち間違い検知）
+  $('#grid').querySelectorAll('thead select').forEach(s=>{ s.addEventListener('change', scheduleImportHint); });
+  scheduleImportHint();
 }
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function collect(){
@@ -748,7 +835,7 @@ $('#manualTbl').addEventListener('input',(e)=>{
 
 $('#parseBtn').addEventListener('click',parse);
 $('#supplierSel').addEventListener('change',onSupplierPick);
-$('#supplier').addEventListener('input',()=>{ updateStep2Lock(); warnSupplierMismatch(); });
+$('#supplier').addEventListener('input',()=>{ updateStep2Lock(); warnSupplierMismatch(); scheduleImportHint(); });
 $('#resetBtn').addEventListener('click',()=>{
   if((grid.length || $('#supplier').value.trim()) && !confirm('入力中の仕入先・取り込みデータをすべて消して、別の仕入先を最初から取り込みますか？')) return;
   resetImport(); hideTop(); $('#supplier').focus();

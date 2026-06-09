@@ -23,7 +23,7 @@ const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
 const { CDLINK_PAGE } = require('./cdlinkPage');
 const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk } = require('./settings');
-const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords, mergeMakerFiles } = require('./shogo');
+const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords, mergeMakerFiles, makerProdKey } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
 const { readXlsxBuffer } = require('./xlsxread');
 const { detectColumns: detectMakerCols, serialToDate, normDate } = require('./makerXlsx');
@@ -1195,6 +1195,46 @@ function listMakerQuotes() {
   return items;
 }
 
+// 取込画面用：この仕入先が既に maker_quotes にあるか＋（任意）今回の表とのキー重複を返す。
+function buildMakerImportHint(supplier, previewItems) {
+  supplier = String(supplier || '').trim();
+  if (!supplier) return { hasExisting: false };
+  const listed = listMakerQuotes().find((x) => x.supplier === supplier);
+  if (!listed) return { hasExisting: false, supplier };
+  const res = {
+    hasExisting: true,
+    supplier,
+    importedAt: listed.importedAt,
+    count: listed.count,
+    sourceCount: (listed.sources || []).length,
+    status: listed.status,
+    needsRematch: !!listed.needsRematch,
+  };
+  const items = Array.isArray(previewItems) ? previewItems : [];
+  if (items.length && fs.existsSync(MAKER_DIR)) {
+    const files = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f));
+    const merged = mergeMakerFiles(files.map((f) => path.join(MAKER_DIR, f)), getSettings().makerChannel || {});
+    const existing = merged.get(supplier) || [];
+    const keySet = new Set(existing.map((it) => makerProdKey(it)));
+    let matched = 0;
+    let withKey = 0;
+    for (const p of items) {
+      const mc = String((p && p.makerCode) || '').trim();
+      const mn = String((p && p.makerName) || '').trim();
+      if (!mc && !mn) continue;
+      withKey++;
+      if (keySet.has(makerProdKey({ makerCode: mc, makerName: mn }))) matched++;
+    }
+    res.overlap = {
+      incoming: withKey,
+      matched,
+      existingTotal: existing.length,
+      ratio: withKey ? Math.round((matched / withKey) * 100) : 0,
+    };
+  }
+  return res;
+}
+
 // 一覧画面からの「📂 開く」用：ファイル/フォルダをOSの既定アプリで開く（ROOT配下のみ許可）
 function safeOpenPath(rel) {
   const target = path.isAbsolute(rel) ? rel : path.join(ROOT, rel);
@@ -2241,6 +2281,17 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const saved = saveSelfProfile((body && body.selfProfile) || null);
       return sendJson(res, 200, { ok: true, selfProfile: saved });
+    }
+    if (req.method === 'GET' && url.startsWith('/api/maker-import-hint')) {
+      const sp = new URLSearchParams(req.url.split('?')[1] || '');
+      const supplier = (sp.get('supplier') || '').trim();
+      return sendJson(res, 200, buildMakerImportHint(supplier));
+    }
+    if (req.method === 'POST' && url === '/api/maker-import-check') {
+      const body = await readBody(req);
+      const supplier = String((body && body.supplier) || '').trim();
+      const items = Array.isArray(body && body.items) ? body.items : [];
+      return sendJson(res, 200, buildMakerImportHint(supplier, items));
     }
     if (req.method === 'GET' && url === '/api/maker-list') {
       return sendJson(res, 200, { items: listMakerQuotes() });
