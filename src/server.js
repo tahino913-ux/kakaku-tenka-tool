@@ -2387,8 +2387,8 @@ const server = http.createServer(async (req, res) => {
         const saved = supplier ? lookupImportSkip(supplier, r) : null;
         if (saved) {
           return {
-            noise: base.noise || true,
-            reason: base.reason || saved.reason || '前回取込対象外',
+            noise: base.noise,
+            reason: saved.reason || base.reason || '前回取込対象外',
             remembered: true,
             savedAt: saved.at,
             savedTimes: saved.times || 1,

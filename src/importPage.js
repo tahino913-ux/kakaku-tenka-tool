@@ -217,9 +217,10 @@ function priorMeta(res){
 function renderImportHintHtml(res, detailed){
   if(!res) return { html:'', kind:'', style:'' };
   if(!res.hasExisting&&!(res.savedSkipCount>0)) return { html:'', kind:'', style:'' };
-  if(!res.hasExisting&&res.savedSkipCount>0&&!detailed){
+  if(!res.hasExisting&&res.savedSkipCount>0){
     let html='📝 <b>取込対象外の記録 '+res.savedSkipCount+' 品</b>（この仕入先）';
-    html+='<br>前回チェックを外して保存した品は、次に同じ品番・商品名が表に出たら<b>自動でチェック OFF</b>にします。';
+    if(detailed) html+='<br>この表に該当品があれば<b>自動でチェック OFF</b>（紫背景）で表示します。';
+    else html+='<br>前回チェックを外して保存した品は、次に同じ品番・商品名が表に出たら<b>自動でチェック OFF</b>にします。';
     return { html, kind:'prior_only', style: importHintBoxStyle('prior_only') };
   }
   if(!res.hasExisting) return { html:'', kind:'', style:'' };
@@ -281,7 +282,7 @@ function updateNoiseBarCount(){
 function bindNoiseBarButtons(){
   const ex=$('#noiseExcludeAll'), inc=$('#noiseIncludeAll');
   if(ex) ex.onclick=()=>{ $('#grid').querySelectorAll('tr.noise-row input.rowinc').forEach(c=>{ c.checked=false; }); updateNoiseBarCount(); scheduleImportHint(); };
-  if(inc) inc.onclick=()=>{ $('#grid').querySelectorAll('input.rowinc').forEach(c=>{ c.checked=true; }); updateNoiseBarCount(); scheduleImportHint(); };
+  if(inc) inc.onclick=()=>{ $('#grid').querySelectorAll('input.rowinc').forEach(c=>{ c.checked=true; c.dataset.userToggled='1'; }); updateNoiseBarCount(); scheduleImportHint(); };
 }
 function collectSkipped(){
   const rows=previewRowsFromGrid();
@@ -386,7 +387,7 @@ async function refreshImportHint(){
     const res=items.length
       ? await fetch('/api/maker-import-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,items})}).then(x=>x.json())
       : await fetch('/api/maker-import-hint?supplier='+encodeURIComponent(supplier)).then(x=>x.json());
-    if(!res.hasExisting){ el.style.display='none'; return; }
+    if(!res.hasExisting&&!(res.savedSkipCount>0)){ el.style.display='none'; return; }
     const h=renderImportHintHtml(res, !!items.length);
     el.setAttribute('style', h.style);
     el.innerHTML=h.html;
@@ -1129,7 +1130,7 @@ $('#saveBtn').addEventListener('click',async()=>{
       const linkMsg=(res.linkedCount>0)?' ／ 📌 自社コード入力 '+res.linkedCount+'件を手動紐付け（100%確定）として登録しました。':'';
       let okMsg='✓ <b>'+esc(supplier)+'</b> を保存しました（'+res.count+'件'+(excludedCount?('・除外 '+excludedCount+' 行'):'')+'）。書式（列の対応）も登録したので次回から自動適用されます。 → '+esc(res.file||'')+linkMsg+extra;
       if(res.recordedSkips) okMsg+='<br>📝 取込対象外 <b>'+res.recordedSkips+' 件</b>を記録しました（次回同じ品は自動で除外）。'+(res.savedSkipTotal!=null?' 記録合計 '+res.savedSkipTotal+' 品。':'');
-        +'<br><b>続けて別の仕入先を取り込めます</b>（入力はクリアしました。① で次の仕入先を選んでください）。';
+      okMsg+='<br><b>続けて別の仕入先を取り込めます</b>（入力はクリアしました。① で次の仕入先を選んでください）。';
       // 二重登録の警告：同じ商品が「別の仕入先」にも登録されている＝取り違えの可能性。
       const dw=res.dupWarning;
       if(dw && dw.count){

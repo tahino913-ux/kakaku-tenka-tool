@@ -53,4 +53,28 @@ function updateImportSkips(supplier, includedItems, skippedItems) {
   return merged;
 }
 
-module.exports = { getImportSkips, lookupImportSkip, updateImportSkips };
+// 単体検証（settings.json は触らない＝キー生成の整合のみ）
+function selfTest() {
+  const kCd = makerProdKey({ makerCode: '  AbC12  ', makerName: '無視される' });
+  const kNm = makerProdKey({ makerCode: '', makerName: '返品　案内' });
+  if (kCd !== 'CD:abc12' || kNm !== 'NM:返品案内') {
+    console.error('importSkip selfTest FAILED keys', { kCd, kNm });
+    process.exit(1);
+  }
+  // updateImportSkips のマージロジック（メモリ上のみ）
+  const map = new Map([['NM:旧', { key: 'NM:旧', makerName: '旧', times: 2, at: '2020-01-01', reason: 'x' }]]);
+  map.delete(makerProdKey({ makerCode: '', makerName: '旧' }));
+  const at = '2026-06-09T00:00:00.000Z';
+  const key = makerProdKey({ makerCode: '', makerName: '新規除外' });
+  map.set(key, { key, makerName: '新規除外', reason: '手動', at, times: 1 });
+  const merged = [...map.values()].sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  if (merged.length !== 1 || merged[0].makerName !== '新規除外') {
+    console.error('importSkip selfTest FAILED merge', merged);
+    process.exit(1);
+  }
+  console.log('importSkip selfTest OK');
+}
+
+if (require.main === module) selfTest();
+
+module.exports = { getImportSkips, lookupImportSkip, updateImportSkips, selfTest };
