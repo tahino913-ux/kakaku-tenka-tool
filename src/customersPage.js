@@ -38,9 +38,12 @@ const CUSTOMERS_PAGE = `<!doctype html>
   /* 見積書 出力バー */
   .exportbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#eef4fb;border-bottom:1px solid #d6e1ee;padding:9px 16px}
   .exportbar .exp{background:#1b6b3a;color:#fff;border:none;border-radius:8px;padding:8px 15px;font-weight:700;cursor:pointer;font-size:13px}
-  .exportbar .exp.one{background:#2f7d52}
   .exportbar .exp:disabled{opacity:.45;cursor:not-allowed}
   .exportbar .exp:hover:not(:disabled){filter:brightness(1.08)}
+  /* 「○○だけ作成」＝選択中得意先の本番発行（緑の .exportbar .exp と別クラスで確実に赤表示） */
+  #exportOneBtn.issue-one-btn,#bulkTargetBar #exportOneBtn{background:#c62828 !important;color:#fff !important;border:2px solid #a31515 !important;border-radius:9px;padding:10px 20px;font-weight:800;cursor:pointer;font-size:14px;box-shadow:0 2px 8px rgba(198,40,40,.45);white-space:nowrap;filter:none !important}
+  #exportOneBtn.issue-one-btn:hover:not(:disabled),#bulkTargetBar #exportOneBtn:hover:not(:disabled){background:#b71c1c !important;border-color:#8e0000 !important;box-shadow:0 3px 10px rgba(183,28,28,.5)}
+  #exportOneBtn.issue-one-btn:disabled,#bulkTargetBar #exportOneBtn:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
   .exportbar .exphint{font-size:11px;color:#5a6b7a}
   #exportResult{margin:10px 16px 0}
   .ok-banner{background:#eef7ef;border:1px solid #bfe0c4;color:#1f6b35;border-radius:10px;padding:10px 14px;font-size:13px}
@@ -69,6 +72,17 @@ const CUSTOMERS_PAGE = `<!doctype html>
   .pv-sec-rev{margin:18px 0 6px;font-weight:700;color:#a01b10;border-top:2px solid #f0c6c2;padding-top:10px}
   .gate-foot{display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid #e6ecf2}
   .gate-foot .go{background:#1b6b3a;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-weight:700;cursor:pointer}
+  /* 提出済み見積一覧モーダル */
+  .issued-list-gate{max-width:980px}
+  .issued-list-gate .gate-head h2{color:#1f6b35}
+  .issued-list-folders{margin:0 18px 8px;padding:8px 10px;background:#e8f5ec;border:1px solid #bfe0c4;border-radius:8px;font-size:12.5px;line-height:1.6}
+  .issued-list-folders .foldbtn{background:#fff;border:1px solid #9fcbab;color:#1f6b35;border-radius:7px;padding:3px 10px;font-weight:700;cursor:pointer;font-size:12px;margin:2px 4px 2px 0}
+  .issued-list-search{margin:0 18px 8px;padding:7px 10px;border:1px solid #c7d6e4;border-radius:8px;width:calc(100% - 36px);font-size:13px;box-sizing:border-box}
+  .issued-list-gate .actbtn{font-size:12px;padding:4px 9px;margin-right:4px;border-radius:7px;cursor:pointer;font-weight:700}
+  .issued-list-gate .actbtn.go{background:#1b6b3a;color:#fff;border:none}
+  .issued-list-gate .actbtn.ghost{background:#fff;border:1px solid #cdd7e1;color:#3d4f63}
+  #issuedListBtn{background:#1f6b35;color:#fff;border:none;border-radius:8px;padding:7px 12px;font-weight:700;cursor:pointer;font-size:13px}
+  #issuedListBtn:hover{background:#165a2b}
   .gate-foot .go:disabled{opacity:.45;cursor:not-allowed}
   .gate-foot .ghost{background:#fff;border:1px solid #c7d6e4;border-radius:8px;padding:9px 16px;font-weight:700;cursor:pointer;color:#33485c}
   .cust{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid #eef1f5;cursor:pointer}
@@ -134,6 +148,13 @@ const CUSTOMERS_PAGE = `<!doctype html>
   .rrradios label.rr{font-size:11px;color:#33405a;white-space:nowrap;cursor:pointer;display:inline-flex;align-items:center;gap:2px;padding:1px 0}
   .rrradios input[type=radio]{margin:0;cursor:pointer}
   .rrradios.ov{background:#eafaef;border-radius:6px;padding:2px 4px}
+  .calcbar .round-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .calcbar .round-radios{display:flex;flex-wrap:wrap;gap:2px 10px;align-items:center}
+  .calcbar .round-radios label{font-size:12px;color:#33405a;white-space:nowrap;cursor:pointer;display:inline-flex;align-items:center;gap:3px;font-weight:400}
+  .calcbar .round-radios input{margin:0;cursor:pointer}
+  .calcbar #cRoundMode{padding:6px 8px;border:1px solid #c7d6e4;border-radius:7px;font-size:13px;background:#fff}
+  .rowround-wrap.ov{background:#eafaef;border-radius:6px;padding:2px 4px}
+  select.rowround-mode{font-size:11px;padding:2px 4px;border:1px solid #c7d6e4;border-radius:5px}
   input.rowfactor{vertical-align:middle}
   button.hold-btn{background:#fff;border:1px solid #e0c48a;color:#8a5a12;border-radius:6px;padding:2px 7px;font-size:11px;cursor:pointer}
   button.hold-btn:hover{background:#fff8ec}
@@ -189,6 +210,7 @@ const CUSTOMERS_PAGE = `<!doctype html>
     </select></label>
   <span id="msg" class="muted"></span>
   <span class="spacer" style="margin-left:auto"></span>
+  <button type="button" id="issuedListBtn" title="提出済みの見積書を一覧で見る">📋 提出済一覧</button>
   <span id="issuedStat" class="muted" title="見積書を提出（発行）済みの得意先数">提出済 0</span>
   <button class="go" id="resetIssuedBtn" style="background:#8a6d3b" title="提出済みマークをすべて消します（新しい改定サイクルの開始時に使用）。見積書ファイルは消えません">提出履歴をリセット</button>
 </div>
@@ -208,24 +230,21 @@ const CUSTOMERS_PAGE = `<!doctype html>
     <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" id="cBandOn"> 💴 現売価で転嫁ルールを変える（価格帯別・全体反映）</label>
     <div id="bandBox" style="display:none;margin-top:5px;background:#f6f9fc;border:1px solid #d4e0ec;border-radius:8px;padding:8px"></div>
   </div>
-  <div class="fld"><label>改定後価格 まるめ <span class="h">小数の扱い</span></label>
-    <select id="cRound">
-      <optgroup label="切り捨て（カット）">
-        <option value="1|floor">小数点以下カット（整数）</option>
-        <option value="0.1|floor">小数第1位以下カット</option>
-        <option value="0.01|floor">小数第2位以下カット</option>
-      </optgroup>
-      <optgroup label="四捨五入">
-        <option value="1|round">整数（円）で四捨五入</option>
-        <option value="0.1|round">小数第1位まで（四捨五入）</option>
-        <option value="0.01|round">銭まで（小数第2位・四捨五入）</option>
-      </optgroup>
-      <optgroup label="切り上げ">
-        <option value="1|ceil">整数（円）で切り上げ</option>
-        <option value="0.1|ceil">小数第1位まで（切り上げ）</option>
-        <option value="0.01|ceil">銭まで（小数第2位・切り上げ）</option>
-      </optgroup>
-    </select></div>
+  <div class="fld"><label>改定後価格 まるめ</label>
+    <input type="hidden" id="cPolicyRoundMode" value="round">
+    <div class="round-row">
+      <div class="round-radios" id="cRoundUnitBox">
+        <label><input type="radio" name="cRoundUnit" value="1"> 整数</label>
+        <label><input type="radio" name="cRoundUnit" value="0.1"> 0.1</label>
+        <label><input type="radio" name="cRoundUnit" value="0.01" checked> 0.01</label>
+      </div>
+      <select id="cRoundMode" title="「全体」＝⚙設定の端数処理に従う">
+        <option value="">全体（⚙設定）</option>
+        <option value="floor">切捨て</option>
+        <option value="round">四捨五入</option>
+        <option value="ceil">切上げ</option>
+      </select>
+    </div></div>
   <div class="fld"><label>自社コスト上乗せ% <span class="h">労務費等</span></label>
     <input id="cUplift" class="num" type="number" step="0.1" value="0"></div>
   <div class="fld"><label>低マージン警告 <span class="h">改定後粗利率</span></label>
@@ -246,7 +265,7 @@ const CUSTOMERS_PAGE = `<!doctype html>
   <span id="exportMsg" class="muted"></span>
 </div>
 <!-- 「選択中の得意先だけ作成」ボタンは、得意先選択時に下の一括バー右端へ移動する（普段はここに退避）。 -->
-<span id="exportOneHome" style="display:none"><button class="exp one" id="exportOneBtn" disabled>📄 選択中の得意先だけ作成</button></span>
+<span id="exportOneHome" style="display:none"><button class="issue-one-btn" id="exportOneBtn" disabled>📄 選択中の得意先だけ作成</button></span>
 <div id="exportResult" style="display:none"></div>
 
 <div class="exportbar" id="hanbaiMoved" style="background:#f3f5f8;border-color:#d8dee6;color:#55606e;font-size:12.5px">
@@ -268,6 +287,23 @@ const CUSTOMERS_PAGE = `<!doctype html>
       <span style="flex:1"></span>
       <button class="ghost" id="gateBack">戻る（修正する）</button>
       <button class="go" id="gateIssue">要確認を除外して発行</button>
+    </div>
+  </div>
+</div>
+
+<div class="gate-overlay" id="issuedListOverlay">
+  <div class="gate issued-list-gate">
+    <div class="gate-head">
+      <h2>📋 提出済みの見積書一覧</h2>
+      <button class="gate-x" id="issuedListClose" title="閉じる">×</button>
+    </div>
+    <div id="issuedListFolders" class="issued-list-folders"></div>
+    <input id="issuedListSearch" class="issued-list-search" type="text" placeholder="得意先名で絞り込み…">
+    <div class="gate-table-wrap" id="issuedListBody"></div>
+    <div class="gate-foot">
+      <span id="issuedListSummary" class="muted"></span>
+      <span style="flex:1"></span>
+      <button class="ghost" id="issuedListClose2">閉じる</button>
     </div>
   </div>
 </div>
@@ -316,7 +352,7 @@ let rowRules={};  // 行ごと転嫁ルールの上書き { rowKey: ruleType }�
 let rowSell={};   // 行ごと 改定後売価 の手入力 { rowKey: 入力文字列 }
 let rowEff={};    // 行ごと 実施日 の手入力 { rowKey: 入力文字列 }
 let rowNote={};   // 行ごと 備考 の手入力 { rowKey: 入力文字列 }（見積書の備考列に転記）
-let rowRound={};  // 行ごと まるめ の上書き { rowKey: "単位|処理" 例 "1|floor" }（空=全体のまるめ）
+let rowRound={};  // 行ごと まるめ { rowKey: "単位|処理" 例 "0.01|floor"。空|空＝上の全体 }
 let rowFactor={}; // 行ごと 掛率（行ルール=掛率×のとき）{ rowKey: 数値 }（未設定=上の全体「掛率」を使う）
 let lowMarginPct=15; // 低マージン警告のしきい値（%）。改定後粗利率がこの値未満なら警告。画面で調整可。
 // 数値を表示用にクリーン化（¥・円・カンマ無し、最大2桁）。空/非数は''。
@@ -411,21 +447,46 @@ function rowFactorInput(p){
   const v = (rowFactor[p.rowKey]!=null && rowFactor[p.rowKey]!=='') ? rowFactor[p.rowKey] : gf;
   return ' ×<input class="rowfactor" type="text" inputmode="decimal" data-key="'+esc(p.rowKey)+'" value="'+esc(v)+'" title="この行の掛率（現売価 × この値）。空欄なら上の全体「掛率」を使います" style="width:52px">';
 }
-// 行ごと まるめ（改定後価格の端数処理）の選択肢。先頭＝全体のまるめを継承。値="単位|処理"。
-const ROW_ROUND_GROUPS=[
-  ['切り捨て（カット）',[['1|floor','整数'],['0.1|floor','0.1'],['0.01|floor','0.01']]],
-  ['四捨五入',[['1|round','整数'],['0.1|round','0.1'],['0.01|round','0.01']]],
-  ['切り上げ',[['1|ceil','整数'],['0.1|ceil','0.1'],['0.01|ceil','0.01']]],
-];
-function rowRoundSelect(p){
-  const cur = rowRound[p.rowKey]||'';
-  let opts = '<option value=""'+(cur===''?' selected':'')+'>（全体）</option>';
-  for(const g of ROW_ROUND_GROUPS){
-    opts += '<optgroup label="'+g[0]+'">';
-    for(const o of g[1]) opts += '<option value="'+o[0]+'"'+(o[0]===cur?' selected':'')+'>'+o[1]+'</option>';
-    opts += '</optgroup>';
+// 行ごと まるめ：桁ラジオ＋処理ドロップダウン（上の全体設定を継承可）
+const ROW_ROUND_UNIT_OPTS=[['','（全体）'],['1','整数'],['0.1','0.1'],['0.01','0.01']];
+const ROW_ROUND_MODE_OPTS=[['','全体'],['floor','切捨て'],['round','四捨五入'],['ceil','切上げ']];
+let _rndSeq=0;
+function parseRowRound(v){
+  const s=String(v||'').trim();
+  if(!s) return {unit:'', mode:''};
+  if(s.includes('|')){
+    const pr=s.split('|');
+    let unit='', mode='';
+    const u=parseFloat(pr[0]);
+    if(pr[0]!=='' && (u===1||u===0.1||u===0.01)) unit=String(u);
+    const m=pr[1]||'';
+    if(m==='floor'||m==='round'||m==='ceil') mode=m;
+    return {unit, mode};
   }
-  return '<select class="rowrule rowround'+(cur?' ov':'')+'" data-key="'+esc(p.rowKey)+'" title="この行だけ改定後価格のまるめを変える（空＝上の全体設定に従う）">'+opts+'</select>';
+  const u=parseFloat(s);
+  if(u===1||u===0.1||u===0.01) return {unit:String(u), mode:''};
+  if(s==='floor'||s==='round'||s==='ceil') return {unit:'', mode:s};
+  return {unit:'', mode:''};
+}
+function setRowRound(key, unit, mode){
+  const u=unit||'', m=mode||'';
+  if(!u && !m) delete rowRound[key];
+  else rowRound[key]=u+'|'+m;
+}
+function rowRoundCell(p){
+  const {unit, mode}=parseRowRound(rowRound[p.rowKey]);
+  const ov=!!(unit||mode);
+  const rid='rnd'+(_rndSeq++);
+  let h='<div class="rowround-wrap'+(ov?' ov':'')+'">';
+  h+='<div class="rrradios" style="display:inline-flex;flex-wrap:wrap;gap:1px 6px">';
+  for(const o of ROW_ROUND_UNIT_OPTS){
+    h+='<label class="rr" style="font-size:10px"><input type="radio" class="rowround-unit" name="'+rid+'u" data-key="'+esc(p.rowKey)+'" value="'+esc(o[0])+'"'+(o[0]===unit?' checked':'')+'>'+esc(o[1])+'</label>';
+  }
+  h+='</div> <select class="rowround-mode" data-key="'+esc(p.rowKey)+'">';
+  for(const o of ROW_ROUND_MODE_OPTS){
+    h+='<option value="'+o[0]+'"'+(o[0]===mode?' selected':'')+'>'+esc(o[1])+'</option>';
+  }
+  return h+'</select></div>';
 }
 
 // 画面のカスタマイズ操作 → サーバへ渡す計算設定（メインページと同じ項目）
@@ -433,14 +494,23 @@ function rowRoundSelect(p){
 let priceBands=[{max:null, rule:'add_increase', factor:1.25}];
 const BAND_RULES=[['add_increase','上乗せ'],['keep_margin_rate','粗利維持'],['markup','掛率×'],['sell_cost_rate','売価×仕入率'],['keep_sell','据置']];
 function bandsEnabled(){ return !!($('#cBandOn')&&$('#cBandOn').checked); }
+function getRoundUnit(){
+  const el=document.querySelector('input[name="cRoundUnit"]:checked');
+  const u=el?parseFloat(el.value):0.01;
+  return (u===1||u===0.1||u===0.01)?u:0.01;
+}
+function getRoundMode(){
+  const sel=String(($('#cRoundMode')||{}).value||'').trim();
+  if(sel==='floor'||sel==='ceil'||sel==='round') return sel;
+  const pol=String(($('#cPolicyRoundMode')||{}).value||'round').trim();
+  return (pol==='floor'||pol==='ceil')?pol:'round';
+}
 function calcOpts(){
-  // 「改定後価格 まるめ」は "単位|処理"（例 1|floor＝小数点以下カット）の1値。単位と処理に分解して送る。
-  const rp=String($('#cRound').value||'0.01|round').split('|');
   return {
     ruleType: $('#cRule').value,
     factor: parseFloat($('#cFactor').value)||1,
-    roundingUnit: parseFloat(rp[0])||0.01,
-    roundingMode: rp[1]||'round',
+    roundingUnit: getRoundUnit(),
+    roundingMode: getRoundMode(),
     selfUplift: parseFloat($('#cUplift').value)||0,
     forceEffectiveDate: ($('#cEff').value||'').trim(),
     priceBands: bandsEnabled() ? priceBands.filter(b=>b.rule) : undefined, // 価格帯別ON時のみ送る
@@ -472,6 +542,7 @@ function renderBands(){
 }
 const RULE_LABEL={add_increase:'上乗せ',keep_margin_rate:'粗利維持',markup:'掛率×',sell_cost_rate:'売価×仕入率',keep_sell:'据置'};
 const MODE_LABEL={round:'四捨五入',ceil:'切上げ',floor:'切捨て'};
+const UNIT_LABEL={'1':'整数','0.1':'0.1','0.01':'0.01'};
 function toggleFactor(){ $('#cFactorBox').style.display = ($('#cRule').value==='markup')?'flex':'none'; }
 function showApplied(a){
   if(!a){ $('#appliedMsg').textContent=''; return; }
@@ -480,8 +551,11 @@ function showApplied(a){
   const ruleDisp = bands.length
     ? ('💴 価格帯別: '+bands.map(b=>(b.max==null?'それ以上':('〜'+b.max))+'='+(RULE_LABEL[b.rule]||b.rule)+(b.rule==='markup'?('×'+(b.factor||'')):'')).join(' / '))
     : ((RULE_LABEL[a.ruleType]||a.ruleType)+(a.ruleType==='markup'?(' '+a.factor):''));
+  const uLbl=UNIT_LABEL[String(a.roundingUnit)]||String(a.roundingUnit);
+  const mSel=String(($('#cRoundMode')||{}).value||'');
+  const mLbl=mSel?(MODE_LABEL[mSel]||mSel):('⚙'+(MODE_LABEL[a.roundingMode]||a.roundingMode));
   const parts=[ ruleDisp,
-    '端数 '+a.roundingUnit+'円/'+(MODE_LABEL[a.roundingMode]||a.roundingMode),
+    'まるめ '+uLbl+' / '+mLbl,
     '自社+'+a.selfUplift+'%',
     a.forceEffectiveDate?('実施日 '+a.forceEffectiveDate+' に統一'):'実施日 各行' ];
   const ovN=Object.keys(rowRules).length, sN=Object.keys(rowSell).length, eN=Object.keys(rowEff).length;
@@ -607,6 +681,90 @@ async function openIssued(name){
     if(r.note) alert(r.note); // ファイルが見つからずフォルダを開いた場合などの注記
   }catch(e){ alert('通信に失敗しました：'+e); }
 }
+let ISSUED_LIST_DATA=null; // 提出済一覧モーダル用（/api/issued-quotes-list の結果）
+function fmtIssuedAt(iso){
+  if(!iso) return '—';
+  const d=new Date(iso);
+  if(isNaN(d.getTime())) return String(iso).slice(0,16).replace('T',' ');
+  const pad=n=>String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes());
+}
+function renderIssuedList(data, q){
+  const items=(data&&data.items)||[];
+  const folders=(data&&data.folders)||[];
+  const query=(q||'').trim().toLowerCase();
+  const shown=query ? items.filter(row=>String(row.customer||'').toLowerCase().indexOf(query)>=0) : items;
+  let fh='';
+  if(folders.length){
+    fh='<strong>出力フォルダ</strong> ';
+    for(const f of folders){
+      fh+='<button type="button" class="foldbtn" data-folder="'+esc(f.folder)+'" onclick="openIssuedFolder(this.getAttribute(\\'data-folder\\'))">📁 '+esc(f.folder)+'（'+f.customers+'社）</button>';
+    }
+  } else fh='<span class="muted">出力フォルダ情報なし</span>';
+  const fel=$('#issuedListFolders'); if(fel) fel.innerHTML=fh;
+  let html='<table><thead><tr><th>得意先</th><th>提出日時</th><th>見積No</th><th class="num">品目</th><th class="num">回数</th><th>操作</th></tr></thead><tbody>';
+  if(!shown.length){
+    html+='<tr><td colspan="6" class="muted" style="text-align:center;padding:24px">'
+      +(query?'「'+esc(q)+'」に一致する提出済みはありません。':'提出済みの見積はまだありません。<br>見積を「発行」するとここに表示されます。')
+      +'</td></tr>';
+  } else {
+    for(const row of shown){
+      const miss=!row.fileExists;
+      html+='<tr'+(miss?' style="opacity:.8"':'')+'>'
+        +'<td>'+esc(row.customer)+(miss?' <span class="muted" title="見積書ファイルが見つかりません">⚠</span>':'')+'</td>'
+        +'<td>'+esc(fmtIssuedAt(row.lastIssuedAt))+'</td>'
+        +'<td>'+esc(row.quoteNo||'—')+'</td>'
+        +'<td class="num">'+(row.itemCount||0)+'</td>'
+        +'<td class="num">'+(row.count||1)+'</td>'
+        +'<td>'
+        +'<button type="button" class="actbtn go" data-name="'+esc(row.customer)+'" onclick="openIssued(this.getAttribute(\\'data-name\\'))">📄 開く</button>'
+        +'<button type="button" class="actbtn ghost" data-name="'+esc(row.customer)+'" onclick="jumpToIssuedCustomer(this.getAttribute(\\'data-name\\'))">👤 得意先へ</button>'
+        +'</td></tr>';
+    }
+  }
+  html+='</tbody></table>';
+  const body=$('#issuedListBody'); if(body) body.innerHTML=html;
+  const sum=$('#issuedListSummary');
+  if(sum){
+    const totalItems=data.totalItems!=null?data.totalItems:items.reduce((s,x)=>s+(x.itemCount||0),0);
+    sum.textContent = shown.length
+      ? ('表示 '+shown.length+(query?' / 全'+items.length:'')+' 社・合計 '+totalItems+' 品')
+      : '';
+  }
+}
+async function openIssuedList(){
+  await loadIssueLog();
+  let data={items:[],folders:[],count:0,totalItems:0};
+  try{
+    const r=await fetch('/api/issued-quotes-list').then(x=>x.json());
+    if(r&&r.ok) data=r;
+  }catch(e){
+    data.items=Object.entries(ISSUED||{}).map(([customer,ent])=>({
+      customer,lastIssuedAt:ent.lastIssuedAt||'',quoteNo:ent.quoteNo||'',itemCount:ent.itemCount||0,
+      count:ent.count||1,folder:ent.folder||'',fileExists:true,folderExists:true
+    })).sort((a,b)=>String(b.lastIssuedAt).localeCompare(String(a.lastIssuedAt)));
+    data.count=data.items.length;
+    data.totalItems=data.items.reduce((s,x)=>s+(x.itemCount||0),0);
+  }
+  ISSUED_LIST_DATA=data;
+  const search=$('#issuedListSearch'); if(search) search.value='';
+  renderIssuedList(data,'');
+  $('#issuedListOverlay').classList.add('show');
+}
+function closeIssuedList(){ $('#issuedListOverlay').classList.remove('show'); }
+async function openIssuedFolder(folder){
+  if(!folder) return;
+  try{
+    const r=await fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'output/'+folder})}).then(x=>x.json());
+    if(r&&r.ok) $('#msg').textContent='フォルダを開きました: '+folder;
+    else alert((r&&r.error)||'フォルダを開けませんでした');
+  }catch(e){ alert('通信に失敗しました：'+e); }
+}
+function jumpToIssuedCustomer(name){
+  closeIssuedList();
+  if(DATA.find(x=>x.name===name)) selectCust(name);
+  else $('#msg').textContent='「'+name+'」は現在の改定対象に見つかりません（提出済みの記録のみ残っています）。';
+}
 // 1得意先の「提出済み」を取り消す
 async function unmarkIssued(name){
   if(!confirm('「'+name+'」の提出済みマークを取り消します。よろしいですか？\\n（見積書ファイル自体は消えません。表示の記録だけ消します）')) return;
@@ -723,7 +881,7 @@ function selectCust(name){
     +'<th class="grp" colspan="3">仕入（現→改定後）</th>'
     +'<th class="grp" colspan="5">売価・粗利率（現→改定後）</th>'
     +'<th rowspan="2">行ルール<br><span class="muted">(全体=メイン設定)</span></th>'
-    +'<th rowspan="2">まるめ<br><span class="muted">(全体=上の設定)</span></th>'
+    +'<th rowspan="2">まるめ<br><span class="muted">(上=全体)</span></th>'
     +'<th rowspan="2">実施日</th>'
     +'<th rowspan="2">備考<br><span class="muted">見積書に転記</span></th></tr>'
     +'<tr><th>現仕入</th><th>改定後仕入</th><th>改定%</th>'
@@ -749,7 +907,7 @@ function selectCust(name){
       +'<td class="num'+lowCls+'"'+(lowCls?' title="改定後粗利率が '+lowMarginPct+'% 未満（低マージン）"':'')+'>'+fmtPct1(newM)+'</td>'
       +'<td class="num '+sr.cls+'">'+sr.txt+'</td>'
       +'<td class="rrcell">'+rowRuleRadios(p)+rowFactorInput(p)+'</td>'
-      +'<td>'+rowRoundSelect(p)+'</td>'
+      +'<td class="rrcell">'+rowRoundCell(p)+'</td>'
       +'<td><input class="cellinp effinp'+(p.effManual?' man':'')+(p.noEff?' effmissing':'')+'" data-key="'+esc(p.rowKey)+'" value="'+esc(p.effectiveDate||'')+'" placeholder="例: 2026-07-01" title="'+(p.noEff?'実施日が未設定です（発行には必須）。例: 2026-07-01':'直接入力できます（2026/7/1・7月1日 等でもISO表記に揃います）')+'"></td>'
       +'<td><input class="cellinp noteinp'+(p.note?' man':'')+'" data-key="'+esc(p.rowKey)+'" value="'+esc(p.note||'')+'" placeholder="（任意）" title="ここに入力すると見積書の「備考」列に転記されます"></td>'
       +'</tr>';
@@ -792,12 +950,20 @@ function selectCust(name){
     const btn=$(g.btn);
     if(btn) btn.addEventListener('click',()=> bulkMove(g.cls, g.status));
   }
-  // 行まるめの変更 → その行だけ別のまるめで再計算（サーバ集計＝見積書と同じ計算）。
-  //  ※ rowround も .rowrule クラスを持つので、行ルールの配線が拾わないよう先に処理して除外する。
-  $('#detailCol').querySelectorAll('select.rowround').forEach(sel=>{
+  // 行まるめ（桁ラジオ＋処理ドロップダウン）の変更
+  $('#detailCol').querySelectorAll('input.rowround-unit').forEach(rad=>{
+    rad.addEventListener('change',()=>{
+      const k=rad.getAttribute('data-key');
+      const sel=$('#detailCol').querySelector('select.rowround-mode[data-key="'+k+'"]');
+      setRowRound(k, rad.value, sel?sel.value:'');
+      load();
+    });
+  });
+  $('#detailCol').querySelectorAll('select.rowround-mode').forEach(sel=>{
     sel.addEventListener('change',()=>{
       const k=sel.getAttribute('data-key');
-      if(sel.value) rowRound[k]=sel.value; else delete rowRound[k];
+      const rad=$('#detailCol').querySelector('input.rowround-unit[data-key="'+k+'"]:checked');
+      setRowRound(k, rad?rad.value:'', sel.value);
       load();
     });
   });
@@ -963,11 +1129,12 @@ async function initControls(){
     const df=s.default||{}; const rd=s.rounding||{}; const up=s.selfCostUplift||{};
     if(df.type) $('#cRule').value=df.type;
     if(df.factor!=null) $('#cFactor').value=df.factor;
-    // メイン設定の 端数単位/処理 を「まるめ」プルダウンの "単位|処理" 値に合成。該当が無ければ既定のまま。
-    const u=(rd.unit!=null)?String(rd.unit):'0.01';
-    const md=rd.mode||'round';
-    const want=u+'|'+md;
-    if([...$('#cRound').options].some(o=>o.value===want)) $('#cRound').value=want;
+    // まるめ：桁＝ラジオ、処理＝ドロップダウン（「全体」＝⚙設定の端数処理）
+    const u=String((rd.unit!=null)?rd.unit:0.01);
+    const md=(rd.mode==='floor'||rd.mode==='ceil')?rd.mode:'round';
+    $('#cPolicyRoundMode').value=md;
+    document.querySelectorAll('input[name="cRoundUnit"]').forEach(r=>{ r.checked=(r.value===u); });
+    $('#cRoundMode').value='';
     if(up.rate!=null) $('#cUplift').value=up.rate;
     // 価格帯別ルールの「それ以上」既定を、全体ルールに合わせて初期化（帯はOFFが既定）。
     priceBands=[{max:null, rule:(df.type||'add_increase'), factor:(df.factor!=null?Number(df.factor):1.25)}];
@@ -1002,6 +1169,13 @@ $('#cBandOn').addEventListener('change',()=>{
 $('#search').addEventListener('input',applyFilter);
 $('#recentYears').addEventListener('change',applyFilter);
 $('#resetIssuedBtn').addEventListener('click',resetAllIssued);
+$('#issuedListBtn').addEventListener('click',openIssuedList);
+$('#issuedListClose').addEventListener('click',closeIssuedList);
+$('#issuedListClose2').addEventListener('click',closeIssuedList);
+$('#issuedListOverlay').addEventListener('click',e=>{ if(e.target===$('#issuedListOverlay')) closeIssuedList(); });
+$('#issuedListSearch').addEventListener('input',()=>{
+  if(ISSUED_LIST_DATA) renderIssuedList(ISSUED_LIST_DATA, $('#issuedListSearch').value);
+});
 $('#exportAllBtn').addEventListener('click',()=>exportFlow('all'));
 $('#exportOneBtn').addEventListener('click',()=>exportFlow('one'));
 // 基幹システム取込CSV（単価履歴／仕入原価）のダウンロードは sim 画面の「📅 実施日カレンダー」へ移動した。
@@ -1009,10 +1183,15 @@ $('#gateClose').addEventListener('click',closeGate);
 $('#gateBack').addEventListener('click',closeGate);
 $('#gateIssue').addEventListener('click',()=>{ if(gateOpts) doIssue(gateOpts); });
 $('#gateOverlay').addEventListener('click',e=>{ if(e.target===$('#gateOverlay')) closeGate(); });
-document.addEventListener('keydown',e=>{ if(e.key==='Escape' && $('#gateOverlay').classList.contains('show')) closeGate(); });
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape') return;
+  if($('#issuedListOverlay').classList.contains('show')) closeIssuedList();
+  else if($('#gateOverlay').classList.contains('show')) closeGate();
+});
 // ルール/端数の変更は即再計算。掛率・自社%・実施日はEnterまたはフォーカスアウトで再計算（打鍵ごとの連打を防ぐ）。
 $('#cRule').addEventListener('change',()=>{ toggleFactor(); load(); });
-$('#cRound').addEventListener('change',load);
+document.querySelectorAll('input[name="cRoundUnit"]').forEach(r=> r.addEventListener('change',load));
+$('#cRoundMode').addEventListener('change',load);
 ['#cFactor','#cUplift','#cEff'].forEach(sel=>{
   const el=$(sel);
   el.addEventListener('change',load);

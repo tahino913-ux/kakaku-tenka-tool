@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { readXlsx } = require('./xlsxread');
 const { isNoiseRow } = require('./noiserow');
+const { sen, senStr } = require('./rules');
 
 const norm = (s) => String(s == null ? '' : s).replace(/[\s　]/g, '').normalize('NFKC');
 
@@ -95,7 +96,9 @@ function convert(xlsxPath, outDir) {
       const sup = (idx.sup != null && norm(row[idx.sup])) ? String(row[idx.sup]).trim() : sheetMaker;
       if (!bySupplier.has(sup)) bySupplier.set(sup, []);
       bySupplier.get(sup).push({
-        メーカー商品CD: code, 商品名: name, 現単価: String(cur).trim(), 新単価: String(nw).trim(),
+        メーカー商品CD: code, 商品名: name,
+        現単価: Number.isFinite(sen(cur)) ? senStr(cur) : String(cur).trim(),
+        新単価: Number.isFinite(sen(nw)) ? senStr(nw) : String(nw).trim(),
         切替日: idx.date != null ? normDate(row[idx.date]) : '',
       });
     }
@@ -126,18 +129,18 @@ function prodKey(code, name) {
 }
 // 既存 maker_quotes/<仕入先>.csv を行配列で読む（無ければ空）。makerXlsx が書いた列名を読む。
 function readExistingMakerRows(file) {
-  try {
-    if (!fs.existsSync(file)) return [];
-    const { loadCsv } = require('./csv');
-    const { records } = loadCsv(file);
-    return records.map((r) => ({
-      メーカー商品CD: r['メーカー商品CD'] || r['メーカー品番'] || r['品番'] || '',
-      商品名: r['商品名'] || r['メーカー商品名'] || '',
-      現単価: r['現単価'] || r['現価格'] || '',
-      新単価: r['新単価'] || r['新価格'] || '',
-      切替日: r['切替日'] || r['実施日'] || r['適用日'] || '',
-    })).filter((r) => String(r.商品名).trim() !== '' || String(r.メーカー商品CD).trim() !== '');
-  } catch (_) { return []; }
+  if (!fs.existsSync(file)) return [];
+  // ファイルが在るのに読めない場合は throw して中断する。
+  //  ＝空配列で返すと upsert が既存データを「無かったこと」にして上書き保存し、商品が丸ごと消える事故になるため。
+  const { loadCsv } = require('./csv');
+  const { records } = loadCsv(file);
+  return records.map((r) => ({
+    メーカー商品CD: r['メーカー商品CD'] || r['メーカー品番'] || r['品番'] || '',
+    商品名: r['商品名'] || r['メーカー商品名'] || '',
+    現単価: r['現単価'] || r['現価格'] || '',
+    新単価: r['新単価'] || r['新価格'] || '',
+    切替日: r['切替日'] || r['実施日'] || r['適用日'] || '',
+  })).filter((r) => String(r.商品名).trim() !== '' || String(r.メーカー商品CD).trim() !== '');
 }
 
 if (require.main === module) {

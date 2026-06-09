@@ -88,11 +88,10 @@ module.exports = {
   //  AI(Claude API)が抽出して取り込みグリッドに自動入力する補助機能。
   //  ⚠ AIは「抽出・提案」だけ。確定は従来どおり ③確認グリッド＋人。価格計算・照合には関与しない。
   //  ⚠ 既定OFF＝apiKey 未設定なら外部送信ゼロ・完全ローカルのまま（従来動作）。
-  //  ⚠ 有効化＝settings.json で ai.enabled:true ＋ apiKey 設定（または環境変数 ANTHROPIC_API_KEY）。
-  //     キーは settings.json（gitignore）か環境変数に置く。送るのはメーカー見積の商品名・数字のみ。
+  //  ⚠ 有効化＝settings.json で ai.enabled:true ＋ 環境変数 ANTHROPIC_API_KEY を設定。
+  //     APIキーは settings.json に保存しない（環境変数のみ）。送るのはメーカー見積の商品名・数字のみ。
   ai: {
     enabled: false,                  // 既定OFF（汎用版・キー未設定では使わない）
-    apiKey: '',                      // Anthropic APIキー（空なら環境変数 ANTHROPIC_API_KEY を使う）
     model: 'claude-haiku-4-5',       // テキスト/Excel 抽出用（安価・構造化抽出向き）
     hardModel: 'claude-sonnet-4-6',  // PDF手紙など難物の抽出用
   },

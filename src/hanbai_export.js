@@ -44,7 +44,8 @@ function intStr(v) {
 function senStr(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return '';
-  return String(Math.round(n * 100) / 100);
+  // rules.senStr と同一の整形（2桁丸め→末尾0/余分な小数点を除去）＝CSV間で表記が必ず揃う。
+  return (Math.round(n * 100) / 100).toFixed(2).replace(/\.?0+$/, '');
 }
 
 // 1明細 → 11列の配列。tax = {zeiKbn, zeiRitu}（無ければ既定）。

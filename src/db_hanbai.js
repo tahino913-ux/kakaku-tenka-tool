@@ -308,4 +308,12 @@ function loadCustomerMaster(dbCfg) {
   } finally { try { fs.unlinkSync(csv); } catch (_) {} }
 }
 
-module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax, loadSelfProductsFromDb, loadCustomerMaster };
+// DB接続の死活確認（SELECT 1 のみ・読み取り専用）。照合前のプレフライト用。
+function probeDbConnection(dbCfg) {
+  dbCfg = dbCfg || {};
+  const out = runQueryToCsv(dbCfg, 'SELECT 1 AS ok');
+  try { fs.unlinkSync(out); } catch (_) {}
+  return true;
+}
+
+module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax, loadSelfProductsFromDb, loadCustomerMaster, probeDbConnection };

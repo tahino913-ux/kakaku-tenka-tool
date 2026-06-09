@@ -11,7 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const { loadCsv } = require('./csv');
-const { toNum } = require('./rules');
+const { toNum, sen } = require('./rules');
 const { loadHanbai } = require('./hanbai');
 const { matchAll, toCsv, padSelfCode } = require('./match');
 const { xlsToCsv, isXls } = require('./xls2csv');
@@ -62,7 +62,6 @@ function resolveHanbaiSource(p) {
 // 容器の仕入単価は「銭（小数2桁）」が基準。メーカー見積の新単価が計算値（例 14.26×1.2=17.112）や
 //  浮動小数（17.111999999999998）のまま取り込まれると、仕入原価CSVが17.112になりメーカー見積(17.11)とズレる。
 //  → 取り込み時に銭(2桁)へ丸めて、照合・表示・基幹CSVをメーカー見積どおり(17.11)に揃える。
-function sen(v) { return Number.isFinite(v) ? Math.round(v * 100) / 100 : v; }
 function loadMakerQuote(csvPath) {
   const { records } = loadCsv(csvPath);
   const get = (r, names) => { for (const n of names) if (r[n] !== undefined && r[n] !== '') return r[n]; return ''; };
@@ -89,8 +88,20 @@ function loadMakerQuote(csvPath) {
 // 案A：メーカー見積を「仕入先ごとに1本へ統合」する。
 //  並べ替え用にファイルの新しさを返す（ファイル名の日時印 メーカー見積_<仕入先>_YYYYMMDD_HHMM(SS) を優先、無ければ更新時刻）。
 function fileTimeOf(f) {
+  // ファイル名の日時印（メーカー見積_<仕入先>_YYYYMMDD_HHMM(SS)）を epoch ミリ秒に変換し、
+  //  日時印を持たない flat な <仕入先>.csv（makerXlsx.convert 出力）の更新時刻(mtimeMs)と
+  //  同じ単位で比較できるようにする。
+  //  ⚠ 以前は Number('20260608'+'192710') の桁連結値を返していたため ~2e13 となり、
+  //    mtimeMs(~1.7e12)より常に大きく＝古い日時印CSVが新しい flat CSV を後勝ちで上書きしていた。
   const m = path.basename(f).match(/_(\d{8})_(\d{4,6})(?:\.csv)?$/i);
-  if (m) return Number(m[1] + m[2].padEnd(6, '0'));
+  if (m) {
+    const ymd = m[1], hms = m[2].padEnd(6, '0');
+    const t = new Date(
+      Number(ymd.slice(0, 4)), Number(ymd.slice(4, 6)) - 1, Number(ymd.slice(6, 8)),
+      Number(hms.slice(0, 2)), Number(hms.slice(2, 4)), Number(hms.slice(4, 6))
+    ).getTime();
+    if (Number.isFinite(t)) return t;
+  }
   try { return fs.statSync(f).mtimeMs; } catch (_) { return 0; }
 }
 // 商品の同一判定キー：メーカー品番があれば品番、無ければ商品名（NFKC・空白除去・小文字）。
@@ -108,7 +119,8 @@ function mergeMakerFiles(makerFiles, channelMap) {
   const ordered = makerFiles.slice().sort((a, b) => fileTimeOf(a) - fileTimeOf(b));
   for (const mf of ordered) {
     let items;
-    try { items = loadMakerQuote(mf); } catch (_) { items = []; }
+    // 解析失敗は握りつぶさず警告（黙って空にすると、その仕入先の見積が丸ごと消えても気づけない）。
+    try { items = loadMakerQuote(mf); } catch (e) { console.warn('[shogo] メーカー見積CSVの読込に失敗（スキップ）: ' + mf + ' / ' + (e && e.message || e)); items = []; }
     for (const it of items) {
       const raw = it.supplier || '仕入先不明';
       const supplier = channelMap[raw] || raw;            // メーカー→問屋に寄せる
@@ -122,9 +134,46 @@ function mergeMakerFiles(makerFiles, channelMap) {
   return res;
 }
 
+// 自社製造(9000)の照合には全期間DBプールが必須。自宅PC等でファイルへフォールバックすると日野が全休眠になる。
+const SELF_HANBAI_MIN_POOL = 4000;
+
+function shogoRequiresDb(s) {
+  s = s || getSettings();
+  if (s.selfManufacture && s.selfManufacture.enabled) return true;
+  const makersProfile = getMakers() || {};
+  for (const prof of Object.values(makersProfile)) {
+    if (String(prof && prof.purchaseCode).trim() === '9000') return true;
+  }
+  return false;
+}
+
+function assertShogoHanbaiSafe(s, hanbaiArg, loadInfo) {
+  if (!shogoRequiresDb(s) || hanbaiArg) return;
+  const mode = (s.hanbai && s.hanbai.source) || 'file';
+  if (mode === 'file') {
+    throw new Error(
+      '設定が hanbai.source=file です。自社製造(日野折箱店・9000)の照合には販売大臣DBが必要です。\n' +
+      'settings.json の hanbai.source を auto にし、DBがある会社PCで照合してください。'
+    );
+  }
+  if (loadInfo.source === 'file') {
+    throw new Error(
+      '販売大臣DBに接続できず、限定的な販売実績ファイルへフォールバックしました。\n' +
+      'この状態で照合すると日野折箱店の自社製造一致が壊れます（一致0・全休眠になる事故）。照合を中止しました。\n' +
+      '会社PCで SQL Server(MSSQL$OHKEN) が起動していることを確認してから再実行してください。'
+    );
+  }
+  if (loadInfo.count < SELF_HANBAI_MIN_POOL) {
+    throw new Error(
+      '販売実績が ' + loadInfo.count + ' 件と少なすぎます（DB未接続のフォールバックの可能性）。\n' +
+      '自社製造(9000)の照合には全期間DBプール(約8500件以上)が必要です。照合を中止しました。'
+    );
+  }
+}
+
 // 販売実績レコードを取得する（DB直結 or ファイル）。run()＝照合 と サーバの「自社品検索(休眠の手動紐付け)」で共用。
 //  opts.settings: getSettings() 相当（省略時は読み直す） / opts.hanbaiArg: 明示した販売実績ファイル（あれば常にファイル優先）
-//  opts.log: 進捗ログ関数（省略時は無音）。戻り値: hanbai.js:parseHanbai 形のレコード配列。
+//  opts.log: 進捗ログ関数（省略時は無音）。戻り値: { records, source:'db'|'file' }。
 //  ※ 取得ロジックは run() と完全に同じ（DB 'db'/'auto'/'file' とフォールバック）。1か所に集約して二重実装を避ける。
 function loadHanbaiRecords(opts) {
   opts = opts || {};
@@ -135,6 +184,7 @@ function loadHanbaiRecords(opts) {
   //  引数で販売実績ファイルを明示した時は常にファイルを優先。
   const mode = (!hanbaiArg && s.hanbai && s.hanbai.source) || 'file';
   let hanbai = null;
+  let source = 'file';
   if (mode === 'db' || mode === 'auto') {
     try {
       log('販売実績を 販売大臣DB から直接取得中…（読み取り専用・書き込みなし）');
@@ -145,6 +195,7 @@ function loadHanbaiRecords(opts) {
       const dbExtra = { candidateMonths: (s.hanbai && s.hanbai.candidateMonths) };
       if (opts.fullHistory) dbExtra.candidateStart = '2000-01-01';
       hanbai = loadHanbaiFromDb(Object.assign({}, (s.hanbai && s.hanbai.db) || {}, dbExtra));
+      source = 'db';
       log('販売実績レコード: ' + hanbai.length + ' 件（DB: ' + ((s.hanbai.db && s.hanbai.db.database) || '') + (opts.fullHistory ? ' / 全期間' : '') + '）');
     } catch (e) {
       if (mode === 'db') throw e; // 'db'(厳格)は失敗＝中断（古いファイルで黙って続行しない）
@@ -163,9 +214,10 @@ function loadHanbaiRecords(opts) {
       hanbaiCsv = xlsToCsv(hanbaiSrc);
     }
     hanbai = loadHanbai(hanbaiCsv);
+    source = 'file';
     log('販売実績レコード: ' + hanbai.length + ' 件（' + path.basename(hanbaiSrc) + '）');
   }
-  return hanbai;
+  return { records: hanbai, source, count: hanbai.length };
 }
 
 function run(argv) {
@@ -195,7 +247,27 @@ function run(argv) {
   //  どこまで遡って表示・見積するかは得意先ページの「過去N年」フィルタで別途制御できる。
   const cm = Number((s.hanbai && s.hanbai.candidateMonths));
   const fullHist = !(Number.isFinite(cm) && cm >= 12); // 12未満/0/未設定 → 全期間
-  const hanbai = loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: fullHist, log: console.log });
+  if (shogoRequiresDb(s) && !hanbaiArg) {
+    const mode = (s.hanbai && s.hanbai.source) || 'file';
+    if (mode === 'auto' || mode === 'db') {
+      const { probeDbConnection } = require('./db_hanbai');
+      try { probeDbConnection((s.hanbai && s.hanbai.db) || {}); }
+      catch (e) {
+        throw new Error(
+          '販売大臣DBに接続できません。自社製造(日野折箱店)の照合が壊れるため、照合を中止します。\n' +
+          '自宅PC等DBのない環境では 照合.bat／↻照合 を実行しないでください。\n' +
+          String(e && e.message || e)
+        );
+      }
+    }
+  }
+  const hanbaiLoad = loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: fullHist, log: console.log });
+  const hanbai = hanbaiLoad.records;
+  // 自社製造(9000)用の全期間プールも同じ条件で検証（窓モード時は別ロードになる）。
+  const selfPoolLoad = fullHist
+    ? hanbaiLoad
+    : loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: true, log: console.log });
+  assertShogoHanbaiSafe(s, hanbaiArg, selfPoolLoad);
 
   // .xlsx のメーカー見積を maker_quotes/ のCSVへ展開（ドロップ→照合.bat だけで使える）
   const expandXlsx = (file) => {
@@ -242,7 +314,7 @@ function run(argv) {
   // 自社製造(9000)は季節品が多く窓では取りこぼすため常に全期間プール。窓モードのときだけ別途ロード（全期間時は hanbai を流用）。
   let selfHanbai = null;
   const getSelfHanbai = () => {
-    if (!selfHanbai) selfHanbai = fullHist ? hanbai : loadHanbaiRecords({ settings: s, hanbaiArg, fullHistory: true, log: console.log });
+    if (!selfHanbai) selfHanbai = fullHist ? hanbai : selfPoolLoad.records;
     return selfHanbai;
   };
   for (const [supplier, items] of merged) {
@@ -273,4 +345,4 @@ if (require.main === module) {
   try { run(process.argv); }
   catch (e) { console.error('✗ ' + (e && e.message || e)); process.exit(1); }
 }
-module.exports = { run, loadHanbaiRecords, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey, fileTimeOf };
+module.exports = { run, loadHanbaiRecords, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey, fileTimeOf, shogoRequiresDb, assertShogoHanbaiSafe, SELF_HANBAI_MIN_POOL };

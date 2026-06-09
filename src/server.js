@@ -11,7 +11,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { exec, execFile } = require('child_process');
 const { loadAndNormalize } = require('./load');
-const { calcRow } = require('./rules');
+const { calcRow, sen, senStr } = require('./rules');
 const { loadPL } = require('./pl');
 const { writeQuote } = require('./quoteXlsx');
 const { writeXlsx } = require('./xlsx');
@@ -23,14 +23,18 @@ const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
 const { CDLINK_PAGE } = require('./cdlinkPage');
 const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk } = require('./settings');
-const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords } = require('./shogo');
+const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords, mergeMakerFiles } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
 const { readXlsxBuffer } = require('./xlsxread');
-const { detectColumns: detectMakerCols, serialToDate } = require('./makerXlsx');
-const { loadCsv } = require('./csv');
+const { detectColumns: detectMakerCols, serialToDate, normDate } = require('./makerXlsx');
+const { loadCsv, decodeBuffer } = require('./csv');
 const { xlsToCsv } = require('./xls2csv');
 const { priceRowAnomaly } = require('./anomaly');
+const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode } = require('./productLink');
+const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
+// 配信HTMLの版（/api/ping の rev と一致＝古いサーバが残っていないか確認用）
+const SIM_PAGE_REV = '20260608a';
 const { buildCostCsv } = require('./cost_export');
 const os = require('os');
 
@@ -68,6 +72,39 @@ function recordIssuance(issued, folderName, atIso) {
     };
   }
   writeIssueLog(log);
+}
+
+// 提出済み見積の一覧（発行履歴＋ファイル有無）。得意先ページの「提出済一覧」モーダル用。
+function buildIssuedQuotesList() {
+  const log = readIssueLog();
+  const items = [];
+  const folderSet = {};
+  for (const [customer, ent] of Object.entries(log)) {
+    if (!ent) continue;
+    const folder = String(ent.folder || '');
+    const folderPath = folder ? path.join(OUTPUT_DIR, folder) : '';
+    const filePath = folder ? path.join(folderPath, `見積_${sanitizeName(customer)}.xlsx`) : '';
+    const row = {
+      customer,
+      lastIssuedAt: ent.lastIssuedAt || '',
+      quoteNo: ent.quoteNo || '',
+      itemCount: Number(ent.itemCount) || 0,
+      count: Number(ent.count) || 1,
+      folder,
+      fileExists: !!(filePath && fs.existsSync(filePath)),
+      folderExists: !!(folderPath && fs.existsSync(folderPath)),
+    };
+    items.push(row);
+    if (folder) {
+      if (!folderSet[folder]) folderSet[folder] = { folder, customers: 0, lastIssuedAt: '' };
+      folderSet[folder].customers++;
+      if (row.lastIssuedAt > folderSet[folder].lastIssuedAt) folderSet[folder].lastIssuedAt = row.lastIssuedAt;
+    }
+  }
+  items.sort((a, b) => String(b.lastIssuedAt).localeCompare(String(a.lastIssuedAt)));
+  const folders = Object.values(folderSet).sort((a, b) => String(b.lastIssuedAt).localeCompare(String(a.lastIssuedAt)));
+  const totalItems = items.reduce((s, x) => s + (x.itemCount || 0), 0);
+  return { items, count: items.length, folders, totalItems };
 }
 
 // ---- 得意先別アイテムの状態（検討中＝除外／提出済み）-------------------
@@ -117,13 +154,16 @@ function markItemsIssued(customer, items, quoteNo, atIso) {
   if (!customer || !items || !items.length) return;
   const map = readItemStatus();
   if (!map[customer]) map[customer] = {};
+  // 見積書(xlsx)は売価を2桁丸め(r2)で出力するので、保存単価も同じ2桁丸めで揃える
+  //  （生値のまま保存すると 品目ステータス.json／基幹CSV が見積書と最大¥0.01ズレる）。
+  const r2 = (v) => Number.isFinite(Number(v)) ? Math.round(Number(v) * 100) / 100 : null;
   for (const it of items) {
     const k = it && it.rowKey; if (!k) continue;
     map[customer][k] = {
       s: 'issued', at: atIso, quoteNo: quoteNo || '', eff: String((it && it.effectiveDate) || ''),
       // 発行時の確定単価を保存＝手入力/価格帯別/行ルールで決めた見積書の単価をそのまま基幹CSV(単価履歴/仕入原価)へ反映。
-      sell: (it && Number.isFinite(Number(it.newSell))) ? Number(it.newSell) : null,
-      cost: (it && Number.isFinite(Number(it.newCost))) ? Number(it.newCost) : null,
+      sell: r2(it && it.newSell),
+      cost: r2(it && it.newCost),
     };
   }
   writeItemStatus(map);
@@ -159,7 +199,9 @@ function listLatestCsv() {
     const supplier = m[1];
     const stamp = m[2] + '_' + m[3].padEnd(6, '0'); // HHMM→HHMM00 に揃えて文字列比較できるように
     const cur = latest.get(supplier);
-    if (!cur || cur.stamp < stamp) latest.set(supplier, { file: f, stamp });
+    // 同じ日時スタンプ（分単位など）で複数本あるときは、実ファイルの更新時刻が新しい方を採用。
+    let mtime = 0; try { mtime = fs.statSync(path.join(INPUT_DIR, f)).mtimeMs; } catch (_) {}
+    if (!cur || cur.stamp < stamp || (cur.stamp === stamp && cur.mtime < mtime)) latest.set(supplier, { file: f, stamp, mtime });
   }
   const picked = [...latest.values()].map((x) => x.file).sort((a, b) => a.localeCompare(b, 'ja'));
   return picked.concat(others.sort());
@@ -368,13 +410,8 @@ function calcAll(body) {
   const links = ((getProductLinks() || {})[supplier]) || {};
   const itemStatusMap = readItemStatus(); // 各行の状態（提出済み/検討中）を 得意先別ページと同じ rowKey で引く（メイン表で提出済みを隠す等に使う）
   // 紐付けの取り合い防止：自社CDが「別メーカー品」に予約されている行は除外。
-  //  (注) 紐付け先メーカーがこのCSV内に行を持たない場合は、自社CDの全候補が消える
-  //       → 「↻ 照合を実行」で再生成すれば新しい紐付けが取り込まれる。
-  const recs = allRecs.filter((rec) => {
-    if (!rec.productCode) return true;
-    const linkedMaker = links[rec.productCode];
-    return !linkedMaker || linkedMaker === rec.makerName;
-  });
+  //  紐付け名がずれていて見積にその名のメーカー品が無いときは行を残す（typo で一覧から消えない）。
+  const recs = allRecs.filter((rec) => !shouldExcludeByProductLink(rec, links, allRecs));
 
   const excludedCust = getExcludedCustomers(); // 取引終了などで除外設定された得意先（画面・損益・見積から外す）
   const rows = recs.map((rec, i) => {
@@ -383,13 +420,14 @@ function calcAll(body) {
     //  ルールは全体設定(現売価×掛率 等)・行上書きをそのまま使う＝掛率での一括値上げや手入力ができる。
     //  原価0だと add_increase 既定では「値上げなのに同額」になるが、自社製造は誤りではないので
     //  下の priceWarning で自社製造を除外する（要確認に落とさない）。
-    const effNewCost = isSelfMade ? 0 : (fin(Number(o.newCost)) && o.newCost !== '' && o.newCost != null ? Number(o.newCost) : rec.newCost);
+    // 手入力の改定後仕入は銭(2桁)へ丸めて取り込む（rec.newCost は load 側で sen 済み＝表示・計算の端数を揃える）。
+    const effNewCost = isSelfMade ? 0 : (fin(Number(o.newCost)) && o.newCost !== '' && o.newCost != null ? sen(Number(o.newCost)) : rec.newCost);
     const effRule = o.rule ? { type: o.rule, factor: globalRule.factor } : globalRule;
     const cfg = { default: effRule, overrides: [], rounding, selfCostUplift };
     const recForCalc = isSelfMade ? { ...rec, currentCost: 0, newCost: effNewCost } : { ...rec, newCost: effNewCost };
     const r = calcRow(recForCalc, cfg);
     // 紐付け辞書で確定済の (自社CD ⇔ メーカー商品名) なら ステータスを 「📌 手動紐付け」 に上書き
-    const linkedSelf = r.productCode && links[r.productCode] === r.makerName;
+    const linkedSelf = isProductLinkActive(r, links, allRecs);
     const matchStatus = linkedSelf ? '📌 手動紐付け' : (r.matchStatus || '');
     const ps = parseSelfName(r.productName); // 自社商品名を構造化
     // 提出対象（得意先あり・一致）行だけ価格異常を判定（休眠/未一致は売単価が無くて当然なので対象外）
@@ -417,7 +455,7 @@ function calcAll(body) {
       productNameCore: (rec.masterName && String(rec.masterName).trim()) ? String(rec.masterName).trim() : ps.core, // DB直結時はマスタ商品名(クリーン)を優先＝1/120等のゴミを含まない
       supplierCode: ps.supplierCode, freight: ps.freight, lot: ps.lot, supplierIdEmbed: ps.supplierId,
       makerName: r.makerName || '', makerCode: rec.makerCode || '', matchStatus, priceWarning, rateWarning, costConflict: '',
-      currentCost: r.currentCost, newCost: r.newCost, costIncrease: r.costIncrease, costIncreaseRate: r.costIncreaseRate,
+      currentCost: sen(r.currentCost), newCost: sen(r.newCost), costIncrease: r.costIncrease, costIncreaseRate: r.costIncreaseRate,
       currentSell: r.currentSell, newSell: r.newSell, sellIncrease: r.sellIncrease,
       currentMarginRate: r.currentMarginRate, newMarginRate: r.newMarginRate,
       qty: r.qty, qtySource: r.qtySource, lastDate: rec.lastDate || '',
@@ -475,8 +513,8 @@ function calcAll(body) {
     avgNewMargin: sumNewSales > 0 ? (sumNewProfit / sumNewSales) * 100 : NaN,
     totalSellNow: sumCurSales, totalSellNew: sumNewSales,
   };
-  // 全メーカー商品名のユニーク集合（紐付け編集UIの選択肢として返す）
-  const makerNames = Array.from(new Set(rows.map((r) => r.makerName).filter(Boolean))).sort();
+  // 紐付け編集UIの選択肢＝照合結果の名前だけでなくメーカー見積・登録済み紐付けも含める（変更先がリストに無い事故を防ぐ）
+  const makerNames = supplier ? collectMakerNamesForSupplier(supplier) : Array.from(new Set(rows.map((r) => r.makerName).filter(Boolean))).sort();
   // 仕入先マスタも返却 → 行ごとの「発注先コード→名前」解決に使う
   const suppliers = getSuppliers();
   return { rows, summary, supplier, productLinks: links, makerNames, suppliers };
@@ -583,12 +621,24 @@ function buildCdCandidates() {
   const seen = new Set();
   const items = [];
   let dormantWithCode = 0;
+  const dormantItems = []; // 品番ありなのに休眠（自社品が見つからない）＝手で探してNM3登録すべき筆頭
+  const dormSeen = new Set();
   for (const { sup, recs } of fileRecs) {
     for (const r of recs) {
       const st = r['照合'] || '';
       const makerCode = String(r['メーカー商品CD'] || '').trim();
       const selfCode = String(r['販売実績商品コード'] || '').trim();
-      if (/休眠|未一致/.test(st)) { if (makerCode) dormantWithCode++; continue; } // 休眠＝自社CD不明
+      if (/休眠|未一致/.test(st)) {
+        if (makerCode) {
+          dormantWithCode++;
+          const dk = sup + '\x01' + makerCode;
+          if (!dormSeen.has(dk)) {
+            dormSeen.add(dk);
+            dormantItems.push({ supplier: sup, makerCode, makerName: String(r['メーカー商品名'] || '').replace(/\s+/g, ' ').slice(0, 50) });
+          }
+        }
+        continue; // 休眠＝自社CD不明
+      }
       if (!/名前一致/.test(st)) continue; // CD一致・手動紐付けは確定済み＝対象外
       if (!makerCode || !selfCode || /^0+$/.test(selfCode)) continue;
       if (cdMakerCodes.has(makerCode)) continue; // その品番は既に正しい自社品にCD一致済み＝別品への取り違え候補なので除外
@@ -607,7 +657,18 @@ function buildCdCandidates() {
     }
   }
   items.sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.selfCode).localeCompare(String(b.selfCode)));
-  return { items, count: items.length, dormantWithCode };
+  dormantItems.sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.makerCode).localeCompare(String(b.makerCode)));
+  return { items, count: items.length, dormantWithCode, dormantItems };
+}
+// 品番ありなのに休眠（自社品が見つからない）メーカー品の一覧CSV（UTF-8 BOM）。
+//  ＝「この品番の自社品は何？」を社内で探してマスタ(商品名3)に登録する作業リスト＝CD一致カバレッジを上げる起点。
+function buildCdDormantCsv() {
+  const { dormantItems } = buildCdCandidates();
+  const cell = (v) => { const s = (v == null ? '' : String(v)); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const head = ['仕入先', 'メーカー品番', 'メーカー商品名', '対応する自社商品コード（記入）'];
+  const lines = [head.join(',')];
+  for (const it of dormantItems) lines.push([it.supplier, it.makerCode, it.makerName, ''].map(cell).join(','));
+  return '﻿' + lines.join('\r\n');
 }
 // 候補をマスタ登録用CSV（UTF-8 BOM＝Excelで日本語が文字化けしない）に。商品コード＋メーカー品番が主役。
 //  ※販売大臣の商品マスタ取込フォーマット（列名/SJIS要否）は実機で要確認。まずは確認・作業用の汎用CSV。
@@ -635,15 +696,24 @@ function multiMatchCheck() {
       if (!code || /^0+$/.test(code)) continue;
       const mc = String(r['メーカー商品CD'] || '').trim();
       const cost = String(r['新仕入単価'] || '').trim();
+      const pm = String(r['照合'] || '').match(/(\d+)\s*%/);
+      const pct = pm ? Number(pm[1]) : 0;
       if (!byCode.has(code)) byCode.set(code, { name: String(r['販売実績商品名'] || '').replace(/\s+/g, ' ').slice(0, 28), byMaker: new Map() });
-      byCode.get(code).byMaker.set(mc, { makerCode: mc, makerName: String(r['メーカー商品名'] || '').replace(/\s+/g, ' ').slice(0, 24), cost, supplier: sup });
+      byCode.get(code).byMaker.set(mc, { makerCode: mc, makerName: String(r['メーカー商品名'] || '').replace(/\s+/g, ' ').slice(0, 24), cost, supplier: sup, pct });
     }
   }
   const out = [];
   for (const [code, e] of byCode) {
     const vs = [...e.byMaker.values()];
-    const costs = new Set(vs.map((v) => v.cost));
-    if (vs.length > 1 && costs.size > 1) out.push({ code, name: e.name, variants: vs });
+    // 単価は銭(2桁)へ正規化して比較＝17.11 と 17.112 を「同じ」と見なす（浮動小数の見かけ違いを誤検出しない）。
+    const costs = new Set(vs.map((v) => senStr(v.cost)).filter((s) => s !== ''));
+    if (vs.length > 1 && costs.size > 1) {
+      // 推定：一致度%が最も高い候補を「正しい候補」のヒントに（同%なら先頭）。＝どれを商品名3に登録すべきかの当たり。
+      let best = vs[0];
+      for (const v of vs) if ((v.pct || 0) > (best.pct || 0)) best = v;
+      const suggestCode = vs.filter((v) => (v.pct || 0) === (best.pct || 0)).length === 1 ? best.makerCode : '';
+      out.push({ code, name: e.name, variants: vs, suggest: suggestCode, suggestName: suggestCode ? best.makerName : '' });
+    }
   }
   out.sort((a, b) => String(a.code).localeCompare(String(b.code)));
   return out;
@@ -653,10 +723,40 @@ function multiMatchCheck() {
 function buildMultiMatchCsv() {
   const items = multiMatchCheck();
   const cell = (v) => { const s = (v == null ? '' : String(v)); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
-  const head = ['商品コード', '現商品名', 'メーカー品番（候補）', 'メーカー商品名', '新仕入単価', '仕入先'];
+  const head = ['商品コード', '現商品名', 'メーカー品番（候補）', 'メーカー商品名', '新仕入単価', '一致度%', '仕入先', '推定（一致度が最も高い候補）'];
   const lines = [head.join(',')];
-  for (const it of items) for (const v of it.variants) lines.push([it.code, it.name, v.makerCode, v.makerName, v.cost, v.supplier].map(cell).join(','));
+  for (const it of items) for (const v of it.variants) lines.push([it.code, it.name, v.makerCode, v.makerName, v.cost, (v.pct || ''), v.supplier, (it.suggest && v.makerCode === it.suggest) ? '★ これが有力' : ''].map(cell).join(','));
   return '﻿' + lines.join('\r\n');
+}
+
+// 紐付けモーダル用：仕入先のメーカー商品名候補（照合結果＋メーカー見積＋登録済み紐付け）を集める。
+function collectMakerNamesForSupplier(supplier) {
+  const sup = String(supplier || '').trim();
+  const names = new Set();
+  if (!sup) return [];
+  for (const f of listLatestCsv()) {
+    if (String(f).split('_照合結果_')[0] !== sup) continue;
+    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    for (const r of recs) {
+      const nm = String(r['メーカー商品名'] || '').trim();
+      if (nm && nm !== '【販売実績なし or 商品名不一致】') names.add(nm);
+    }
+  }
+  try {
+    const files = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f) && !f.startsWith('_'));
+    const items = mergeMakerFiles(files.map((f) => path.join(MAKER_DIR, f)), getSettings().makerChannel || {});
+    for (const it of items) {
+      if (String(it.supplier || '').trim() !== sup) continue;
+      const nm = String(it.makerName || '').trim();
+      if (nm) names.add(nm);
+    }
+  } catch (e) { /* maker_quotes 無しでも続行 */ }
+  const pl = (getProductLinks()[sup]) || {};
+  for (const v of Object.values(pl)) {
+    const nm = String(v || '').trim();
+    if (nm) names.add(nm);
+  }
+  return [...names].sort((a, b) => a.localeCompare(b, 'ja'));
 }
 
 // 紐付けモーダル用：指定仕入先の「メーカー商品名の候補」と既存の手動紐付けを返す。
@@ -664,27 +764,55 @@ function buildMultiMatchCsv() {
 function linkContext(supplier) {
   const sup = String(supplier || '').trim();
   const links = (getProductLinks()[sup]) || {};
-  const names = new Set();
-  if (sup) {
-    for (const f of listLatestCsv()) {
-      if (String(f).split('_照合結果_')[0] !== sup) continue;
-      let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
-      for (const r of recs) {
-        const nm = String(r['メーカー商品名'] || '').trim();
-        if (nm && nm !== '【販売実績なし or 商品名不一致】') names.add(nm);
-      }
-    }
+  return { ok: true, supplier: sup, makerNames: collectMakerNamesForSupplier(sup), links };
+}
+
+// 手動紐付けの健全性チェック：表記ゆれ・古い紐付け・手動より確実な自動候補。
+function buildProductLinkCheck() {
+  const productLinks = getProductLinks();
+  const matchRowsBySupplier = {};
+  for (const f of listLatestCsv()) {
+    const sup = String(f).split('_照合結果_')[0];
+    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    matchRowsBySupplier[sup] = recs;
   }
-  return { ok: true, supplier: sup, makerNames: [...names].sort((a, b) => a.localeCompare(b, 'ja')), links };
+  const base = auditProductLinks(productLinks, matchRowsBySupplier);
+  let makerItems = [];
+  try {
+    const files = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f) && !f.startsWith('_'));
+    const merged = mergeMakerFiles(files.map((f) => path.join(MAKER_DIR, f)), getSettings().makerChannel || {});
+    // mergeMakerFiles は Map(仕入先→item[]) を返す。監査関数は item の配列を期待するので平坦化する
+    //  （※従来ここで Map のまま渡しており、auditBetterManualLinks が実質無効化されていた＝本修正で復活）。
+    if (merged instanceof Map) { for (const arr of merged.values()) makerItems.push(...arr); }
+    else if (Array.isArray(merged)) makerItems = merged;
+  } catch (e) { /* maker_quotes 無しでも続行 */ }
+  let hanbai = [];
+  try { hanbai = getHanbaiRecordsCached(); } catch (e) { /* DB/ファイル不可でも続行 */ }
+  const better = auditBetterManualLinks(productLinks, makerItems, hanbai);
+  const suspect = auditSuspectManualLinks(productLinks, makerItems, hanbai);
+  const issues = [...base.issues, ...better.issues, ...suspect.issues].sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja')
+    || String(a.code).localeCompare(String(b.code)));
+  return {
+    issues,
+    count: issues.length,
+    mismatchCount: base.mismatchCount,
+    orphanCount: base.orphanCount,
+    betterCount: better.count,
+    betterCdCount: better.betterCdCount,
+    betterNameCount: better.betterNameCount,
+    suspectCount: suspect.count,
+  };
 }
 
 // 販売実績レコードのキャッシュ（自社品検索の連打で毎回DB/ファイルを読まないよう短時間キャッシュ）。
 //  ※ 照合(shogo)は毎回フレッシュに読むのでこのキャッシュは「自社品検索」専用。force で破棄して読み直せる。
 let _hanbaiCache = null; // { at, records }
+// 照合し直したら呼ぶ：自社品検索キャッシュ（5分TTL）と照合結果CSVキャッシュを破棄して次回フレッシュに読む。
+function invalidateCaches() { _hanbaiCache = null; try { cache.clear(); } catch (_) {} }
 function getHanbaiRecordsCached(force) {
   const TTL = 5 * 60 * 1000; // 5分（DB読取は約1.5秒・ファイルも数秒かかるため）
   if (!force && _hanbaiCache && (Date.now() - _hanbaiCache.at) < TTL) return _hanbaiCache.records;
-  const records = loadHanbaiRecords({ settings: getSettings() }); // ログは無音（UI用途）
+  const records = loadHanbaiRecords({ settings: getSettings() }).records; // ログは無音（UI用途）
   _hanbaiCache = { at: Date.now(), records };
   return records;
 }
@@ -788,7 +916,20 @@ function calcByDate(body) {
       const issuedEff = (stEntry && stEntry.s === 'issued' && stEntry.eff) ? stEntry.eff : '';
       const eff = normDateInput(issuedEff || r.effectiveDate || r.switchDate || '');
       if (eff !== date) continue;
-      rows.push(Object.assign({ supplier: sup, itemStatus: (stEntry && stEntry.s) || '' }, r)); // 行に仕入先＋進捗を付与
+      // 提出済みは発行時に確定した単価を採用し、年影響(損益)も再計算＝見積書・得意先別ページと一致させる
+      //  （既定再計算のままだと、手入力/価格帯別/行ルールで決めた発行単価とカレンダー上の損益がズレる）。
+      let row = r;
+      if (stEntry && stEntry.s === 'issued') {
+        row = Object.assign({}, r);
+        if (stEntry.sell != null && Number.isFinite(Number(stEntry.sell))) row.newSell = Number(stEntry.sell);
+        if (stEntry.cost != null && Number.isFinite(Number(stEntry.cost))) row.newCost = Number(stEntry.cost);
+        if (fin(row.qty) && row.qty > 0) {
+          if (fin(row.newSell) && fin(row.currentSell)) { row.sellIncrease = row.newSell - row.currentSell; row.annualSellImpact = row.qty * row.sellIncrease; row.annualSellNew = row.qty * row.newSell; }
+          if (fin(row.newCost) && fin(row.currentCost)) { row.costIncrease = row.newCost - row.currentCost; row.annualCostImpact = row.qty * row.costIncrease; }
+        }
+        if (fin(row.newSell) && row.newSell > 0 && fin(row.newCost)) row.newMarginRate = ((row.newSell - row.newCost) / row.newSell) * 100;
+      }
+      rows.push(Object.assign({ supplier: sup, itemStatus: (stEntry && stEntry.s) || '' }, row)); // 行に仕入先＋進捗を付与
       supSet.add(sup);
     }
   }
@@ -931,12 +1072,12 @@ function csvCell(v) { const s = String(v == null ? '' : v); return /[",\r\n]/.te
 
 // Excel由来の数値表現を整える（浮動小数の誤差を丸めた短い文字列に）
 function cleanNum(v) {
-  const s = String(v == null ? '' : v).trim();
-  if (s === '' || !/^-?\d/.test(s)) return s; // 文字混じりはそのまま
-  const n = parseFloat(s);
+  const s = String(v == null ? '' : v).normalize('NFKC').trim();
+  if (s === '' || !/^-?[\d,]*\d/.test(s)) return s; // 文字混じりはそのまま（先頭が数字/カンマ区切り数字のみ処理）
+  const n = parseFloat(s.replace(/,/g, '')); // 桁区切りカンマを除去（"1,234.5" → 1234.5）
   if (!Number.isFinite(n)) return s;
-  // toFixed(10) で誤差を吸収して Number 化（"9.5299999999999994" → "9.53"）
-  return String(Number(n.toFixed(10)));
+  // 容器仕入単価は銭（小数2桁）が基準（2.549999999 → 2.55）
+  return senStr(n);
 }
 
 // 取り込んだ表の「切替日（日付シリアル）」「現/新単価（浮動小数誤差）」を見やすい値に直す。
@@ -944,12 +1085,33 @@ function cleanNum(v) {
 function normalizeMakerGrid(grid) {
   if (!Array.isArray(grid) || !grid.length) return grid;
   const idx = detectMakerCols(grid);
-  if (!idx) return grid;
-  for (let r = idx.headerRow + 1; r < grid.length; r++) {
-    const row = grid[r]; if (!Array.isArray(row)) continue;
-    if (idx.date != null && row[idx.date] != null && row[idx.date] !== '') row[idx.date] = serialToDate(row[idx.date]);
-    if (idx.cur  != null && row[idx.cur]  != null && row[idx.cur]  !== '') row[idx.cur]  = cleanNum(row[idx.cur]);
-    if (idx.nw   != null && row[idx.nw]   != null && row[idx.nw]   !== '') row[idx.nw]   = cleanNum(row[idx.nw]);
+  if (idx) {
+    for (let r = idx.headerRow + 1; r < grid.length; r++) {
+      const row = grid[r]; if (!Array.isArray(row)) continue;
+      if (idx.date != null && row[idx.date] != null && row[idx.date] !== '') row[idx.date] = normDate(row[idx.date]);
+      if (idx.cur  != null && row[idx.cur]  != null && row[idx.cur]  !== '') row[idx.cur]  = cleanNum(row[idx.cur]);
+      if (idx.nw   != null && row[idx.nw]   != null && row[idx.nw]   !== '') row[idx.nw]   = cleanNum(row[idx.nw]);
+    }
+    return grid;
+  }
+  // 見出し自動検出に失敗しても、列名から現・新単価らしき列を推定して銭丸め
+  for (let r = 0; r < Math.min(grid.length, 15); r++) {
+    const head = grid[r]; if (!Array.isArray(head)) continue;
+    const cols = [];
+    head.forEach((h, i) => {
+      const t = String(h || '').normalize('NFKC').toLowerCase();
+      if (/(新単価|新価格|改定後|改定単価)/.test(t)) cols.push(i);
+      else if (/(現単価|現行|旧単価|現価)/.test(t)) cols.push(i);
+      else if (/(単価|価格|仕入)/.test(t)) cols.push(i);
+    });
+    if (!cols.length) continue;
+    for (let ri = r + 1; ri < grid.length; ri++) {
+      const row = grid[ri]; if (!Array.isArray(row)) continue;
+      for (const ci of cols) {
+        if (row[ci] != null && row[ci] !== '') row[ci] = cleanNum(row[ci]);
+      }
+    }
+    break;
   }
   return grid;
 }
@@ -965,7 +1127,7 @@ function extractSupplierFromMakerFile(filename) {
 }
 function countCsvDataRows(fullPath) {
   try {
-    const txt = fs.readFileSync(fullPath, 'utf8').replace(/^﻿/, '');
+    const txt = decodeBuffer(fs.readFileSync(fullPath)).replace(/^﻿/, ''); // 文字コード自動判定（Shift_JIS等でも行数が狂わない）
     const lines = txt.split(/\r?\n/).filter((l) => l.trim() !== '');
     return Math.max(0, lines.length - 1); // ヘッダー1行を除く
   } catch (e) { return 0; }
@@ -1052,6 +1214,15 @@ function saveMakerQuote(body) {
   const supplier = String((body && body.supplier) || '').trim() || '仕入先不明';
   const items = Array.isArray(body && body.items) ? body.items : [];
   if (!items.length) return { ok: false, error: 'データがありません' };
+  // クライアントを信用せず、保存時に必ず銭丸め（2.54999 → 2.55）
+  for (const it of items) {
+    if (it.currentCost != null && String(it.currentCost).trim() !== '') {
+      if (Number.isFinite(sen(it.currentCost))) it.currentCost = senStr(it.currentCost);
+    }
+    if (it.newCost != null && String(it.newCost).trim() !== '') {
+      if (Number.isFinite(sen(it.newCost))) it.newCost = senStr(it.newCost);
+    }
+  }
   // 自社製造（メーカーコード9000＝日野折箱店）判定。body.purchaseCode 優先・無ければ既存プロファイル。
   const effPurchase = String(
     (body && body.purchaseCode != null && String(body.purchaseCode).trim() !== '')
@@ -1073,7 +1244,12 @@ function saveMakerQuote(body) {
   const header = ['仕入先', 'メーカー品番', 'メーカー商品名', '規格', '現単価', '新単価', '切替日'];
   const lines = [header.join(',')];
   for (const it of items) {
-    lines.push([supplier, it.makerCode, it.makerName, it.spec, it.currentCost, it.newCost, it.switchDate].map(csvCell).join(','));
+    const cur = senStr(it.currentCost);
+    const nw = senStr(it.newCost);
+    lines.push([supplier, it.makerCode, it.makerName, it.spec,
+      Number.isFinite(sen(it.currentCost)) ? cur : it.currentCost,
+      Number.isFinite(sen(it.newCost)) ? nw : it.newCost,
+      it.switchDate].map(csvCell).join(','));
   }
   const fname = `メーカー見積_${sanitizeName(supplier)}_${stamp()}.csv`;
   fs.writeFileSync(path.join(MAKER_DIR, fname), '﻿' + lines.join('\r\n'), 'utf8');
@@ -1377,7 +1553,8 @@ function buildCustomerCandidates(opts) {
       let ruleForRow = ruleType;
       // 優先順位：行ルール上書き > 価格帯別ルール（現売価で変える）> 全体ルール。
       const ov = rowRules[rowKey];
-      const hasRowRuleOv = !!(ov && ov !== ruleType);
+      // 行ルールが明示選択されていれば（全体と同じ値でも）価格帯別を抑止＝この行は手動ロック扱い。
+      const hasRowRuleOv = !!ov;
       // 価格帯別ルール：行ルール上書きが無い行にだけ、現売価で帯のルール/掛率を当てる。
       const band = hasRowRuleOv ? null : bandFor(r.currentSell);
       const effRuleType = hasRowRuleOv ? ov : (band && band.rule ? band.rule : ruleType);
@@ -1386,9 +1563,23 @@ function buildCustomerCandidates(opts) {
       const roundOv = rowRound[rowKey];
       const roundManual = roundOv != null && String(roundOv).trim() !== '';
       if (roundManual) {
-        const pr = String(roundOv).split('|');
-        const u = parseFloat(pr[0]);
-        if (Number.isFinite(u) && u > 0) effRounding = { unit: u, mode: pr[1] || 'round' };
+        const s = String(roundOv).trim();
+        let eu = rounding.unit, em = rounding.mode;
+        if (s.includes('|')) {
+          const pr = s.split('|');
+          const u = parseFloat(pr[0]);
+          if (pr[0] !== '' && Number.isFinite(u) && (u === 1 || u === 0.1 || u === 0.01)) eu = u;
+          const m = pr[1] || '';
+          if (m === 'floor' || m === 'round' || m === 'ceil') em = m;
+          effRounding = { unit: eu, mode: em };
+        } else {
+          const u = parseFloat(s);
+          if (Number.isFinite(u) && u > 0 && (u === 1 || u === 0.1 || u === 0.01)) {
+            effRounding = { unit: u, mode: rounding.mode };
+          } else if (s === 'floor' || s === 'round' || s === 'ceil') {
+            effRounding = { unit: rounding.unit, mode: s };
+          }
+        }
       }
       // 掛率（markupのとき）：行掛率 > 帯の掛率 > 全体factor。
       let effFactor = factor;
@@ -1408,7 +1599,8 @@ function buildCustomerCandidates(opts) {
       // 改定後売価の手入力（最優先）。¥/円/カンマ/全角を除去して数値に揃える。
       const manualSell = parsePriceInput(rowSell[rowKey]);
       const sellManual = manualSell != null;
-      if (sellManual) { newSell = manualSell; ruleForRow = 'manual'; }
+      // 手入力は銭(2桁)に丸めて保持＝見積書xlsx(2桁丸め)・発行時保存と一致させる（端数のズレ防止）。
+      if (sellManual) { newSell = sen(manualSell); ruleForRow = 'manual'; }
       // 実施日：行の手入力 > 全体一括 > 各行の切替日。どの形式でも ISO に揃える。
       const effManual = rowEff[rowKey] != null && String(rowEff[rowKey]).trim() !== '';
       const effRaw = effManual ? String(rowEff[rowKey]) : (forceDate || ((r.effectiveDate && String(r.effectiveDate).trim()) ? String(r.effectiveDate).trim() : (r.switchDate || '')));
@@ -1432,13 +1624,9 @@ function buildCustomerCandidates(opts) {
       // 実施日が有効な日付でない（空・「未定」等）行に印を付ける。得意先ページの見積発行では実施日が必須＝
       //  対象に残して赤く強調し、発行ゲートでブロックする（exportCustomerQuotes で参照）。
       item.noEff = !isValidEff(item.effectiveDate);
-      // 価格異常は「行ごと上書き後の改定後売価・ルール」で判定し直す（古い全体ルールの判定を使わない）。
-      //  例: 全体=値上げ → ある行だけ keep_sell/手入力に上書きしても、上書き後の値で正しく判定。
-      //  costConflict（同一メーカー品番に新仕入が複数＝売価に依らないメーカー見積の重複）は売価上書きと無関係なので元判定を保持。
-      const effPriceWarning = priceRowAnomaly(item.currentSell, item.newSell, ruleForRow, isSelfMadeSup(cand.supplier));
-      const effPriceReason = effPriceWarning || (cand.r.costConflict || '');
-      if (effPriceReason) { review.push(Object.assign({ reason: effPriceReason, reasonType: 'price' }, item)); continue; } // 価格異常
-      if (cand.score < thr) { review.push(Object.assign({ reason: '一致度が低い（' + (r.matchStatus || '') + '）', reasonType: 'match' }, item)); continue; } // 低一致
+      // 状態を先に引く。提出済み(issued)は発行時に確定した内容（単価・実施日）を最優先で復元し、
+      //  価格異常・低一致のゲートでは弾かない＝再照合や全体ルール変更で「提出済みが要確認に落ちて消える／
+      //  発行時単価が復元されず基幹CSVに出ない」事故を防ぐ（CLAUDE.md: 発行時単価保存の方針を徹底）。
       const stEntry = (itemStatusMap[name] && itemStatusMap[name][rowKey]) || null;
       item.status = (stEntry && stEntry.s) || ''; // ''=対象 / 'hold'=検討中 / 'issued'=提出済み
       if (item.status === 'issued') {
@@ -1449,7 +1637,17 @@ function buildCustomerCandidates(opts) {
         //  これで 単価履歴CSV(新販売単価)・仕入原価CSV(新仕入単価) が見積書と完全一致する（既定再計算で上書きしない）。
         if (stEntry.sell != null && Number.isFinite(Number(stEntry.sell))) { newSell = Number(stEntry.sell); item.newSell = newSell; }
         if (stEntry.cost != null && Number.isFinite(Number(stEntry.cost))) { item.newCost = Number(stEntry.cost); }
+        keep.push(item); // 提出済み＝発行済みの確定行。価格異常・低一致のゲートを通さずそのまま採用する。
+        continue;
       }
+      // 以下は提出済み以外（対象/検討中）＝価格異常・低一致を判定して要確認(review)へ振り分ける。
+      // 価格異常は「行ごと上書き後の改定後売価・ルール」で判定し直す（古い全体ルールの判定を使わない）。
+      //  例: 全体=値上げ → ある行だけ keep_sell/手入力に上書きしても、上書き後の値で正しく判定。
+      //  costConflict（同一メーカー品番に新仕入が複数＝売価に依らないメーカー見積の重複）は売価上書きと無関係なので元判定を保持。
+      const effPriceWarning = priceRowAnomaly(item.currentSell, item.newSell, ruleForRow, isSelfMadeSup(cand.supplier));
+      const effPriceReason = effPriceWarning || (cand.r.costConflict || '');
+      if (effPriceReason) { review.push(Object.assign({ reason: effPriceReason, reasonType: 'price' }, item)); continue; } // 価格異常
+      if (cand.score < thr) { review.push(Object.assign({ reason: '一致度が低い（' + (r.matchStatus || '') + '）', reasonType: 'match' }, item)); continue; } // 低一致
       keep.push(item);
     }
     byCustomerSplit.set(name, { keep, review });
@@ -1492,16 +1690,35 @@ function aggregateCustomers(opts) {
 
 // 得意先 除外設定モーダル用データ：
 //  active  = いま照合に出ている得意先（＝除外候補。既に除外済みの先は calcAll で消えるので出ない）。
+//            要確認・価格異常だけの得意先（例 自社消費分＝売単価0）も含める＝見積対象(keep)が0でも一覧に出す。
 //            最終売上日・取引有無も付ける＝「取引が無い先」を見つけやすく。
 //  excluded= 現在 除外中の得意先（名前＋除外日時）。ここから「復活」できる。
 function customerExclusionData() {
   let active = [];
   try {
-    const agg = aggregateCustomers({});
-    active = (agg.customers || []).map((c) => ({
+    const byName = new Map();
+    for (const file of listLatestCsv()) {
+      let calc;
+      try { calc = calcAll({ file }); } catch (e) { continue; }
+      const supplier = calc.supplier || String(file).split('_照合結果_')[0] || '';
+      for (const r of calc.rows || []) {
+        const name = r.customerName;
+        if (!name || name === '-' || /未一致/.test(r.matchStatus || '')) continue;
+        if (!byName.has(name)) {
+          byName.set(name, { name, code: '', lastDate: '', hasRecent: false, productCount: 0, suppliers: new Set() });
+        }
+        const c = byName.get(name);
+        if (r.customerCode && String(r.customerCode).trim()) c.code = String(r.customerCode).trim();
+        if (r.lastDate && r.lastDate > c.lastDate) c.lastDate = r.lastDate;
+        if (Number(r.qty) > 0) c.hasRecent = true;
+        c.productCount += 1;
+        if (supplier) c.suppliers.add(supplier);
+      }
+    }
+    active = [...byName.values()].map((c) => ({
       name: c.name, code: c.code || '', lastDate: c.lastDate || '',
-      hasRecent: !!c.hasRecent, productCount: c.productCount || 0, supplierCount: c.supplierCount || 0,
-    }));
+      hasRecent: !!c.hasRecent, productCount: c.productCount || 0, supplierCount: c.suppliers.size,
+    })).sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
   } catch (e) { active = []; }
   const ex = getExcludedCustomers();
   const excluded = Object.keys(ex).map((name) => ({ name, at: ex[name] }))
@@ -1768,7 +1985,7 @@ const server = http.createServer(async (req, res) => {
     }
     // 死活確認（起動時の二重起動防止に使う）。ローカル限定・パスワード不要・機微情報なし。
     if (url === '/api/ping') {
-      return sendJson(res, 200, { ok: true, app: 'kakaku-tenka-sim' });
+      return sendJson(res, 200, { ok: true, app: 'kakaku-tenka-sim', rev: SIM_PAGE_REV });
     }
     // #2 アクセスパスワード（settings.accessPassword が設定されている場合のみ）
     const accessPw = String((getSettings().accessPassword) || '').trim();
@@ -1878,6 +2095,9 @@ const server = http.createServer(async (req, res) => {
     // 見積書の提出（発行）履歴：得意先ページで「提出済み」を表示する。
     if (req.method === 'GET' && url === '/api/issue-log') {
       return sendJson(res, 200, { ok: true, log: readIssueLog() });
+    }
+    if (req.method === 'GET' && url === '/api/issued-quotes-list') {
+      return sendJson(res, 200, { ok: true, ...buildIssuedQuotesList() });
     }
     if (req.method === 'POST' && url === '/api/issue-log-reset') {
       const body = await readBody(req);
@@ -2126,11 +2346,19 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url === '/api/product-link') {
       const body = await readBody(req);
       const sup = String((body && body.supplier) || '').trim();
-      const code = String((body && body.productCode) || '').trim();
+      const code = normalizeLinkCode((body && body.productCode) || '');
       const name = (body && body.makerName != null) ? String(body.makerName).trim() : '';
       if (!sup || !code) return sendJson(res, 200, { ok: false, error: 'supplier と productCode は必須です' });
+      let linkWarn = '';
+      if (name) {
+        const ctx = linkContext(sup);
+        const makers = ctx.makerNames || [];
+        if (makers.length && !makers.includes(name)) {
+          linkWarn = '登録したメーカー品名が、この仕入先の照合結果に見つかりません。候補リストから選ぶと表記ゆれで消える事故を防げます。';
+        }
+      }
       const links = saveProductLink(sup, code, name);
-      return sendJson(res, 200, { ok: true, productLinks: links });
+      return sendJson(res, 200, { ok: true, productLinks: links, linkWarn: linkWarn || undefined });
     }
     if (req.method === 'POST' && url === '/api/maker-quote') {
       const body = await readBody(req);
@@ -2140,6 +2368,7 @@ const server = http.createServer(async (req, res) => {
       if (saved && saved.ok) {
         try {
           const outFiles = runShogo(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
+          invalidateCaches(); // 照合し直したので古いキャッシュを破棄
           saved.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)) };
           // 二重登録の検知：取り込んだ仕入先と「別の仕入先」に同じ自社商品が出ていないか。
           //  例: 修正見積を違う仕入先名で取り込むと、同じ商品が2仕入先に出て二重になる。
@@ -2161,6 +2390,7 @@ const server = http.createServer(async (req, res) => {
       if (r && r.ok) {
         try {
           const outFiles = runShogo(['', '']);
+          invalidateCaches(); // 照合し直したので古いキャッシュを破棄
           r.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)) };
         } catch (e) { r.shogo = { ok: false, error: String(e && e.message || e) }; }
       }
@@ -2208,6 +2438,7 @@ const server = http.createServer(async (req, res) => {
       // メーカー見積 × 販売実績 を照合し input/ へ出力（中身は 照合.bat と同じ）
       try {
         const outFiles = runShogo(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
+        invalidateCaches(); // 照合し直したので古いキャッシュ（自社品検索・照合結果）を破棄
         return sendJson(res, 200, { ok: true, files: (outFiles || []).map((f) => path.basename(f)) });
       } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
@@ -2250,6 +2481,21 @@ const server = http.createServer(async (req, res) => {
       try { return sendJson(res, 200, { ok: true, dups: crossSupplierDupCheck() }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), dups: [] }); }
     }
+    if (req.method === 'GET' && url === '/api/link-check') {
+      try {
+        const r = buildProductLinkCheck();
+        return sendJson(res, 200, {
+          ok: true, issues: r.issues.slice(0, 80), count: r.count,
+          mismatchCount: r.mismatchCount, orphanCount: r.orphanCount,
+          betterCount: r.betterCount || 0, betterCdCount: r.betterCdCount || 0, betterNameCount: r.betterNameCount || 0,
+        });
+      } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), issues: [], count: 0 }); }
+    }
+    // 照合 精度レポート（最新CSV × 人が確定した正解＝productLinks+cdReview）。読み取り専用。
+    if (req.method === 'GET' && url === '/api/match-audit') {
+      try { const { buildMatchAudit } = require('./matchaudit'); return sendJson(res, 200, Object.assign({ ok: true }, buildMatchAudit({ getSettings }))); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
     // CD一致化 候補（メーカー品番をマスタ商品名3に登録すればCD一致にできる品）
     if (req.method === 'GET' && url === '/api/cd-candidates') {
       try { const r = buildCdCandidates(); return sendJson(res, 200, { ok: true, count: r.count, dormantWithCode: r.dormantWithCode, items: r.items.slice(0, 300) }); }
@@ -2261,6 +2507,20 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, {
           'Content-Type': 'text/csv; charset=utf-8',
           'Content-Disposition': 'attachment; filename="multimatch.csv"; filename*=UTF-8\'\'' + encodeURIComponent('単価不確定の品.csv'),
+          'Content-Length': buf.length,
+        });
+        return res.end(buf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('export error: ' + String(e && e.message || e));
+      }
+    }
+    if (req.method === 'GET' && url === '/api/cd-dormant.csv') {
+      try {
+        const buf = Buffer.from(buildCdDormantCsv(), 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="cd_dormant.csv"; filename*=UTF-8\'\'' + encodeURIComponent('品番あり休眠_要マスタ登録.csv'),
           'Content-Length': buf.length,
         });
         return res.end(buf);
@@ -2482,6 +2742,12 @@ const PAGE = `<!doctype html>
   /* 商品名は内容（コード＋名称＋🏢仕入先バッジ）が長いと列を独占しがち→最大幅＋折り返しで
      横幅をキャップ。これで余り幅が商品名に集中せず全列へ分散する。 */
   #tbl td.pn, #tbl th.pn{ white-space:normal; word-break:break-word; max-width:420px; }
+  #tbl th.sortable{ cursor:pointer; user-select:none; }
+  #tbl th.sortable:hover{ background:#eef2f7; }
+  #tbl th.sortable.sel{ background:#e3edf7; color:#1f4e78; }
+  #tbl th.shogo-col, #tbl td.shogo-col{ width:44px; min-width:44px; max-width:52px; padding:4px 2px; vertical-align:middle; }
+  #shogoBtn{ font-size:11px; padding:5px 4px; line-height:1.25; white-space:normal; }
+  #shogoMsg{ display:block; margin-top:3px; font-size:10px; color:#6b7785; line-height:1.2; word-break:break-all; }
   th,td{ border-right:1px solid var(--line); border-bottom:1px solid var(--line); padding:5px 7px; white-space:nowrap; }
   th:first-child,td:first-child{ border-left:1px solid var(--line); }
   th{ background:#eef2f7; position:sticky; top:0; z-index:2; font-weight:700; color:#2a3a4a; }
@@ -2495,6 +2761,7 @@ const PAGE = `<!doctype html>
   #priceAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fdecea; border:1px solid #f5b7b1; color:#922b21; font-size:13px; }
   #rateAlert{ display:none; margin:8px 0; padding:9px 12px; border-radius:8px; background:#fff4d6; border:1px solid #f0d090; color:#7a5200; font-size:13px; }
   #dupAlert{ margin:8px 0; padding:9px 12px; border-radius:8px; background:#fdeede; border:1px solid #e6b87a; color:#8a4b12; font-size:13px; line-height:1.7; }
+  #linkAlert{ margin:8px 0; padding:9px 12px; border-radius:8px; background:#fff8e6; border:1px solid #e6c84a; color:#7a5a10; font-size:13px; line-height:1.7; }
   #cdCand{ margin:8px 0; padding:9px 12px; border-radius:8px; background:#eaf3fb; border:1px solid #9ec3e6; color:#1f4e78; font-size:13px; line-height:1.7; }
   #cdCand a.dl{ display:inline-block; margin-left:6px; padding:3px 10px; border-radius:6px; background:#1f6fb2; color:#fff; text-decoration:none; font-weight:700; font-size:12px; }
   #cdCand a.dl:hover{ background:#175a92; }
@@ -2676,10 +2943,10 @@ const PAGE = `<!doctype html>
             <option value="keep_sell">据え置き（値上げしない）</option>
           </select></div>
         <div class="fcol" id="sFactorBox" style="display:none"><label>掛率</label><input id="sFactor" type="number" step="0.01" value="1.25"></div>
-        <div class="fcol"><label>端数 単位</label>
-          <select id="sUnit"><option value="1">1円</option><option value="0.1">0.1円</option><option value="0.01">0.01円（銭）</option></select></div>
-        <div class="fcol"><label>端数 処理</label>
-          <select id="sMode"><option value="round">四捨五入</option><option value="ceil">切上げ</option><option value="floor">切捨て</option></select></div>
+        <div class="fcol"><label>端数 単位 <span style="font-size:10px;color:#9aa6b2">得意先ページの初期桁</span></label>
+          <select id="sUnit"><option value="1">整数</option><option value="0.1">0.1</option><option value="0.01">0.01</option></select></div>
+        <div class="fcol"><label>端数 処理 <span style="font-size:10px;color:#9aa6b2">切捨て/四捨五入/切上げ</span></label>
+          <select id="sMode"><option value="round">四捨五入（既定）</option><option value="ceil">切上げ</option><option value="floor">切捨て</option></select></div>
         <div class="fcol"><label>自社コスト上乗せ%</label><input id="sUplift" type="number" step="0.1" value="0"></div>
         <div class="fcol"><label>一致度しきい値%<br><span style="font-size:10px;color:#9aa6b2">未満は要確認へ</span></label><input id="sThreshold" type="number" step="1" value="80"></div>
       </div>
@@ -2738,11 +3005,8 @@ const PAGE = `<!doctype html>
 
 <div class="bar">
   <div class="field"><label>対象（照合結果CSV）</label>
-    <div style="display:flex;gap:6px;align-items:center">
-      <select id="file"></select>
-      <button id="shogoBtn" class="ghost" style="white-space:nowrap" title="maker_quotes に取り込んだメーカー見積を販売実績と照合し、新しい照合結果CSVを作ります（販売実績が旧Excelなら自動変換）">↻ 照合を実行</button>
-    </div>
-    <span id="shogoMsg" style="font-size:11px;color:#6b7785"></span></div>
+    <select id="file"></select>
+  </div>
 </div>
 
 <!-- 見積書作成への導線（メインは照合確認用 → 見積書は得意先別ページで）。独立バナーで目立たせる。 -->
@@ -2792,6 +3056,7 @@ const PAGE = `<!doctype html>
   <button id="dateFilterClear" type="button" style="margin-left:auto;background:#2f6fb0;color:#fff;border:none;border-radius:7px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer">× 解除して通常表示に戻す</button>
 </div>
 <div id="dupAlert" style="display:none"></div>
+<div id="linkAlert" style="display:none"></div>
 <div id="cdCand" style="display:none"></div>
 <div id="priceAlert"></div>
 <div id="rateAlert"></div>
@@ -2799,7 +3064,8 @@ const PAGE = `<!doctype html>
 <div class="hbar" id="hbar"><div id="hbarInner"></div></div>
 <div class="wrap" id="wrap"><table id="tbl">
   <thead><tr>
-    <th>得意先</th><th class="c">一致度<br><span class="hint">(自社↔仕入)</span></th><th class="pn">商品名</th><th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
+    <th class="c shogo-col"><button id="shogoBtn" class="ghost" title="maker_quotes に取り込んだメーカー見積を販売実績と照合し、新しい照合結果CSVを作ります（販売実績が旧Excelなら自動変換）">↻<br>照合</button><span id="shogoMsg"></span></th>
+    <th>得意先</th><th class="c sortable" id="sortMatchTh" title="クリックで並び替え：得意先順 → 一致度高い順 → 低い順">一致度<br><span class="hint">(自社↔仕入・並替可)</span></th><th class="pn">商品名</th><th class="c">紐付け<br><span class="hint">(手動確定)</span></th>
     <th class="r">現仕入</th><th class="c">改定後 仕入単価</th><th class="r">仕入値上額<br><span class="hint">(改定%)</span></th>
     <th class="c">年間数量</th><th class="r">仕入 年影響</th>
   </tr></thead>
@@ -2812,6 +3078,7 @@ const PAGE = `<!doctype html>
 </div>
 
 <script>
+const SIM_PAGE_REV='${SIM_PAGE_REV}';
 const $ = (s) => document.querySelector(s);
 const RULE_LABEL = { add_increase:'上乗せ', keep_margin_rate:'粗利維持', markup:'掛率', sell_cost_rate:'売価×仕入率', keep_sell:'据置' };
 let baseRows = [];      // 画面の行構造（ファイル読込時に確定）
@@ -2823,9 +3090,17 @@ let currentSupplier = ''; // 現在表示中の照合結果CSVの仕入先名（
 let currentLinks = {};    // 現在の仕入先の productLinks（{自社CD: メーカー商品名}）
 let allMakerNames = [];   // 編集モーダルのドロップダウン候補
 let currentSuppliers = {}; // 仕入先マスタ {コード: {name, ...}} ：発注先名の解決に使用
+let linkUpgradeMap = {};   // 手動紐付けより確実な候補 { 仕入先\\x01自社CD: issue }
+let linkSuspectMap = {};   // 手動紐付けの勘違いの疑い { 仕入先\\x01自社CD: issue }
+let mainSortMode = '';     // 一致品の並び：''=得意先順 / 'matchDesc'=一致度高い順 / 'matchAsc'=低い順
 
 const yen = (v) => Number.isFinite(v) ? '¥' + Math.round(v).toLocaleString('ja-JP') : '—';
-const num = (v,d=2) => Number.isFinite(v) ? v.toLocaleString('ja-JP',{minimumFractionDigits:d,maximumFractionDigits:d}) : '—';
+const num = (v,d=2) => {
+  const n = (typeof v==='number') ? v : parseFloat(String(v).replace(/,/g,''));
+  if (!Number.isFinite(n)) return '—';
+  const r = Math.round(n*100)/100;
+  return r.toLocaleString('ja-JP',{minimumFractionDigits:d,maximumFractionDigits:d});
+};
 const pct = (v) => Number.isFinite(v) ? v.toFixed(1)+'%' : '—';
 const signCls = (v) => Number.isFinite(v) ? (v>0?'pos':(v<0?'neg':'')) : '';
 
@@ -2841,6 +3116,46 @@ function settings(){
   };
 }
 function isUnmatched(r){ return !r.customerName || r.customerName==='-' || /未一致/.test(r.matchStatus||''); }
+
+// 並び替え用の一致度スコア（CD一致・手動＝100、名前一致＝%、休眠＝-1）
+function matchPctNum(r){
+  const st = r.matchStatus || '';
+  if (isUnmatched(r)) return -1;
+  if (/手動紐付け/.test(st) || /CD一致/.test(st)) return 100;
+  const m = st.match(/(\\d+)\\s*%/);
+  return m ? Number(m[1]) : 0;
+}
+function sortMatchedIndices(indices){
+  const col = new Intl.Collator('ja');
+  if (mainSortMode === 'matchDesc' || mainSortMode === 'matchAsc') {
+    const dir = mainSortMode === 'matchDesc' ? -1 : 1;
+    indices.sort((a,b)=>{
+      const pa = matchPctNum(baseRows[a]), pb = matchPctNum(baseRows[b]);
+      if (pa !== pb) return (pa - pb) * dir;
+      return col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
+        || col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
+        || col.compare(baseRows[a].productName||'', baseRows[b].productName||'');
+    });
+    return;
+  }
+  indices.sort((a,b)=> col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
+    || col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
+    || col.compare(baseRows[a].productName||'', baseRows[b].productName||''));
+}
+function updateSortMatchTh(){
+  const th = $('#sortMatchTh'); if(!th) return;
+  th.classList.remove('sel');
+  let mark = '';
+  if (mainSortMode === 'matchDesc') { mark = ' ▼'; th.classList.add('sel'); }
+  else if (mainSortMode === 'matchAsc') { mark = ' ▲'; th.classList.add('sel'); }
+  const hint = mainSortMode === 'matchDesc' ? '高い順' : (mainSortMode === 'matchAsc' ? '低い順' : '並替可');
+  th.innerHTML = '一致度'+mark+'<br><span class="hint">('+hint+'・クリック)</span>';
+}
+function cycleMainSort(){
+  mainSortMode = mainSortMode === '' ? 'matchDesc' : (mainSortMode === 'matchDesc' ? 'matchAsc' : '');
+  updateSortMatchTh();
+  if (baseRows.length) renderMainRows(!!dateFilter);
+}
 
 // 一致度セル: matchStatus(「✓ CD一致」「✓ 名前一致(80%)」「📌 手動紐付け」) から % を取り出して大きく表示。
 //  得意先と商品名の間に独立カラムとして置き、自社↔仕入の照合の確かさを一目で分かるようにする。
@@ -3057,7 +3372,7 @@ async function runShogo(){
       $('#shogoMsg').style.color='#2e7d32'; $('#shogoMsg').textContent='✓ 照合完了（'+(res.files?res.files.length:0)+'件のCSVを作成）';
       await loadFiles(newest);
       loadAllImpact(); // 照合結果が増減した可能性 → 全社損益を取り直す
-      loadDupCheck(); loadCdCandidates(); // 二重登録・CD一致化候補も取り直す（マスタ登録→再照合で減る）
+      loadDupCheck(); loadLinkCheck(); loadCdCandidates(); // 二重登録・紐付け名ずれ・CD候補を取り直す
     } else {
       $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent='照合できません: '+(res.error||'');
     }
@@ -3086,6 +3401,7 @@ function buildMainRow(r, i, readOnly){
   const costCell = '<td class="r" id="nc'+i+'">'+num(r.newCost)+'</td>';
   const linkCell = '<td class="c">'+linkCellHtml(r, i)+'</td>'; // 横断（読み取り）ビューでも紐付けは可能
   tr.innerHTML =
+    '<td class="c shogo-col"></td>'+
     custCellHtml(r)+
     '<td class="c">'+matchPctCell(r)+'</td>'+
     '<td class="pn">'+prodName+'</td>'+
@@ -3100,7 +3416,7 @@ function buildMainRow(r, i, readOnly){
 // 区切り見出しの行（一致品／休眠の境目）。セルIDを持たないので updateView は素通り。
 function sectionHeaderRow(text, bg, fg){
   const tr=document.createElement('tr'); tr.className='secthead';
-  tr.innerHTML='<td colspan="9" style="background:'+bg+';color:'+fg+';font-weight:700;font-size:12px;padding:6px 10px;border-top:2px solid '+fg+'">'+text+'</td>';
+  tr.innerHTML='<td colspan="10" style="background:'+bg+';color:'+fg+';font-weight:700;font-size:12px;padding:6px 10px;border-top:2px solid '+fg+'">'+text+'</td>';
   return tr;
 }
 // baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
@@ -3117,15 +3433,13 @@ function renderMainRows(readOnly){
     (isUnmatched(r)?dormant:matched).push(i);
   });
   const col = new Intl.Collator('ja');
-  // 一致品＝得意先別（同名がまとまる）→ 仕入先 → 商品名 で安定ソート
-  matched.sort((a,b)=> col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
-    || col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
-    || col.compare(baseRows[a].productName||'', baseRows[b].productName||''));
+  sortMatchedIndices(matched);
   // 休眠＝仕入先 → メーカー商品名 で並べる（誰の未一致品か分かりやすく）
   dormant.sort((a,b)=> col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
     || col.compare(baseRows[a].makerName||'', baseRows[b].makerName||''));
   if(matched.length){
-    tb.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（得意先別に並べています）', '#eaf6ee', '#1b6b3a'));
+    const sortLbl = mainSortMode === 'matchDesc' ? '一致度 高い順' : (mainSortMode === 'matchAsc' ? '一致度 低い順' : '得意先別');
+    tb.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（'+sortLbl+'）', '#eaf6ee', '#1b6b3a'));
     matched.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
   }
   if(dormant.length){
@@ -3218,8 +3532,21 @@ function syncHScroll(){
 function linkCellHtml(r, i){
   const code = r.productCode || '';
   // 確定済み判定：現在ファイルの紐付け辞書 or 行のステータスが「📌 手動紐付け」（横断ビューは辞書が空なので後者で判定）
-  const linked = code && (currentLinks[code] === r.makerName || /📌/.test(r.matchStatus||''));
-  if (linked) return '<span style="color:#1e7e34;font-weight:600">📌 確定</span> <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
+  const linked = code && (linkEq(linkLookup(currentLinks, code), r.makerName) || /📌/.test(r.matchStatus||''));
+  if (linked) {
+    const sup = r.supplier || currentSupplier || '';
+    const up = linkUpgradeMap[sup+'\x01'+code];
+    const upTip = up
+      ? (up.kind==='better_cd'
+        ? '手動よりCD一致の候補あり：'+up.betterMaker
+        : '手動より一致度の高い候補あり（'+up.betterScore+'%）：'+up.betterMaker)
+      : '';
+    const upMark = up ? ' <span style="color:#c0392b;font-weight:700" title="'+esc(upTip)+'">⚠</span>' : '';
+    const sus = linkSuspectMap[sup+'\x01'+code];
+    const susReason = sus ? (sus.reasons||[]).map(function(x){ return x.k==='low_name'?('名前ほぼ別物('+x.v+'%)'):x.k==='size_mismatch'?'サイズ違い':x.k==='color_mismatch'?'色違い':x.k==='price_gap'?('原価約'+x.v+'倍ズレ'):x.k; }).join('・') : '';
+    const susMark = sus ? ' <span style="color:#fff;background:#c0392b;font-weight:700;border-radius:3px;padding:0 4px" title="'+esc('勘違いの疑い：自社「'+(sus.selfName||'')+'」と別物かも（'+susReason+'）。✏で見直してください')+'">🚨</span>' : '';
+    return '<span style="color:#1e7e34;font-weight:600">📌 確定</span>'+susMark+upMark+' <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
+  }
   if (!code) {
     // 休眠（メーカー品が自社品に未マッチ）でも、メーカー商品名があれば「実績のある自社品を選んで紐付け」できる
     if (r.makerName) return '<button class="linkBtn" data-i="'+i+'" style="font-size:11px;color:#b8860b" title="実績のある自社品を選んで、このメーカー品に紐付けます">✏ 実績と紐付け</button>';
@@ -3242,6 +3569,21 @@ function linkSim(a, b){
   let inter = 0; for (const t of sa) if (sb.has(t)) inter++;
   return inter / Math.max(sa.size, sb.size);
 }
+// 紐付け名の表記ゆれ比較（productLink.js と同じ NFKC＋空白除去）
+function linkNormN(s){ return String(s||'').normalize('NFKC').replace(/\\s+/g,'').toLowerCase(); }
+function linkEq(a,b){ return !!a&&!!b&&(a===b||linkNormN(a)===linkNormN(b)); }
+function linkLookup(links, code){
+  const raw=String(code||'').trim(); if(!raw) return '';
+  if(links[raw]) return links[raw];
+  if(/^\\d+$/.test(raw)){
+    const pad=raw.padStart(6,'0');
+    if(links[pad]) return links[pad];
+    const n=String(Number(pad));
+    if(links[n]) return links[n];
+  }
+  return '';
+}
+function escAttr(s){ return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
 // 「決定的」な語＝単一漢字(蓋/身/大/中/小/特/丸/角…) または 数字を含むトークン(0.4/28/11号…)、
 // あるいは部位語(本体/内嵌合蓋/巻き蓋/防曇蓋/内嵌合/嵌合蓋/内外蓋/高蓋/中皿)。
 // 取り違えが致命的になる語。両側で揃っていないと「品が違う」可能性が高い。
@@ -3288,8 +3630,8 @@ async function openLinkModal(idx){
   }
 
   const noteHtml = (mode === 'maker')
-    ? '⚠ 保存すると、その自社商品はこのメーカー品に固定されます。次回の照合(↻ボタン)から優先適用されます。先頭の「— 解除」を選ぶと自動マッチに戻ります。'
-    : '⚠ 保存すると、その自社品（販売実績）がこのメーカー品に固定されます。<b>休眠の解消は「↻ 照合を実行」で反映</b>されます（保存後にそのまま実行できます）。';
+    ? '⚠ 保存すると、その自社商品はこのメーカー品に固定されます。照合結果CSVへ反映するには、表の左「↻ 照合」を押してください。先頭の「— 解除」で自動マッチに戻せます。'
+    : '⚠ 保存すると、その自社品（販売実績）がこのメーカー品に固定されます。休眠の解消は表の左「↻ 照合」を押したあとに反映されます。';
 
   const wrap = document.createElement('div');
   wrap.innerHTML =
@@ -3325,8 +3667,15 @@ async function openLinkModal(idx){
       const ctx = await fetch('/api/link-context?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
       if (!ctx || !ctx.ok){ warn.style.display='block'; warn.textContent='⚠ 紐付け候補の取得に失敗しました'; return; }
       makerNames = ctx.makerNames || []; links = ctx.links || {};
-    } else { makerNames = allMakerNames; links = currentLinks; }
-    cur = links[r.productCode] || '';
+    } else {
+      // 単一仕入先ビューでも候補はサーバが返した拡張リスト（照合＋メーカー見積＋登録済み）
+      if (!allMakerNames.length) {
+        const ctx = await fetch('/api/link-context?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
+        if (!ctx || !ctx.ok){ warn.style.display='block'; warn.textContent='⚠ 紐付け候補の取得に失敗しました'; return; }
+        makerNames = ctx.makerNames || []; links = ctx.links || currentLinks;
+      } else { makerNames = allMakerNames; links = currentLinks; }
+    }
+    cur = linkLookup(links, r.productCode) || '';
     list = makerNames.map((n)=>({ value:n, simName:n, label:n, samePc:false }));
   } else {
     const ctx = await fetch('/api/self-products?supplier='+encodeURIComponent(supplier)).then(x=>x.json()).catch(()=>null);
@@ -3339,8 +3688,12 @@ async function openLinkModal(idx){
       return { value:p.code, simName:p.name, label:'['+p.code+'] '+p.name+pcTag+sellTag, samePc:same };
     });
   }
+  // 登録済みの紐付け名が候補リストに無いときは先頭に追加（変更・解除できるように）
+  if (mode === 'maker' && cur && !list.some((x) => linkEq(x.value, cur))) {
+    list.unshift({ value: cur, simName: cur, label: cur + ' （現在の登録・候補外）', samePc: false });
+  }
   // 類似度でスコアリング・降順（self は同じ発注先を少し優先）
-  const scored = list.map((c)=>({ ...c, score: linkSim(baseName, c.simName) + (c.samePc?0.15:0) }))
+  let scored = list.map((c)=>({ ...c, score: linkSim(baseName, c.simName) + (c.samePc?0.15:0) }))
     .sort((a,b)=> b.score - a.score);
   const byValue = {}; scored.forEach((c)=>{ byValue[c.value] = c; });
   saveBtn.disabled = false;
@@ -3355,29 +3708,62 @@ async function openLinkModal(idx){
         const mark = x.score >= 0.8 ? '✓' : (x.score >= 0.5 ? '·' : ' ');
         const selAttr = x.value === sel.value ? ' selected' : '';
         const padPct = (pct<10?'  ':(pct<100?' ':''))+pct;
-        return '<option value="'+esc(x.value)+'"'+selAttr+'>'+mark+' ['+padPct+'%] '+esc(x.label)+'</option>';
+        return '<option value="'+escAttr(x.value)+'"'+selAttr+'>'+mark+' ['+padPct+'%] '+esc(x.label)+'</option>';
       }).join('');
     const prev = sel.value;
     sel.innerHTML = head + opts;
     if (prev != null) sel.value = prev;
   }
   function updateWarning(){
+    const parts = [];
+    if (mode === 'maker' && r.productCode) {
+      const sus = linkSuspectMap[supplier+'\x01'+r.productCode];
+      if (sus) {
+        const sr = (sus.reasons||[]).map(function(x){ return x.k==='low_name'?('名前がほぼ別物('+x.v+'%)'):x.k==='size_mismatch'?'サイズ違い':x.k==='color_mismatch'?'色違い':x.k==='price_gap'?('原価が約'+x.v+'倍ズレ'):x.k; }).join('・');
+        parts.push('🚨 <b>現在の手動紐付けは勘違いの疑い</b>：自社品「'+esc(sus.selfName||'')+'」に対し 登録先「'+esc(sus.linked)+'」は<b>別商品の可能性</b>（'+esc(sr)+'）。取り違えなら正しいメーカー品を選び直すか、解除してください。');
+      }
+      const up = linkUpgradeMap[supplier+'\x01'+r.productCode];
+      if (up) {
+        if (up.kind === 'better_cd') {
+          parts.push('⚠ 手動紐付けより <b>CD一致（品番一致）</b> の方が確実です：「'+esc(up.betterMaker)+'」への切り替えを検討してください。');
+        } else {
+          parts.push('⚠ 手動紐付けより一致度の高い候補があります（'+up.betterScore+'%）：「'+esc(up.betterMaker)+'」');
+        }
+      }
+    }
     const v = sel.value;
-    if (!v){ warn.style.display='none'; return; }
-    const cand = byValue[v]; const candName = cand ? cand.simName : v;
-    const d = linkDecisiveDiff(baseName, candName);
-    if (!d.hasDiff){ warn.style.display='none'; return; }
-    const lines = [];
-    if (d.onlyMaker.length) lines.push('メーカー側にだけ含まれる語: <b>'+d.onlyMaker.map(esc).join(' / ')+'</b>');
-    if (d.onlySelf.length)  lines.push((mode==='self'?'自社品':'自社')+'側にだけ含まれる語: <b>'+d.onlySelf.map(esc).join(' / ')+'</b>');
-    warn.innerHTML = '⚠ 決定的な語（蓋・身・サイズ等）が違います。別の品の可能性があります。<br>'+lines.join('<br>');
+    if (v) {
+      const cand = byValue[v]; const candName = cand ? cand.simName : v;
+      const d = linkDecisiveDiff(baseName, candName);
+      if (d.hasDiff) {
+        const lines = [];
+        if (d.onlyMaker.length) lines.push('メーカー側にだけ含まれる語: <b>'+d.onlyMaker.map(esc).join(' / ')+'</b>');
+        if (d.onlySelf.length)  lines.push((mode==='self'?'自社品':'自社')+'側にだけ含まれる語: <b>'+d.onlySelf.map(esc).join(' / ')+'</b>');
+        parts.push('⚠ 決定的な語（蓋・身・サイズ等）が違います。別の品の可能性があります。<br>'+lines.join('<br>'));
+      }
+    }
+    if (!parts.length) { warn.style.display='none'; warn.innerHTML=''; return; }
+    warn.innerHTML = parts.join('<br>');
     warn.style.display = 'block';
   }
 
-  // 初期表示: 既存の紐付け or トップ候補を選択
-  const initVal = cur || (scored[0] && scored[0].value) || '';
+  // 初期表示: 登録済み紐付けを表記ゆれ込みで選択（無ければ行のメーカー名→トップ候補）
+  let initVal = '';
+  if (cur) {
+    const hit = scored.find((x) => linkEq(x.value, cur));
+    initVal = hit ? hit.value : cur;
+  } else if (mode === 'maker' && r.makerName) {
+    const hit = scored.find((x) => linkEq(x.value, r.makerName));
+    if (hit) initVal = hit.value;
+  }
+  if (!initVal) initVal = (scored[0] && scored[0].value) || '';
   renderOptions('');
   sel.value = initVal;
+  if (sel.value !== initVal && initVal) {
+    // value が完全一致しなければ option を1件足して選択可能に
+    const o = document.createElement('option'); o.value = initVal; o.textContent = initVal; o.selected = true;
+    sel.appendChild(o);
+  }
   updateWarning();
 
   search.addEventListener('input', () => { renderOptions(search.value); updateWarning(); });
@@ -3395,12 +3781,19 @@ async function openLinkModal(idx){
       const res = await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
         body: JSON.stringify(savePayload(v))}).then(x=>x.json());
       if (!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
+      if (res.linkWarn){ alert('⚠ '+res.linkWarn); }
       close();
-      if (mode === 'self'){
-        // 休眠の解消は再照合が必要（紐付けた自社品は今のCSVに居ないため、その場再描画では出ない）
-        $('#msg').textContent='📌 紐付けを保存しました（'+v+' ⇔ '+(r.makerName||'')+'）。「↻ 照合を実行」で休眠が解消されます。';
-        if (confirm('📌 紐付けを保存しました。\\n今すぐ照合して反映しますか？（販売実績の読み込みに数秒かかります）')) await runShogo();
-      } else if (dateFilter) { await loadByDate(dateFilter); } else if (allView) { await loadAll(); } else { await loadFile(); } // 横断/★全部 はその表を再描画
+      const shogoHint = ' 照合結果に反映するには、表の左「↻ 照合」を押してください。';
+      if (mode === 'self') {
+        $('#msg').textContent='📌 紐付けを保存しました（'+v+' ⇔ '+(r.makerName||'')+'）。'+shogoHint;
+      } else {
+        const lbl = v ? ('「'+v+'」に固定') : '紐付けを解除（自動マッチへ）';
+        $('#msg').textContent='📌 '+lbl+'しました。'+shogoHint;
+      }
+      if (res.productLinks && supplier) {
+        const pl = res.productLinks[supplier];
+        if (pl && typeof pl === 'object') currentLinks = pl;
+      }
     } catch (e) { alert('保存に失敗: '+e); }
   });
 }
@@ -3986,6 +4379,56 @@ async function loadDupCheck(){
       +'修正見積を違う仕入先名で取り込むと起きます（損益・見積・取込CSVが二重に）。正しい仕入先名で取り込み直すか、片方を整理してください。<br>'+sample+(dups.length>6?'<br>　…ほか':'');
   }catch(e){ box.style.display='none'; }
 }
+// 手動紐付けの健全性：表記ずれ・手動より確実な自動候補（CD一致/高い名前一致%）。
+async function loadLinkCheck(){
+  const box=$('#linkAlert'); if(!box) return;
+  try{
+    const r=await fetch('/api/link-check').then(x=>x.json());
+    const issues=(r&&r.issues)||[];
+    linkUpgradeMap = {};
+    issues.filter(i=>i.kind==='better_cd'||i.kind==='better_name').forEach(i=>{
+      linkUpgradeMap[i.supplier+'\x01'+i.code] = i;
+    });
+    linkSuspectMap = {};
+    issues.filter(i=>i.kind==='suspect').forEach(i=>{ linkSuspectMap[i.supplier+'\x01'+i.code] = i; });
+    const mism=issues.filter(i=>i.kind==='name_mismatch');
+    const better=issues.filter(i=>i.kind==='better_cd'||i.kind==='better_name');
+    const suspect=issues.filter(i=>i.kind==='suspect');
+    if(!mism.length && !better.length && !suspect.length){ box.style.display='none'; box.innerHTML=''; return; }
+    let html='';
+    if(suspect.length){
+      const reasonLabel=function(rs){
+        return (rs||[]).map(function(x){
+          if(x.k==='low_name') return '名前がほぼ別物('+x.v+'%)';
+          if(x.k==='size_mismatch') return 'サイズ違い';
+          if(x.k==='color_mismatch') return '色違い';
+          if(x.k==='price_gap') return '原価が約'+x.v+'倍ズレ('+x.self+'→'+x.maker+')';
+          return x.k;
+        }).join('・');
+      };
+      const ss=suspect.slice(0,6).map(i=>'　・'+esc(i.supplier)+' '+esc(i.code)+'：自社「'+esc(i.selfName||'')+'」に 手動「'+esc(i.linked)+'」＝<b>'+esc(reasonLabel(i.reasons))+'</b>').join('<br>');
+      html+='🚨 <b>手動紐付けの勘違いの疑い '+suspect.length+'件</b>：紐付け先のメーカー品が<b>自社商品とそもそも別物</b>の可能性があります（別商品に📌した取り違え）。'
+        +'「✏ 紐付け」で正しいメーカー品に直す（取り違えなら一旦解除）と安全です。<br>'+ss+(suspect.length>6?'<br>　…ほか '+(suspect.length-6)+' 件':'')+'<br>';
+    }
+    if(better.length){
+      const bs=better.slice(0,5).map(i=>{
+        const lbl = i.kind==='better_cd' ? 'CD一致候補' : ('名前一致 '+i.betterScore+'%');
+        return '　・'+esc(i.supplier)+' '+esc(i.code)+'：手動「'+esc(i.linked)+'」→ より確実「'+esc(i.betterMaker)+'」（'+lbl+'）';
+      }).join('<br>');
+      html+='🔔 <b>手動紐付けより確実な候補 '+better.length+'件</b>：自動照合では別のメーカー品の方が信頼度が高いです。'
+        +'「✏ 紐付け」で切り替えるか、商品マスタ(商品名3)に品番を登録してCD一致にしてください。<br>'+bs+(better.length>5?'<br>　…ほか '+(better.length-5)+' 件':'')+'<br>';
+    }
+    if(mism.length){
+      const ms=mism.slice(0,5).map(i=>'　・'+esc(i.supplier)+' '+esc(i.code)+'：登録「'+esc(i.linked)+'」→ 照合は「'+esc(i.hint||i.makers[0]||'?')+'」').join('<br>');
+      html+='🔗 <b>手動紐付けの表記ずれ '+mism.length+'件</b>：登録名とメーカー品名が一致していません。'
+        +'「✏ 紐付け」で<b>候補リストから選び直す</b>と安全です。<br>'+ms+(mism.length>5?'<br>　…ほか '+(mism.length-5)+' 件':'');
+    }
+    box.style.display='block';
+    box.innerHTML=html;
+    // 表の 📌 セルに ⚠ を付け直す（すでに描画済みのとき）
+    if(baseRows.length && !dateFilter) renderMainRows(!!dateFilter);
+  }catch(e){ box.style.display='none'; linkUpgradeMap={}; linkSuspectMap={}; }
+}
 // CD一致化 候補：メーカー品番をマスタ(商品名3)に登録すればCD一致にできる品の案内＋CSVダウンロード。
 async function loadCdCandidates(){
   const box=$('#cdCand'); if(!box) return;
@@ -3994,14 +4437,16 @@ async function loadCdCandidates(){
     if(!r||!r.ok||!r.count){ box.style.display='none'; box.innerHTML=''; return; }
     box.style.display='block';
     box.innerHTML='🏷 <b>メーカー品番を商品マスタ(商品名3)に登録すると「CD一致(高精度)」にできる品 '+r.count+'件</b>'
-      +(r.dormantWithCode?'（ほか 品番ありの休眠 '+r.dormantWithCode+'件＝自社品の確認が必要）':'')
+      +(r.dormantWithCode?'（ほか 品番ありの休眠 '+r.dormantWithCode+'件＝自社品の確認が必要 <a class="dl" href="/api/cd-dormant.csv" download>📥 休眠リストCSV</a>）':'')
       +' <a class="dl" href="/cdlink">🏷 コード化ページで1件ずつ確定 →</a>'
       +' <a class="dl" href="/api/cd-candidates.csv" download>📥 候補CSV</a>'
       +'<div style="font-size:11px;margin-top:3px;color:#3a567a">「コード化ページ」で1件ずつ確認→確定（確定はすぐ手動紐付けで効きます）→ たまったら商品名3登録用CSVで販売大臣に登録 → 「↻ 照合を実行」でCD一致に昇格。</div>';
   }catch(e){ box.style.display='none'; }
 }
 (async ()=>{
-  await initSettings(); fetchPL(); loadAllImpact(); loadDupCheck(); loadCdCandidates();
+  await initSettings(); fetchPL(); loadAllImpact(); loadDupCheck(); loadLinkCheck(); loadCdCandidates();
+  const smTh = $('#sortMatchTh');
+  if (smTh) { updateSortMatchTh(); smTh.addEventListener('click', cycleMainSort); }
   const params=new URLSearchParams(location.search);
   const fSup=params.get('focusSupplier');
   if(fSup){

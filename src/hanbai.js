@@ -68,6 +68,19 @@ function cleanCustomerName(body) {
 function looksLikeDate(s) {
   return /\d{1,4}\s*[\/年\-]\s*\d{1,2}/.test(String(s || ''));
 }
+// Excelシリアル日付（.XLS→CSV変換で購買暦が数値になることがある。例 46388）。
+//  20000〜80000 を妥当な日付シリアルとみなす（≒1954〜2119年）。
+function isSerialDate(s) {
+  const t = String(s == null ? '' : s).trim();
+  if (!/^\d{4,6}(\.\d+)?$/.test(t)) return false;
+  const n = Number(t);
+  return n >= 20000 && n <= 80000;
+}
+function serialToIso(n) {
+  const d = new Date((Number(n) - 25569) * 86400000); // 1900日付系（UTCで一貫＝丸日のずれ無し）
+  const p = (x) => String(x).padStart(2, '0');
+  return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate());
+}
 
 // 商品名末尾の「仕入先コード(1〜2桁)」を取り出す。
 //  販売大臣の自社販売実績では「(朝日ﾋﾟｯｷﾝｸﾞ) 92988 ※50 13」のように
@@ -77,7 +90,11 @@ function trailingPurchaseCode(name) {
   const s = String(name || '').trim();
   // 末尾の括弧注記を除去（"13（S-2)" → "13"）
   const cleaned = s.replace(/\s*[（(][^）)]*[）)]\s*$/, '');
-  const m = cleaned.match(/(?:^|[\s\D])(\d{1,2})\s*$/);
+  // 発注先コードは「… ※50 13」のように“独立トークン”で末尾に付く＝直前は空白(または先頭)。
+  //  以前は直前が \D（記号）でも拾い、サイズ末尾「A-6」「M-3」を 0006/0003 と誤検出していた。
+  //  → 空白区切り限定にして誤検出を抑止（ハイフン直結のサイズは発注先コードとみなさない）。
+  //  ⚠ 照合の発注先フィルタに効くため、会社PCでの再照合（dup-check=0/日野1085）で確認すること。
+  const m = cleaned.match(/(?:^|\s)(\d{1,2})\s*$/);
   return m ? m[1].padStart(4, '0') : '';
 }
 
@@ -96,7 +113,8 @@ function parseHanbai(text) {
 
     const dateRaw = dateIdx !== -1 ? String(row[dateIdx] == null ? '' : row[dateIdx]).trim() : '';
     const indented = /^\s/.test(c0); // 商品行は先頭にスペース字下げ
-    const isProduct = (dateRaw !== '' && looksLikeDate(dateRaw)) || (indented && /^\s*\d{3,}\s/.test(c0));
+    // 商品行＝購買暦に「日付らしき値」または「Excelシリアル日付」が入る／もしくは字下げ＋自社CD。
+    const isProduct = (dateRaw !== '' && (looksLikeDate(dateRaw) || isSerialDate(dateRaw))) || (indented && /^\s*\d{3,}\s/.test(c0));
 
     const { code, body } = splitCodeBody(c0);
     if (!isProduct) {
@@ -116,7 +134,7 @@ function parseHanbai(text) {
       currentSell,
       annualAmount,
       origCost,
-      lastDate: dateRaw,
+      lastDate: isSerialDate(dateRaw) ? serialToIso(dateRaw) : dateRaw, // シリアルはISOへ（過去N年フィルタが正しく効く）
       norm: normName(body),         // 全名(埋込メーカー品番を含む)・名前照合の補助
       codeNorm: normForCode(body),  // CD照合用：区切りを残した正規化（コードが数量と連結しない）
       coreNorm: normName(coreName(body)), // 名前照合用：ノイズ除去済みコア名

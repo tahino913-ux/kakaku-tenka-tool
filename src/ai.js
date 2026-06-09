@@ -23,11 +23,11 @@ const API_VERSION = '2023-06-01';
 const MAX_TOKENS = 16000;          // 非ストリーミングの安全圏（これ以上はSDK/HTTPタイムアウト懸念）
 const TIMEOUT_MS = 120000;
 
-// 実効AI設定を返す。apiKey は settings.json 優先、無ければ環境変数 ANTHROPIC_API_KEY。
+// 実効AI設定を返す。apiKey は環境変数 ANTHROPIC_API_KEY のみ（settings.json には保存しない）。
 function getAiConfig() {
   let ai = {};
   try { ai = (getSettings() || {}).ai || {}; } catch (_) { ai = {}; }
-  const apiKey = String(ai.apiKey || process.env.ANTHROPIC_API_KEY || '').trim();
+  const apiKey = String(process.env.ANTHROPIC_API_KEY || '').trim();
   return {
     enabled: !!ai.enabled && !!apiKey,
     rawEnabled: !!ai.enabled,
@@ -172,7 +172,7 @@ async function extractMakerQuote(opts) {
   opts = opts || {};
   const cfg = getAiConfig();
   if (!cfg.rawEnabled) return { ok: false, error: 'AI取り込みは設定で無効です（settings.json の ai.enabled）。' };
-  if (!cfg.apiKey) return { ok: false, error: 'APIキーが未設定です（settings.json の ai.apiKey か 環境変数 ANTHROPIC_API_KEY）。' };
+  if (!cfg.apiKey) return { ok: false, error: 'APIキーが未設定です（環境変数 ANTHROPIC_API_KEY を設定してください）。' };
 
   const text = (opts.text != null) ? String(opts.text) : '';
   const pdfB64 = opts.pdfB64 ? String(opts.pdfB64) : '';

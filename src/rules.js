@@ -4,10 +4,26 @@ const { normName } = require('./textnorm');
 // 文字列を数値へ。"1,234" / "390.0" / "nan" / "" を安全に処理。
 function toNum(v) {
   if (v === null || v === undefined) return NaN;
-  const s = String(v).replace(/,/g, '').trim();
+  // 全角数字・全角カンマ等を半角化(NFKC)してから、桁区切り・通貨記号・空白を除去。
+  //  例: "１２３４"→1234 / "1，234"→1234 / "¥1,234"→1234 / "390 円"→390
+  //  ※CSV取込（販売実績・メーカー見積・照合結果）はこの関数を通るので、全角入力の取りこぼし(NaN)を防ぐ。
+  const s = String(v).normalize('NFKC').replace(/[,\s¥￥円]/g, '').trim();
   if (s === '' || s.toLowerCase() === 'nan') return NaN;
   const n = Number(s);
   return Number.isFinite(n) ? n : NaN;
+}
+
+// 容器仕入単価の銭丸め（小数2桁）。Excel/計算値の 2.549999999 等を 2.55 に揃える。
+function sen(v) {
+  const n = (typeof v === 'number') ? v : toNum(v);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : n;
+}
+
+// 銭丸めを「表示・CSV用文字列」に（2.55 が 2.549999999… と出る浮動小数表示を防ぐ）。
+function senStr(v) {
+  const n = sen(v);
+  if (!Number.isFinite(n)) return String(v == null ? '' : v);
+  return n.toFixed(2).replace(/\.?0+$/, '');
 }
 
 // 端数処理
@@ -86,9 +102,13 @@ function calcRow(rec, config) {
 
   // 年間数量: 実績(年間数量列)があればそれを使い、無ければ「年間金額 ÷ 現販売単価」で推定
   const hasActualQty = fin(rec.annualQty) && rec.annualQty > 0;
-  const qty = hasActualQty
+  let qty = hasActualQty
     ? rec.annualQty
     : ((fin(rec.annualAmount) && currentSell > 0) ? rec.annualAmount / currentSell : NaN);
+  // 推定値の暴発ガード：現売単価が極小（スケーリング誤り等）だと数量が天文学的になり損益を壊す。
+  //  実在しえない桁（10億/年 超）は「推定不能」に倒す＝現実的なデータは一切影響を受けない。
+  const QTY_SANITY_MAX = 1e9;
+  if (!hasActualQty && fin(qty) && qty > QTY_SANITY_MAX) qty = NaN;
   const qtySource = hasActualQty ? 'actual' : (fin(qty) ? 'estimated' : 'none');
 
   // 年間影響額: 仕入増 = 仕入値上額×数量 / 増収 = 値上げ額×数量
@@ -110,4 +130,4 @@ function calcRow(rec, config) {
   };
 }
 
-module.exports = { calcRow, applyRounding, toNum, pickRule };
+module.exports = { calcRow, applyRounding, toNum, sen, senStr, pickRule };

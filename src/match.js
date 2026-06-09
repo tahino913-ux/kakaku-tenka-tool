@@ -6,6 +6,8 @@
 //  出力は既存の照合結果CSVと同じ列なので、既存パイプラインへ直結できる。
 // =====================================================================
 const { nfkc, normName } = require('./textnorm');
+const { sen } = require('./rules');
+const { isLinkActiveForItem, shouldBlockLinkOther, lookupProductLink } = require('./productLink');
 
 // 名前のトークン分割（全角/半角スペース区切り・1文字ノイズは除外）
 //  英字のみの注記カッコ (D)(KS)(R) 等は照合の邪魔なので除去する。
@@ -365,10 +367,10 @@ function matchOne(item, hanbai, opts = {}) {
     // 自社製造分類の自社CDは他の仕入先には出さない（名前一致・CD一致・手動紐付けすべてに優先して除外）
     if (excludeSelf && excludeSelf.size && excludeSelf.has(padSelfCode(r.productCode))) continue;
     // 手動紐付けチェック: その自社CDが他メーカー品に予約されているならスキップ（取り合い防止）
-    const linkedMakerName = supLinks[r.productCode];
-    const linkSelf = linkedMakerName && linkedMakerName === item.makerName;
-    const linkOther = linkedMakerName && linkedMakerName !== item.makerName;
-    if (linkOther) continue;
+    const linkedMakerName = lookupProductLink(supLinks, r.productCode);
+    const makerNamesInQuote = opts.makerNamesInQuote;
+    const linkSelf = isLinkActiveForItem(r.productCode, item.makerName, linkedMakerName, makerNamesInQuote);
+    if (shouldBlockLinkOther(linkedMakerName, item.makerName, makerNamesInQuote)) continue;
     // 仕入先コードフィルタ（productLinks の行は bypass する）
     // CD一致（メーカー品番＝商品マスタ商品名3／伝票埋込品番 が一致）は最も確実な手がかりなので、
     //  発注先フィルタより優先する。ここで先に判定し、CD一致の行はフィルタを通す（＝手動紐付けと同格）。
@@ -446,10 +448,11 @@ function matchAll(items, hanbai, opts = {}) {
   //  取り込んだ「現単価」は販売単価の意味（＝下流では販売実績の現売単価をそのまま使う）であり、
   //  仕入原価ではないため、現行仕入単価・新仕入単価をどちらも 0 にする（値上げは得意先別で手入力）。
   const selfMode = opts.selfMatch === true || String(opts.purchaseCode || '').trim() === '9000';
+  const matchOpts = Object.assign({}, opts, { makerNamesInQuote: new Set(items.map((it) => it.makerName)) });
   for (const item of items) {
-    const hits = matchOne(item, hanbai, opts);
-    const cCost = selfMode ? 0 : item.currentCost;
-    const nCost = selfMode ? 0 : item.newCost;
+    const hits = matchOne(item, hanbai, matchOpts);
+    const cCost = selfMode ? 0 : sen(item.currentCost);
+    const nCost = selfMode ? 0 : sen(item.newCost);
     const costInc = (Number.isFinite(nCost) && Number.isFinite(cCost))
       ? nCost - cCost : NaN;
     const costRate = (Number.isFinite(costInc) && cCost > 0)
@@ -509,4 +512,4 @@ function toCsv(rows) {
   return '﻿' + lines.join('\r\n');
 }
 
-module.exports = { matchAll, matchOne, nameScore, nameScoreInfo, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER, padSelfCode, latinSizeMarkers, sizeMismatch };
+module.exports = { matchAll, matchOne, nameScore, nameScoreInfo, codeCandidates, codeHit, tokenize, toCsv, RESULT_HEADER, padSelfCode, latinSizeMarkers, sizeMismatch, colorMismatch };

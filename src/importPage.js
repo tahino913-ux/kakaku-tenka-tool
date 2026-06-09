@@ -340,11 +340,57 @@ function applyProfile(){
     const s=$('#grid').querySelector('thead select[data-c="'+c+'"]');
     if(s) s.value=field;
   });
+  applyPriceFormatToGrid(); // 登録済み列対応を当てたあと、現・新単価を銭表示に揃える
 }
 function norm(s){return String(s||'').normalize('NFKC').toLowerCase()}
+// 仕入単価の銭丸め（小数2桁）。Excel/計算値の 2.549999999 等を 2.55 に揃える。
+// toFixed(2) で文字列化＝丸め後の 2.55 が 2.549999999… と表示されるのを防ぐ。
+function senPrice(v){
+  const s=String(v==null?'':v).replace(/,/g,'').trim();
+  if(s==='') return '';
+  const n=parseFloat(s);
+  if(!Number.isFinite(n)) return String(v);
+  return (Math.round(n*100)/100).toFixed(2).replace(/\\.?0+$/,'');
+}
+// 小数第3位以降の単価（2.54999 等）＝Excelの誤差。列対応がずれていても拾う。
+function isMessyPrice(v){
+  const s=String(v==null?'':v).replace(/,/g,'').trim();
+  return /^-?\\d+\\.\\d{3,}$/.test(s) && Number.isFinite(parseFloat(s));
+}
+function formatPriceCell(v){
+  if(isMessyPrice(v)) return senPrice(v);
+  const s=String(v==null?'':v).replace(/,/g,'').trim();
+  if(s===''||!/^-?\\d/.test(s)||!/\\./.test(s)) return v;
+  const n=parseFloat(s);
+  return Number.isFinite(n) ? senPrice(v) : v;
+}
+// 見出し行から「現単価／新単価」列を推定して、データ行の単価セルを銭丸めする。
+function roundPriceColsInRows(rows, headerRowIdx){
+  if(!rows.length || headerRowIdx<0 || headerRowIdx>=rows.length) return;
+  const head=rows[headerRowIdx]||[];
+  const priceCols=[];
+  head.forEach((h,i)=>{ const g=guess(h); if(g==='currentCost'||g==='newCost') priceCols.push(i); });
+  if(!priceCols.length) return;
+  for(let r=headerRowIdx+1;r<rows.length;r++){
+    for(const c of priceCols){
+      if(rows[r][c]!=null && rows[r][c]!=='') rows[r][c]=senPrice(rows[r][c]);
+    }
+  }
+}
+// ③の表で、列対応が「現単価／新単価」の列の入力値を銭丸め表示に揃える。
+function applyPriceFormatToGrid(){
+  const gridEl=$('#grid'); if(!gridEl) return;
+  gridEl.querySelectorAll('thead select').forEach(sel=>{
+    if(sel.value!=='currentCost' && sel.value!=='newCost') return;
+    const c=sel.dataset.c;
+    gridEl.querySelectorAll('tbody input[data-c="'+c+'"]').forEach(inp=>{
+      if(inp.value.trim()) inp.value=senPrice(inp.value);
+    });
+  });
+}
 function guess(h){
   const t=norm(h);
-  if(/(新単価|新価格|改定後|new)/.test(t)) return 'newCost';
+  if(/(新単価|新価格|改定後|改定単価|改訂単価|new)/.test(t)) return 'newCost';
   if(/(現単価|現行|旧単価|現価)/.test(t)) return 'currentCost';
   if(/(自社コード|自社cd|自社商品|当社コード|弊社コード)/.test(t)) return 'selfCode'; // ※「コード」より前に判定
   if(/(品番|商品cd|商品コード|メーカーcd|^cd$|コード)/.test(t)) return 'makerCode';
@@ -470,21 +516,35 @@ function applySkipAndRender(){
   const skip=Math.max(0,Math.min(originalRows.length-1,parseInt($('#skipN').value,10)||0));
   const sliced=originalRows.slice(skip).map(r=>r.slice());
   const skippedRaw=originalRows.slice(0,skip).map(r=>r.slice()); // 表示用（捨てる行）
-  // B: 切替日列を日付に統一
+  // B: 切替日列を日付に統一／現・新単価を銭丸め（見出しの列推定＋検出列の両方）
   const idx=jsDetectColumns(sliced);
-  if(idx && idx.date!=null){
+  const headerRow=idx ? (idx.headerRow||0) : ($('#hasHeader').checked ? 0 : -1);
+  if(idx){
     const ref=new Date();
     for(let r=(idx.headerRow||0)+1;r<sliced.length;r++){
-      const v=sliced[r][idx.date];
-      if(v!=null && v!=='') sliced[r][idx.date]=jpDateToISO(v,ref);
+      if(idx.date!=null){
+        const v=sliced[r][idx.date];
+        if(v!=null && v!=='') sliced[r][idx.date]=jpDateToISO(v,ref);
+      }
+      if(idx.cur!=null && sliced[r][idx.cur]!='') sliced[r][idx.cur]=senPrice(sliced[r][idx.cur]);
+      if(idx.nw!=null && sliced[r][idx.nw]!='') sliced[r][idx.nw]=senPrice(sliced[r][idx.nw]);
+    }
+  }
+  if(headerRow>=0) roundPriceColsInRows(sliced, headerRow);
+  const dataStart=headerRow>=0?headerRow+1:0;
+  for(let r=dataStart;r<sliced.length;r++){
+    for(let c=0;c<(sliced[r]||[]).length;c++){
+      if(isMessyPrice(sliced[r][c])) sliced[r][c]=senPrice(sliced[r][c]);
     }
   }
   // 列数は「本表＋捨てる行」両方を含めた最大幅で揃える
   const cols=Math.max.apply(null,sliced.concat(skippedRaw).map(r=>r.length||0));
   grid=sliced.map(r=>{ const a=r.slice(); while(a.length<cols) a.push(''); return a.map(c=>String(c==null?'':c)); });
   const skippedPadded=skippedRaw.map(r=>{ const a=r.slice(); while(a.length<cols) a.push(''); return a; });
-  render(cols, skippedPadded); if(!suppressProfile) applyProfile();
-  checkFarFutureDates(); // applyProfile で列対応が変わった後も実施日アラートを最新化
+  render(cols, skippedPadded);
+  if(!suppressProfile) applyProfile();
+  else applyPriceFormatToGrid();
+  checkFarFutureDates();
 }
 // 適切なCSVパーサ（クォート対応）。ファイル選択でのCSV読み込みに使用。
 function csvParseRows(text){
@@ -597,12 +657,18 @@ function render(cols, skippedRows){
   html+='</tr></thead><tbody>';
   dataRows.forEach((r,ri)=>{
     html+='<tr>';
-    for(let c=0;c<cols;c++) html+='<td><input data-r="'+ri+'" data-c="'+c+'" value="'+esc(r[c]||'')+'"></td>';
+    for(let c=0;c<cols;c++){
+      const fld=hasH?guess(headerRow[c]):'';
+      const raw=r[c]||'';
+      const disp=(fld==='currentCost'||fld==='newCost')?senPrice(raw):formatPriceCell(raw);
+      html+='<td><input data-r="'+ri+'" data-c="'+c+'" value="'+esc(disp)+'"></td>';
+    }
     html+='</tr>';
   });
   html+='</tbody>';
   $('#grid').innerHTML=html;
   $('#mapArea').style.display='block';
+  applyPriceFormatToGrid(); // 列対応プルダウンに合わせて現・新単価を銭表示に
   applyForcedDateToGrid(); // 一括 実施日が設定済みなら、再描画後も切替日列へ反映し続ける
   checkFarFutureDates();   // 実施日が3か月以上先の行があれば警告（年の打ち間違い検知）
 }
@@ -620,6 +686,8 @@ function collect(){
     if(forcedSwitchDate && forcedSwitchDate.date && (forcedSwitchDate.scope==='all' || !String(it.switchDate||'').trim())){
       it.switchDate=forcedSwitchDate.date;
     }
+    if(String(it.currentCost||'').trim()!=='') it.currentCost=senPrice(it.currentCost);
+    if(String(it.newCost||'').trim()!=='') it.newCost=senPrice(it.newCost);
     if(it.makerName||it.makerCode||it.newCost) items.push(it);
   });
   return {map,items};
@@ -722,8 +790,15 @@ $('#bulkDateBtn').addEventListener('click',()=>{
 });
 // 列の再マップ（thead select）やセルの直接編集（tbody input）で実施日アラートを再判定。
 $('#grid').addEventListener('change',e=>{
-  if(e.target && (e.target.tagName==='SELECT' || e.target.tagName==='INPUT')) checkFarFutureDates();
+  if(!e.target) return;
+  if(e.target.tagName==='SELECT'){ applyPriceFormatToGrid(); checkFarFutureDates(); }
+  else if(e.target.tagName==='INPUT') checkFarFutureDates();
 });
+$('#grid').addEventListener('blur',e=>{
+  const inp=e.target; if(!inp||!inp.dataset||inp.dataset.c==null) return;
+  const sel=$('#grid').querySelector('thead select[data-c="'+inp.dataset.c+'"]');
+  if(sel&&(sel.value==='currentCost'||sel.value==='newCost')&&inp.value.trim()) inp.value=senPrice(inp.value);
+},true);
 $('#fileBtn').addEventListener('click',()=>{ if($('#fileBtn').disabled) return; $('#file').click(); });
 $('#file').addEventListener('change',onFilePicked);
 
@@ -790,6 +865,7 @@ updateStep2Lock(); // 初期状態（仕入先未選択）でロック
 $('#saveBtn').addEventListener('click',async()=>{
   const supplier=$('#supplier').value.trim();
   if(!supplier){ $('#msg').style.color='#c0392b'; $('#msg').textContent='① 仕入先名を入れてください'; return; }
+  applyPriceFormatToGrid(); // 保存直前に現・新単価を銭丸め（登録済み列対応を反映）
   const {map,items}=collect();
   if(map.newCost==null||(map.makerName==null&&map.makerCode==null)){ $('#msg').style.color='#c0392b'; $('#msg').textContent='「新単価」と「メーカー商品名(または品番)」の列を指定してください'; return; }
   if(!items.length){ $('#msg').style.color='#c0392b'; $('#msg').textContent='データ行がありません'; return; }
