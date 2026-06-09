@@ -190,7 +190,63 @@ function listCsv() {
 // 照合結果CSVは実行のたびに日時つきで増える。ドロップダウンには「仕入先ごとの最新1本」だけ出す。
 //  命名規則 <仕入先>_照合結果_<YYYYMMDD>_<時刻>.csv に一致するものを仕入先で集約し、日時最大を採用。
 //  規則に合わない手動配置CSV等はそのまま全て残す（利用者のファイルを隠さない）。
+let _latestCsvCache = null; // { fp, files }
+let _mergedMakerCache = null; // { fp, channelKey, map }
+let _makerListCache = null; // { fp, items }
+
+function dirCsvFingerprint(dir, pred) {
+  if (!fs.existsSync(dir)) return '0';
+  try {
+    const names = fs.readdirSync(dir).filter(pred);
+    let max = 0;
+    for (const f of names) {
+      try { const m = fs.statSync(path.join(dir, f)).mtimeMs; if (m > max) max = m; } catch (_) {}
+    }
+    return names.length + ':' + max;
+  } catch (_) { return '0'; }
+}
+function inputDirFingerprint() {
+  return dirCsvFingerprint(INPUT_DIR, (f) => f.toLowerCase().endsWith('.csv'));
+}
+function makerQuotesFingerprint() {
+  return dirCsvFingerprint(MAKER_DIR, (f) => /\.csv$/i.test(f) && !f.startsWith('_'));
+}
+function makerListFingerprint() {
+  const outFp = fs.existsSync(OUTPUT_DIR)
+    ? dirCsvFingerprint(OUTPUT_DIR, (f) => /_見積書_/.test(f) || f.startsWith('得意先別_'))
+    : '0';
+  return makerQuotesFingerprint() + '|' + inputDirFingerprint() + '|' + outFp;
+}
+function getMergedMakerMap() {
+  const channelMap = getSettings().makerChannel || {};
+  const channelKey = JSON.stringify(channelMap);
+  const fp = makerQuotesFingerprint();
+  if (_mergedMakerCache && _mergedMakerCache.fp === fp && _mergedMakerCache.channelKey === channelKey) {
+    return _mergedMakerCache.map;
+  }
+  let map = new Map();
+  if (fs.existsSync(MAKER_DIR)) {
+    const files = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f) && !f.startsWith('_'));
+    map = mergeMakerFiles(files.map((f) => path.join(MAKER_DIR, f)), channelMap);
+  }
+  _mergedMakerCache = { fp, channelKey, map };
+  return map;
+}
+function flattenedMergedMakerItems() {
+  const merged = getMergedMakerMap();
+  const out = [];
+  if (merged instanceof Map) { for (const arr of merged.values()) out.push(...arr); }
+  else if (Array.isArray(merged)) out.push(...merged);
+  return out;
+}
+function invalidateMakerCaches() {
+  _mergedMakerCache = null;
+  _makerListCache = null;
+}
+
 function listLatestCsv() {
+  const fp = inputDirFingerprint();
+  if (_latestCsvCache && _latestCsvCache.fp === fp) return _latestCsvCache.files.slice();
   const latest = new Map(); // 仕入先 -> { file, stamp }
   const others = [];
   for (const f of listCsv()) {
@@ -204,7 +260,9 @@ function listLatestCsv() {
     if (!cur || cur.stamp < stamp || (cur.stamp === stamp && cur.mtime < mtime)) latest.set(supplier, { file: f, stamp, mtime });
   }
   const picked = [...latest.values()].map((x) => x.file).sort((a, b) => a.localeCompare(b, 'ja'));
-  return picked.concat(others.sort());
+  const files = picked.concat(others.sort());
+  _latestCsvCache = { fp, files };
+  return files.slice();
 }
 function getRecs(file) {
   const full = path.join(INPUT_DIR, path.basename(file));
@@ -582,7 +640,7 @@ function crossSupplierDupCheck() {
   const byCode = new Map(); // 自社CD -> { name, prices:{仕入先:新仕入} }
   for (const f of files) {
     const sup = String(f).split('_照合結果_')[0];
-    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    let recs; try { recs = getRecs(f); } catch (e) { continue; }
     const seen = new Set(); // 同一ファイル内の同一コードは1回（得意先が複数でも1商品）
     for (const r of recs) {
       if (!/^[✓📌]/.test(r['照合'] || '')) continue;         // 一致行のみ（✓=CD/名前一致・📌=手動紐付け）
@@ -614,7 +672,7 @@ function buildCdCandidates() {
   //  例: 3770661 は 005616(NM3=3770661)にCD一致済み。001374(実は3770660)への名前一致100%は誤り＝出さない。
   const cdMakerCodes = new Set();
   for (const f of files) {
-    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    let recs; try { recs = getRecs(f); } catch (e) { continue; }
     fileRecs.push({ sup: String(f).split('_照合結果_')[0], recs });
     for (const r of recs) { if (/CD一致/.test(r['照合'] || '')) { const mc = String(r['メーカー商品CD'] || '').trim(); if (mc) cdMakerCodes.add(mc); } }
   }
@@ -689,7 +747,7 @@ function multiMatchCheck() {
   const byCode = new Map(); // code -> { name, byMaker:Map(makerCode -> {makerCode, makerName, cost, supplier}) }
   for (const f of files) {
     const sup = String(f).split('_照合結果_')[0];
-    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    let recs; try { recs = getRecs(f); } catch (e) { continue; }
     for (const r of recs) {
       if (!/名前一致/.test(r['照合'] || '')) continue; // CD一致・手動紐付けは確定＝対象外
       const code = String(r['販売実績商品コード'] || '').trim();
@@ -736,15 +794,15 @@ function collectMakerNamesForSupplier(supplier) {
   if (!sup) return [];
   for (const f of listLatestCsv()) {
     if (String(f).split('_照合結果_')[0] !== sup) continue;
-    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    let recs; try { recs = getRecs(f); } catch (e) { continue; }
     for (const r of recs) {
       const nm = String(r['メーカー商品名'] || '').trim();
       if (nm && nm !== '【販売実績なし or 商品名不一致】') names.add(nm);
     }
   }
   try {
-    const files = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f) && !f.startsWith('_'));
-    const items = mergeMakerFiles(files.map((f) => path.join(MAKER_DIR, f)), getSettings().makerChannel || {});
+    const merged = getMergedMakerMap();
+    const items = merged.get(sup) || [];
     for (const it of items) {
       if (String(it.supplier || '').trim() !== sup) continue;
       const nm = String(it.makerName || '').trim();
@@ -773,19 +831,12 @@ function buildProductLinkCheck() {
   const matchRowsBySupplier = {};
   for (const f of listLatestCsv()) {
     const sup = String(f).split('_照合結果_')[0];
-    let recs; try { recs = loadCsv(path.join(INPUT_DIR, path.basename(f))).records; } catch (e) { continue; }
+    let recs; try { recs = getRecs(f); } catch (e) { continue; }
     matchRowsBySupplier[sup] = recs;
   }
   const base = auditProductLinks(productLinks, matchRowsBySupplier);
   let makerItems = [];
-  try {
-    const files = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f) && !f.startsWith('_'));
-    const merged = mergeMakerFiles(files.map((f) => path.join(MAKER_DIR, f)), getSettings().makerChannel || {});
-    // mergeMakerFiles は Map(仕入先→item[]) を返す。監査関数は item の配列を期待するので平坦化する
-    //  （※従来ここで Map のまま渡しており、auditBetterManualLinks が実質無効化されていた＝本修正で復活）。
-    if (merged instanceof Map) { for (const arr of merged.values()) makerItems.push(...arr); }
-    else if (Array.isArray(merged)) makerItems = merged;
-  } catch (e) { /* maker_quotes 無しでも続行 */ }
+  try { makerItems = flattenedMergedMakerItems(); } catch (e) { /* maker_quotes 無しでも続行 */ }
   let hanbai = [];
   try { hanbai = getHanbaiRecordsCached(); } catch (e) { /* DB/ファイル不可でも続行 */ }
   const better = auditBetterManualLinks(productLinks, makerItems, hanbai);
@@ -808,7 +859,12 @@ function buildProductLinkCheck() {
 //  ※ 照合(shogo)は毎回フレッシュに読むのでこのキャッシュは「自社品検索」専用。force で破棄して読み直せる。
 let _hanbaiCache = null; // { at, records }
 // 照合し直したら呼ぶ：自社品検索キャッシュ（5分TTL）と照合結果CSVキャッシュを破棄して次回フレッシュに読む。
-function invalidateCaches() { _hanbaiCache = null; try { cache.clear(); } catch (_) {} }
+function invalidateCaches() {
+  _hanbaiCache = null;
+  _latestCsvCache = null;
+  invalidateMakerCaches();
+  try { cache.clear(); } catch (_) {}
+}
 function getHanbaiRecordsCached(force) {
   const TTL = 5 * 60 * 1000; // 5分（DB読取は約1.5秒・ファイルも数秒かかるため）
   if (!force && _hanbaiCache && (Date.now() - _hanbaiCache.at) < TTL) return _hanbaiCache.records;
@@ -1133,6 +1189,8 @@ function countCsvDataRows(fullPath) {
   } catch (e) { return 0; }
 }
 function listMakerQuotes() {
+  const listFp = makerListFingerprint();
+  if (_makerListCache && _makerListCache.fp === listFp) return _makerListCache.items;
   if (!fs.existsSync(MAKER_DIR)) return [];
   const csvs = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f));
   const inputFiles  = fs.existsSync(INPUT_DIR)  ? fs.readdirSync(INPUT_DIR)  : [];
@@ -1192,6 +1250,7 @@ function listMakerQuotes() {
     });
   }
   items.sort((a, b) => String(b.importedAt || '').localeCompare(String(a.importedAt || '')));
+  _makerListCache = { fp: listFp, items };
   return items;
 }
 
@@ -1211,9 +1270,8 @@ function buildMakerImportHint(supplier, previewItems) {
     needsRematch: !!listed.needsRematch,
   };
   const items = Array.isArray(previewItems) ? previewItems : [];
-  if (items.length && fs.existsSync(MAKER_DIR)) {
-    const files = fs.readdirSync(MAKER_DIR).filter((f) => /\.csv$/i.test(f));
-    const merged = mergeMakerFiles(files.map((f) => path.join(MAKER_DIR, f)), getSettings().makerChannel || {});
+  if (items.length) {
+    const merged = getMergedMakerMap();
     const existing = merged.get(supplier) || [];
     const keySet = new Set(existing.map((it) => makerProdKey(it)));
     let matched = 0;
@@ -1321,6 +1379,7 @@ function saveMakerQuote(body) {
     }
   }
   const result = { ok: true, count: items.length, file: 'maker_quotes/' + fname, linkedCount };
+  invalidateMakerCaches(); // 新CSV追加＝統合キャッシュを破棄（照合前でも取込ヒントに反映）
   // 防止策②（警告）：自社製造で、補完しても自社コードが全く無い商品は照合できず休眠になる→重複の原因。
   if (isSelfMade) {
     const missing = items.filter((it) => !String((it && it.makerCode) || '').trim()).length;
@@ -4653,7 +4712,8 @@ async function loadCdCandidates(){
   }catch(e){ box.style.display='none'; }
 }
 (async ()=>{
-  await initSettings(); fetchPL(); loadAllImpact(); loadDupCheck(); loadLinkCheck(); loadCdCandidates();
+  await initSettings();
+  fetchPL();
   const smTh = $('#sortMatchTh');
   if (smTh) { updateSortMatchTh(); smTh.addEventListener('click', cycleMainSort); }
   const params=new URLSearchParams(location.search);
@@ -4666,8 +4726,11 @@ async function loadCdCandidates(){
     await loadFiles(target);
     focusRow(params.get('focusCustomer')||'', params.get('focusCode')||'', params.get('focusName')||'');
   } else {
-    loadFiles();
+    await loadFiles();
   }
+  loadAllImpact(); // 表の表示後に全社損益（重い集計は後回し）
+  // バナー類は表の描画を阻害しないよう少し遅らせる
+  setTimeout(()=>{ loadDupCheck(); loadLinkCheck(); loadCdCandidates(); }, 80);
 })();
 </script>
 </body></html>`;
