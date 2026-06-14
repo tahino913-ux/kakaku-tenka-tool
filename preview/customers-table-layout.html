@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+  <title>得意先ページ 表レイアウト プレビュー（参考）</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Meiryo","Segoe UI",sans-serif;background:#f4f6f9;color:#1f2733;font-size:13px;padding:20px}
+  h1{font-size:18px;color:#1f4e78;margin:0 0 6px}
+  .lead{color:#5a6b7a;font-size:13px;margin:0 0 20px;max-width:900px;line-height:1.6}
+  section{background:#fff;border:1px solid #e2e6ec;border-radius:10px;margin-bottom:28px;overflow:hidden}
+  section h2{margin:0;padding:12px 16px;font-size:14px;background:#eef2f7;border-bottom:1px solid #e2e6ec}
+  section h2.bad{background:#fdecea;color:#922b21}
+  section h2.good{background:#eef7ef;color:#1f6b35}
+  .note{padding:10px 16px;font-size:12px;color:#5a6b7a;background:#f9fbfd;border-bottom:1px solid #e8edf2}
+  .wrap{overflow:auto;padding:0 12px 12px}
+  table{border-collapse:collapse;width:100%;min-width:960px;font-size:12px;background:#fff}
+  th,td{border:1px solid #e2e6ec;padding:6px 8px;vertical-align:middle}
+  th{background:#eef2f7;font-size:11px;font-weight:700;text-align:center;white-space:nowrap}
+  th.grp{background:#1f4e78;color:#fff;font-size:12px}
+  th.sub{font-weight:600;color:#41526b}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .sup-badge{display:inline-block;background:#eef4fb;color:#1f5fa6;border:1px solid #c6d8ef;border-radius:999px;padding:1px 7px;font-size:10px;font-weight:700}
+  .pcode{font-family:monospace;font-size:10px;color:#6b7785}
+  .prod a{color:#1f5fa6;text-decoration:underline dotted}
+  .pct-up{color:#c0392b;font-weight:700;font-size:11px}
+  .pct-dn{color:#1f6b35;font-weight:700;font-size:11px}
+  .marg{color:#6b7785;font-size:11px}
+  .marg.low{background:#fdeccb;color:#9a5b00;font-weight:700;padding:1px 4px;border-radius:4px}
+  input.sellinp{width:72px;text-align:right;padding:3px 5px;border:1px solid #c7d6e4;border-radius:6px;font-size:12px}
+  .stack .lbl{color:#6b7785;font-size:10px;margin-right:3px}
+  .stack .line{line-height:1.55}
+  .vote{margin:16px;padding:14px 16px;background:#fff8e6;border:1px solid #f0d49a;border-radius:8px;font-size:13px}
+  .vote strong{color:#8a5a12}
+  .legend{display:flex;flex-wrap:wrap;gap:12px;padding:8px 16px 12px;font-size:11px;color:#6b7785}
+  .legend span{display:inline-flex;align-items:center;gap:4px}
+  .box{width:14px;height:14px;border-radius:3px;display:inline-block}
+  .box-cost{background:#e8f0f8;border:1px solid #b8cfe8}
+  .box-sell{background:#e8f5ec;border:1px solid #b8dfc8}
+  /* コンパクト案 */
+  .smart td{font-size:12px;line-height:1.5}
+  .smart .prodname{font-size:12px;line-height:1.4;word-break:break-word}
+  .smart .subline{color:#6b7785;font-size:11px}
+  .smart .paren{color:#9aa6b2;font-size:11px}
+  .smart .main-num{font-weight:700;font-variant-numeric:tabular-nums}
+  .smart .chg-row{margin-top:3px}
+  .smart .chg-lbl{color:#6b7785;font-size:10px;margin-right:4px}
+  .smart .chg-val{font-weight:800;font-size:13px}
+  .smart .chg-val.ok{color:#1f6b35}
+  .smart .chg-val.warn{color:#c0392b}
+  .smart .pass-ok{display:inline-block;background:#eef7ef;color:#1f6b35;border:1px solid #bfe0c4;border-radius:4px;font-size:10px;padding:0 5px;margin-left:4px;font-weight:700}
+  .smart .pass-warn{display:inline-block;background:#fdeccb;color:#9a5b00;border:1px solid #f0d49a;border-radius:4px;font-size:10px;padding:0 5px;margin-left:4px;font-weight:700}
+  h2.rec{background:#1f4e78;color:#fff}
+</style>
+</head>
+<body>
+
+<h1>得意先ページ — 表レイアウト案（参考・本番は customersPage.js に実装済み）</h1>
+<p class="lead">
+  <strong>転嫁確認が主目的</strong>＝仕入改定（メーカー事実）に対して、売価改定が十分かをパッと見る。<br>
+  現単価は括弧内の参考表示に下げ、列数も抑えた<strong>コンパクト案</strong>を推奨候補にしています。
+</p>
+
+<section>
+  <h2 class="rec">★ コンパクト案（ご提案・推奨）</h2>
+  <p class="note">
+    新を大きく、現は（括弧）で控えめ表示。改定率は太字で横並び比較しやすく。<br>
+    売価改定 ≥ 仕入改定 なら転嫁OK（緑）、足りない行は警告（橙）。
+  </p>
+  <div class="wrap">
+    <table class="smart">
+      <thead>
+        <tr>
+          <th>操作</th>
+          <th style="text-align:left;min-width:220px">商品</th>
+          <th style="min-width:110px">新仕入<span class="paren">（現）</span></th>
+          <th style="min-width:72px">仕入改定</th>
+          <th style="min-width:200px">新売価/新粗利<span class="paren">（現売価/現粗利）</span></th>
+          <th style="min-width:88px">売価改定</th>
+          <th>行ルール</th>
+          <th>実施日</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>☑ 🤔</td>
+          <td>
+            <div class="prodname"><a href="#">ﾌｸﾚｯｸｽ新 No.11 【紐付】(200入)</a></div>
+            <div class="subline"><span class="sup-badge">朝日</span> <span class="pcode">002601</span></div>
+          </td>
+          <td class="num"><span class="main-num">171.6</span><span class="paren">（131）</span></td>
+          <td class="num"><span class="chg-val">+31</span><span class="paren">%</span></td>
+          <td class="num">
+            <input class="sellinp main-num" value="334.03"> / <span class="main-num">48.6</span><span class="paren">%</span>
+            <span class="paren">（250 / 47.6%）</span>
+          </td>
+          <td class="num">
+            <span class="chg-val ok">+33.6</span><span class="paren">%</span>
+            <span class="pass-ok">転嫁OK</span>
+          </td>
+          <td>（全体）</td>
+          <td>2026-07-01</td>
+        </tr>
+        <tr>
+          <td>☑ 🤔</td>
+          <td>
+            <div class="prodname"><a href="#">ﾌｸﾚｯｸｽ新 No.12 【紐付】(200入)</a></div>
+            <div class="subline"><span class="sup-badge">朝日</span> <span class="pcode">002602</span></div>
+          </td>
+          <td class="num"><span class="main-num">286.8</span><span class="paren">（219）</span></td>
+          <td class="num"><span class="chg-val">+31</span><span class="paren">%</span></td>
+          <td class="num">
+            <input class="sellinp main-num" value="561.03"> / <span class="main-num">48.9</span><span class="paren">%</span>
+            <span class="paren">（420 / 47.9%）</span>
+          </td>
+          <td class="num">
+            <span class="chg-val ok">+33.6</span><span class="paren">%</span>
+            <span class="pass-ok">転嫁OK</span>
+          </td>
+          <td>（全体）</td>
+          <td>2026-07-01</td>
+        </tr>
+        <tr>
+          <td>☑ 🤔</td>
+          <td>
+            <div class="prodname"><a href="#">お好み丸220R 本体PP内ﾗﾐ</a></div>
+            <div class="subline"><span class="sup-badge">大黒</span> <span class="pcode">004828</span></div>
+          </td>
+          <td class="num"><span class="main-num">17.11</span><span class="paren">（14.26）</span></td>
+          <td class="num"><span class="chg-val">+20</span><span class="paren">%</span></td>
+          <td class="num">
+            <input class="sellinp main-num" value="18.5"> / <span class="main-num marg low">12.1</span><span class="paren">%</span>
+            <span class="paren">（15 / 26.6%）</span>
+          </td>
+          <td class="num">
+            <span class="chg-val warn">+23.3</span><span class="paren">%</span>
+            <span class="pass-warn">要確認</span>
+          </td>
+          <td>据置</td>
+          <td style="color:#c0392b">未設定</td>
+        </tr>
+        <tr>
+          <td>☑ 🤔</td>
+          <td>
+            <div class="prodname"><a href="#">ﾀﾚﾋﾞﾝ 角小(D)</a></div>
+            <div class="subline"><span class="sup-badge">中央化学</span> <span class="pcode">001234</span></div>
+          </td>
+          <td class="num"><span class="main-num">16.0</span><span class="paren">（13.3）</span></td>
+          <td class="num"><span class="chg-val">+20</span><span class="paren">%</span></td>
+          <td class="num">
+            <input class="sellinp main-num" value="24.0"> / <span class="main-num">33.3</span><span class="paren">%</span>
+            <span class="paren">（20 / 33.5%）</span>
+          </td>
+          <td class="num">
+            <span class="chg-val ok">+20</span><span class="paren">%</span>
+            <span class="pass-ok">同率</span>
+          </td>
+          <td>粗利維持</td>
+          <td>2026-06-01</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 class="bad">現状（分かりにくい例）</h2>
+  <p class="note">仕入・売価それぞれのセルに「現」「改」が縦に積まれ、数字・％・入力欄が混在しています。</p>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>操作</th><th>商品</th><th>仕入</th><th>売価 粗利%</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>☑ 🤔</td>
+          <td class="prod"><span class="sup-badge">朝日食品容器</span> <span class="pcode">002601</span><br>
+            <a href="#">ﾌｸﾚｯｸｽ新 No.11 【紐付】(200入)</a></td>
+          <td class="stack">
+            <div class="line"><span class="lbl">現</span>131</div>
+            <div class="line"><span class="lbl">改</span>171.6 <span class="pct-up">+31.0%</span></div>
+          </td>
+          <td class="stack">
+            <div class="line num"><span class="lbl">現</span>250 <span class="marg">47.6%</span></div>
+            <div class="line num"><input class="sellinp" value="334.03"> <span class="marg">48.6%</span> <span class="pct-up">+33.6%</span></div>
+          </td>
+        </tr>
+        <tr>
+          <td>☑ 🤔</td>
+          <td class="prod"><span class="sup-badge">朝日食品容器</span> <span class="pcode">002602</span><br>
+            <a href="#">ﾌｸﾚｯｸｽ新 No.12 【紐付】(200入)</a></td>
+          <td class="stack">
+            <div class="line"><span class="lbl">現</span>219</div>
+            <div class="line"><span class="lbl">改</span>286.8 <span class="pct-up">+31.0%</span></div>
+          </td>
+          <td class="stack">
+            <div class="line num"><span class="lbl">現</span>420 <span class="marg">47.9%</span></div>
+            <div class="line num"><input class="sellinp" value="561.03"> <span class="marg">48.9%</span> <span class="pct-up">+33.6%</span></div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2 class="good">参考：ワイド列案（前回案・列が多い）</h2>
+  <p class="note">
+    列を分けて横一列で読めるようにします。粗利率は<strong>売価側のみ</strong>（現・改の2列）。<br>
+    幅が足りない画面では表エリアだけ横スクロール（商品名は左に固定も検討可）。
+  </p>
+  <div class="legend">
+    <span><i class="box box-cost"></i> 仕入（3列）</span>
+    <span><i class="box box-sell"></i> 売価（5列）</span>
+  </div>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th rowspan="2">操作</th>
+          <th rowspan="2" style="min-width:200px;text-align:left">商品</th>
+          <th colspan="3" class="grp">仕入</th>
+          <th colspan="5" class="grp">売価</th>
+          <th rowspan="2">行ルール</th>
+          <th rowspan="2">まるめ</th>
+          <th rowspan="2">実施日</th>
+        </tr>
+        <tr>
+          <th class="sub" style="background:#e8f0f8">現単価</th>
+          <th class="sub" style="background:#e8f0f8">新単価</th>
+          <th class="sub" style="background:#e8f0f8">改定%</th>
+          <th class="sub" style="background:#e8f5ec">現売価</th>
+          <th class="sub" style="background:#e8f5ec">現粗利%</th>
+          <th class="sub" style="background:#e8f5ec">新売価<br><span style="font-weight:400">（入力可）</span></th>
+          <th class="sub" style="background:#e8f5ec">新粗利%</th>
+          <th class="sub" style="background:#e8f5ec">改定%</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>☑ 🤔</td>
+          <td class="prod"><span class="sup-badge">朝日食品容器</span> <span class="pcode">002601</span><br>
+            <a href="#">ﾌｸﾚｯｸｽ新 No.11 【紐付】(200入)</a></td>
+          <td class="num" style="background:#fafcfe">131</td>
+          <td class="num" style="background:#fafcfe">171.6</td>
+          <td class="num pct-up" style="background:#fafcfe">+31.0%</td>
+          <td class="num" style="background:#f8fcf9">250</td>
+          <td class="num marg" style="background:#f8fcf9">47.6%</td>
+          <td class="num" style="background:#f8fcf9"><input class="sellinp" value="334.03"></td>
+          <td class="num marg" style="background:#f8fcf9">48.6%</td>
+          <td class="num pct-up" style="background:#f8fcf9">+33.6%</td>
+          <td>（全体）</td>
+          <td>（全体）</td>
+          <td>2026-07-01</td>
+        </tr>
+        <tr>
+          <td>☑ 🤔</td>
+          <td class="prod"><span class="sup-badge">朝日食品容器</span> <span class="pcode">002602</span><br>
+            <a href="#">ﾌｸﾚｯｸｽ新 No.12 【紐付】(200入)</a></td>
+          <td class="num" style="background:#fafcfe">219</td>
+          <td class="num" style="background:#fafcfe">286.8</td>
+          <td class="num pct-up" style="background:#fafcfe">+31.0%</td>
+          <td class="num" style="background:#f8fcf9">420</td>
+          <td class="num marg" style="background:#f8fcf9">47.9%</td>
+          <td class="num" style="background:#f8fcf9"><input class="sellinp" value="561.03"></td>
+          <td class="num marg" style="background:#f8fcf9">48.9%</td>
+          <td class="num pct-up" style="background:#f8fcf9">+33.6%</td>
+          <td>（全体）</td>
+          <td>（全体）</td>
+          <td>2026-07-01</td>
+        </tr>
+        <tr style="opacity:.85">
+          <td>☑ 🤔</td>
+          <td class="prod"><span class="sup-badge">大黒工業</span> <span class="pcode">007798</span><br>
+            <a href="#">例）低マージン行</a></td>
+          <td class="num" style="background:#fafcfe">11.01</td>
+          <td class="num" style="background:#fafcfe">13.21</td>
+          <td class="num pct-up" style="background:#fafcfe">+20.0%</td>
+          <td class="num" style="background:#f8fcf9">15</td>
+          <td class="num marg" style="background:#f8fcf9">26.6%</td>
+          <td class="num" style="background:#f8fcf9"><input class="sellinp" value="18.36"></td>
+          <td class="num"><span class="marg low">12.1%</span></td>
+          <td class="num pct-up" style="background:#f8fcf9">+22.4%</td>
+          <td>掛率×</td>
+          <td>整数切捨</td>
+          <td style="color:#c0392b">未設定</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<div class="vote">
+  <strong>コンパクト案についての所感</strong>
+  <ul style="margin:8px 0 0;padding-left:20px;line-height:1.75">
+    <li><strong>目的に合っている</strong> … 得意先ページ＝「転嫁できているか」の確認が主。現単価を括弧に下げるのは合理的です。</li>
+    <li><strong>比較が一目</strong> … 仕入改定 31% と 売価改定 33.6% を横に並べると、粗利が維持・改善されているかすぐ分かります。</li>
+    <li><strong>商品名</strong> … 短縮せず、これまでどおり<strong>正式名をそのまま表示</strong>（リンクは照合画面へ）。</li>
+    <li><strong>追加提案</strong> … 売価改定 &lt; 仕入改定 の行に「要確認」バッジ（上の3行目例）。据置・手入力で意図的な場合は問題なし。</li>
+  </ul>
+  <p style="margin:12px 0 0">このコンパクト案で実装してよければ「実装して」と返信ください。</p>
+</div>
+
+</body>
+</html>
