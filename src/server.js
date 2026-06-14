@@ -26,18 +26,40 @@ const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, ge
 const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords, mergeMakerFiles, makerProdKey } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
 const { readXlsxBuffer } = require('./xlsxread');
-const { detectColumns: detectMakerCols, serialToDate, normDate } = require('./makerXlsx');
+const { detectColumns: detectMakerCols, normDate } = require('./makerXlsx');
 const { loadCsv, decodeBuffer } = require('./csv');
 const { xlsToCsv } = require('./xls2csv');
 const { priceRowAnomaly } = require('./anomaly');
 const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode } = require('./productLink');
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
-const { describeNoiseRow } = require('./noiserow');
-const { getImportSkips, lookupImportSkip, updateImportSkips, removeImportSkip } = require('./importSkip');
+const { describeNoiseRow, isNoiseRow } = require('./noiserow');
+const { getImportSkips, importSkipMap, lookupImportSkip, updateImportSkips, removeImportSkip } = require('./importSkip');
 // 配信HTMLの版（/api/ping の rev と一致＝古いサーバが残っていないか確認用）
-const SIM_PAGE_REV = '20260608a';
+const SIM_PAGE_REV = '20260613b';
+const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
+
+// 照合の同時実行防止（DB読取・input/ 書き込みの競合を防ぐ）
+let _shogoRunning = false;
+function shogoStatusPayload() { return { running: !!_shogoRunning }; }
+function runShogoGuarded(args) {
+  if (_shogoRunning) {
+    const err = new Error('照合が既に実行中です。完了までお待ちください。');
+    err.code = 'SHOGO_BUSY';
+    throw err;
+  }
+  _shogoRunning = true;
+  try {
+    return runShogo(args);
+  } finally {
+    _shogoRunning = false;
+  }
+}
+function shogoBusyJson() {
+  return { ok: false, busy: true, error: '照合実行中です。完了までお待ちください。' };
+}
 const { buildCostCsv } = require('./cost_export');
+const { pruneInputCsv } = require('./pruneInput');
 const os = require('os');
 
 const RATE_CAUTION_PCT = 30; // 値上率がこの%以上の行は sim で黄色く注意表示（除外はしない・調整可）
@@ -48,6 +70,13 @@ const MAKER_DIR = path.join(ROOT, 'maker_quotes');
 const ISSUE_LOG_PATH = path.join(OUTPUT_DIR, '発行履歴.json'); // 得意先別 見積書の提出履歴（output/=Drive同期で両PC共有）
 const PORT_START = 8765;
 
+// 原子的書き込み：一時ファイル→rename で本体を置換（書込途中のクラッシュ/同期割り込みでJSONが壊れない）。失敗時は throw。
+function writeJsonAtomicFile(file, obj) {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj == null ? {} : obj, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
 // ---- 見積書の提出（発行）履歴 -------------------------------------
 //  { 得意先名: { lastIssuedAt(ISO), count, quoteNo, itemCount, folder } }
 //  得意先ページで「提出済みが一目で分かる」ための記録。価格や照合には一切影響しない表示専用データ。
@@ -56,8 +85,8 @@ function readIssueLog() {
   catch (e) { return {}; }
 }
 function writeIssueLog(log) {
-  try { fs.mkdirSync(OUTPUT_DIR, { recursive: true }); fs.writeFileSync(ISSUE_LOG_PATH, JSON.stringify(log, null, 2), 'utf8'); }
-  catch (e) { /* 記録失敗は発行自体を妨げない */ }
+  try { fs.mkdirSync(OUTPUT_DIR, { recursive: true }); writeJsonAtomicFile(ISSUE_LOG_PATH, log); return true; }
+  catch (e) { return false; /* 記録失敗は発行自体を妨げない（呼び出し側で必要なら検知） */ }
 }
 // 発行した得意先ぶんを履歴へ反映（同じ得意先は最終提出で更新＋回数を加算）。
 function recordIssuance(issued, folderName, atIso) {
@@ -108,45 +137,154 @@ function buildIssuedQuotesList() {
   const totalItems = items.reduce((s, x) => s + (x.itemCount || 0), 0);
   return { items, count: items.length, folders, totalItems };
 }
+// 手動修正一覧（照合できずツール外で直した品の記録）。品目ステータス.json の s=manual を集める。
+function buildManualCorrectionsList() {
+  const map = readItemStatus();
+  const items = [];
+  for (const [customer, ent] of Object.entries(map)) {
+    for (const [rowKey, st] of Object.entries(ent || {})) {
+      if (!st || st.s !== 'manual') continue;
+      items.push({
+        customer, rowKey,
+        supplier: st.supplier || '',
+        productCode: st.productCode || '',
+        productName: st.productName || '',
+        matchStatus: st.matchStatus || '',
+        currentSell: st.currentSell,
+        newSell: st.sell,
+        currentCost: st.currentCost,
+        newCost: st.cost,
+        effectiveDate: st.eff || '',
+        note: st.note || '',
+        registeredAt: st.at || '',
+      });
+    }
+  }
+  items.sort((a, b) =>
+    String(a.customer).localeCompare(String(b.customer), 'ja') ||
+    String(a.supplier).localeCompare(String(b.supplier), 'ja') ||
+    String(a.productName).localeCompare(String(b.productName), 'ja'));
+  return { items, count: items.length };
+}
+function escCsvCell(v) {
+  const s = String(v == null ? '' : v);
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function buildManualCorrectionsCsv() {
+  const { items } = buildManualCorrectionsList();
+  const numOut = (v) => (v != null && Number.isFinite(Number(v)) ? String(v) : '');
+  const hdr = '得意先,仕入先,商品コード,商品名,照合,現売単価,改定後売単価,現仕入単価,改定後仕入単価,実施日,備考,登録日時';
+  const rows = items.map((it) => [
+    it.customer, it.supplier, it.productCode, it.productName, it.matchStatus,
+    numOut(it.currentSell), numOut(it.newSell), numOut(it.currentCost), numOut(it.newCost),
+    it.effectiveDate, it.note, it.registeredAt,
+  ].map(escCsvCell).join(','));
+  return '\uFEFF' + hdr + '\r\n' + rows.join('\r\n');
+}
 
-// ---- 得意先別アイテムの状態（検討中＝除外／提出済み）-------------------
-//  { 得意先名: { rowKey: { s:'hold'|'issued', at?, quoteNo? } } }
-//  s='hold'（検討中）＝今回の見積から外すが一覧には残す。s='issued'（提出済み）＝発行済みで別枠へ。
+// ---- 得意先別アイテムの状態（検討中／手動修正／提出済み）-------------------
+//  { 得意先名: { rowKey: { s:'hold'|'manual'|'issued', at?, quoteNo?, sell?, cost?, eff?, note?, ... } } }
+//  s='hold'（検討中）＝見積作成時にあとで考えたい品。見積から除外するが一覧に残す（一時待機場所）。
+//  s='manual'（手動修正）＝照合できない品をツール外で直した記録。見積から除外し一覧で把握・CSV出力。
+//  s='issued'（提出済み）＝発行済みで別枠へ。
 //  価格・照合には無影響＝見積書に「載せる/載せない」と表示の振り分けだけ。output/=Drive同期で両PC共有。
 const ITEM_STATUS_PATH = path.join(OUTPUT_DIR, '品目ステータス.json');
+// 品目ステータスのプロセス内キャッシュ。calcAll/buildCalendar/calcByDate/buildCustomerCandidates 等が
+//  1リクエストで何度も読む（同一ファイルを3回以上）。mtime が同じ間は再パースしない。
+//  ・書き込み(writeItemStatus)で破棄＝読み取り側は常に最新を見る。
+//  ・他PC(Drive同期)が更新→mtime変化で自動再読込。読み取り専用の利用ばかりなので参照共有でも安全。
+let _itemStatusCache = null; // { mtimeMs, map }
 function readItemStatus() {
-  try { return JSON.parse(fs.readFileSync(ITEM_STATUS_PATH, 'utf8') || '{}') || {}; }
+  try {
+    const st = fs.statSync(ITEM_STATUS_PATH);
+    if (_itemStatusCache && _itemStatusCache.mtimeMs === st.mtimeMs) return _itemStatusCache.map;
+    const map = JSON.parse(fs.readFileSync(ITEM_STATUS_PATH, 'utf8') || '{}') || {};
+    if (repairMigratedHold(map)) {
+      // 修復で書き直す＝mtimeが変わる。失敗時は「未保存の修復結果」をキャッシュしない。
+      if (!writeItemStatus(map)) {
+        _itemStatusCache = null;
+        try { return JSON.parse(fs.readFileSync(ITEM_STATUS_PATH, 'utf8') || '{}') || {}; } catch (_) { return {}; }
+      }
+    }
+    let mtimeMs = st.mtimeMs;
+    try { mtimeMs = fs.statSync(ITEM_STATUS_PATH).mtimeMs; } catch (_) {}
+    _itemStatusCache = { mtimeMs, map };
+    return map;
+  }
   catch (e) { return {}; }
 }
-function writeItemStatus(map) {
-  try { fs.mkdirSync(OUTPUT_DIR, { recursive: true }); fs.writeFileSync(ITEM_STATUS_PATH, JSON.stringify(map || {}, null, 2), 'utf8'); }
-  catch (e) { /* 記録失敗は見積自体を妨げない */ }
+// 旧移行バグで hold→issued になった品を検討中へ戻す（migratedFromHold フラグ付きのみ）。
+function repairMigratedHold(map) {
+  let dirty = false;
+  for (const cust of Object.keys(map || {})) {
+    const ent = map[cust];
+    if (!ent) continue;
+    for (const rk of Object.keys(ent)) {
+      const st = ent[rk];
+      if (!st || !st.migratedFromHold) continue;
+      ent[rk] = { s: 'hold', at: st.at || new Date().toISOString() };
+      dirty = true;
+    }
+  }
+  return dirty;
 }
-// 検討中(hold)のON/OFF・提出済み(issued)の解除。status=''で「対象に戻す」（hold/issued どちらも解除）。
-function setItemStatus(customer, rowKey, status) {
+function writeItemStatus(map) {
+  try { fs.mkdirSync(OUTPUT_DIR, { recursive: true }); writeJsonAtomicFile(ITEM_STATUS_PATH, map || {}); _itemStatusCache = null; return true; }
+  catch (e) { _itemStatusCache = null; return false; } // 失敗時もキャッシュ破棄＝未保存の変更を残さず次回ファイルから再読込
+}
+function manualStatusEntry(snap) {
+  snap = snap || {};
+  return {
+    s: 'manual',
+    at: new Date().toISOString(),
+    sell: snap.newSell != null ? snap.newSell : snap.sell,
+    cost: snap.newCost != null ? snap.newCost : snap.cost,
+    eff: String(snap.effectiveDate || snap.eff || ''),
+    note: String(snap.note || ''),
+    productCode: String(snap.productCode || ''),
+    productName: String(snap.productName || ''),
+    supplier: String(snap.supplier || ''),
+    currentSell: snap.currentSell,
+    currentCost: snap.currentCost,
+    matchStatus: String(snap.matchStatus || ''),
+  };
+}
+// 検討中(hold)・手動修正(manual)のON/OFF・提出済み(issued)の解除。status=''で「対象に戻す」。
+function setItemStatus(customer, rowKey, status, snap) {
   const map = readItemStatus();
   if (!customer || !rowKey) return map;
-  if (status === 'hold') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = { s: 'hold' }; }
+  if (status === 'manual') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = manualStatusEntry(snap); }
+  else if (status === 'hold') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = { s: 'hold', at: new Date().toISOString() }; }
   else if (map[customer]) { delete map[customer][rowKey]; if (!Object.keys(map[customer]).length) delete map[customer]; }
-  writeItemStatus(map);
-  return map;
+  return writeItemStatus(map); // 保存成否(boolean)を返す＝APIが ok を判定できる
 }
-// 複数アイテムの状態を一括変更（hold=まとめて検討中へ／''=まとめて対象へ戻す）。1回の書き込みで効率化（700件でも軽い）。
-//  status='' のときは検討中(hold)・提出済み(issued)のどちらでも対象へ戻す（チェックで明示選択した行のみ）。
-//   ＝得意先ページの「検討中→対象」「提出済み→対象」両方のチェック一括移動で使う。
-function setItemStatusBulk(customer, rowKeys, status) {
+// 複数アイテムをまとめて変更（hold=検討中／manual=手動修正／''=対象へ戻す）。
+//  status='' のときは hold・manual・issued のどちらでも対象へ戻す。
+//  items=[{rowKey,snapshot}] を渡すと手動修正時に単価等を保存（hold は rowKeys のみで可）。
+function setItemStatusBulk(customer, rowKeys, status, items) {
   const map = readItemStatus();
-  if (!customer || !Array.isArray(rowKeys) || !rowKeys.length) return { changed: 0 };
+  const list = Array.isArray(items) && items.length
+    ? items
+    : (Array.isArray(rowKeys) ? rowKeys.map((rk) => ({ rowKey: rk })) : []);
+  if (!customer || !list.length) return { changed: 0 };
   let changed = 0;
-  for (const rk of rowKeys) {
-    const rowKey = String(rk || '').trim();
+  for (const it of list) {
+    const rowKey = String((it && it.rowKey) || it || '').trim();
     if (!rowKey) continue;
-    if (status === 'hold') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = { s: 'hold' }; changed++; }
-    else if (map[customer] && map[customer][rowKey]) { delete map[customer][rowKey]; changed++; } // 対象へ戻す（hold/issued どちらも）
+    if (status === 'manual') {
+      if (!map[customer]) map[customer] = {};
+      map[customer][rowKey] = manualStatusEntry(it.snapshot || it);
+      changed++;
+    } else if (status === 'hold') {
+      if (!map[customer]) map[customer] = {};
+      map[customer][rowKey] = { s: 'hold', at: new Date().toISOString() };
+      changed++;
+    } else if (map[customer] && map[customer][rowKey]) { delete map[customer][rowKey]; changed++; }
   }
   if (map[customer] && !Object.keys(map[customer]).length) delete map[customer];
-  writeItemStatus(map);
-  return { changed };
+  const ok = writeItemStatus(map);
+  return { changed, ok };
 }
 // 発行時に「対象だったアイテム」を提出済みへ（rowKey 単位）。
 // 発行時に「対象だったアイテム」を提出済みへ（rowKey 単位）。発行に使った実施日(eff)も保存する＝
@@ -170,7 +308,7 @@ function markItemsIssued(customer, items, quoteNo, atIso) {
   }
   writeItemStatus(map);
 }
-// 提出済み(issued)だけを対象へ戻す（検討中 hold は残す）。customer 指定でその得意先のみ、無指定で全件。
+// 提出済み(issued)だけを対象へ戻す（検討中 hold・手動修正 manual は残す）。customer 指定でその得意先のみ、無指定で全件。
 //  「提出履歴をリセット（新サイクル）」「提出済みを取消」と歩調を合わせる。
 function clearIssuedStatuses(customer) {
   const map = readItemStatus();
@@ -241,9 +379,36 @@ function flattenedMergedMakerItems() {
   else if (Array.isArray(merged)) out.push(...merged);
   return out;
 }
+const _supplierMakerItemsCache = new Map();
+
+// 取込ヒント用：全仕入先の merge を避け、当該仕入先の CSV だけ読む（初回の重さを軽減）。
+function getMakerItemsForSupplier(supplier) {
+  supplier = String(supplier || '').trim();
+  if (!supplier) return [];
+  const channelMap = getSettings().makerChannel || {};
+  const fp = makerQuotesFingerprint() + '|' + JSON.stringify(channelMap);
+  const hit = _supplierMakerItemsCache.get(supplier);
+  if (hit && hit.fp === fp) return hit.items;
+  const rawNames = new Set([supplier]);
+  for (const [raw, ch] of Object.entries(channelMap)) {
+    if (ch === supplier) rawNames.add(raw);
+  }
+  const files = [];
+  if (fs.existsSync(MAKER_DIR)) {
+    for (const f of fs.readdirSync(MAKER_DIR).filter((x) => /\.csv$/i.test(x) && !x.startsWith('_'))) {
+      if (rawNames.has(extractSupplierFromMakerFile(f))) files.push(path.join(MAKER_DIR, f));
+    }
+  }
+  const map = files.length ? mergeMakerFiles(files, channelMap) : new Map();
+  const items = map.get(supplier) || [];
+  _supplierMakerItemsCache.set(supplier, { fp, items });
+  return items;
+}
+
 function invalidateMakerCaches() {
   _mergedMakerCache = null;
   _makerListCache = null;
+  _supplierMakerItemsCache.clear();
 }
 
 function listLatestCsv() {
@@ -492,7 +657,7 @@ function calcAll(body) {
     const ps = parseSelfName(r.productName); // 自社商品名を構造化
     // 提出対象（得意先あり・一致）行だけ価格異常を判定（休眠/未一致は売単価が無くて当然なので対象外）
     const isQuoteRow = !!r.customerName && r.customerName !== '-' && !/未一致/.test(matchStatus);
-    const priceWarning = isQuoteRow ? priceRowAnomaly(r.currentSell, r.newSell, r.ruleType, isSelfMade) : '';
+    const priceWarning = isQuoteRow ? priceRowAnomaly(r.currentSell, r.newSell, r.ruleType, isSelfMade, r.currentCost, r.newCost) : '';
     // 値上率が大きい行の「注意」（エラーではない＝除外しない）。メーカーの値上げ幅が正しいかの確認喚起。
     //  メイン画面は照合・仕入コストの確認用なので、判定は「メーカー仕入(原価)の値上率」で行う。
     //  ※売価ベースだと自社の転嫁ルール次第で過剰に点灯し、メッセージ「メーカーの値上げ幅」とも食い違うため。
@@ -580,6 +745,29 @@ function calcAll(body) {
   return { rows, summary, supplier, productLinks: links, makerNames, suppliers };
 }
 
+// calcAll の結果をファイル単位でキャッシュ（同一方針での再計算を省略＝メイン/得意先/損益で共有）。
+let _calcAllResultCache = null; // { policyKey, byFile: Map }
+function calcAllPolicyKey(body) {
+  const rule = (body && body.rule) ? body.rule : { type: 'add_increase' };
+  const rounding = (body && body.rounding) ? body.rounding : getSettings().rounding;
+  const selfUplift = body ? body.selfUplift : 0;
+  return JSON.stringify({ rule, rounding, selfUplift, files: listLatestCsv() });
+}
+function calcAllCached(body) {
+  body = body || {};
+  if (Array.isArray(body.rows) && body.rows.length) return calcAll(body); // 行上書き付き再計算はキャッシュしない
+  const file = body.file;
+  if (!file) return calcAll(body);
+  const policyKey = calcAllPolicyKey(body);
+  if (!_calcAllResultCache || _calcAllResultCache.policyKey !== policyKey) {
+    _calcAllResultCache = { policyKey, byFile: new Map() };
+  }
+  if (_calcAllResultCache.byFile.has(file)) return _calcAllResultCache.byFile.get(file);
+  const result = calcAll(body);
+  _calcAllResultCache.byFile.set(file, result);
+  return result;
+}
+
 // ---- 全仕入先 横断の損益インパクト集計 ---------------------------------
 //  損益パネルは「全社」の影響を見るためのものなので、選択中の1ファイルだけでなく
 //  input/ にある全仕入先の最新照合結果（=画面の「対象」ドロップダウンと同じ集合）を
@@ -594,7 +782,7 @@ function impactAllSuppliers(body) {
   const perSupplier = [];
   for (const f of files) {
     try {
-      const r = calcAll({ file: f, rule, rounding, selfUplift });
+      const r = calcAllCached({ file: f, rule, rounding, selfUplift });
       const s = r.summary || {};
       const tc = fin(s.totalCostImpact) ? s.totalCostImpact : 0;
       const ts = fin(s.totalSellImpact) ? s.totalSellImpact : 0;
@@ -625,7 +813,7 @@ function calcAllSuppliers(body) {
   const rows = [];
   for (const f of files) {
     let data;
-    try { data = calcAll({ file: f, rule, rounding, selfUplift }); } catch (e) { continue; }
+    try { data = calcAllCached({ file: f, rule, rounding, selfUplift }); } catch (e) { continue; }
     const sup = (data.supplier || (String(f).split('_照合結果_')[0]) || '').trim();
     for (const r of data.rows) rows.push(Object.assign({ supplier: sup }, r));
   }
@@ -860,12 +1048,23 @@ function buildProductLinkCheck() {
 // 販売実績レコードのキャッシュ（自社品検索の連打で毎回DB/ファイルを読まないよう短時間キャッシュ）。
 //  ※ 照合(shogo)は毎回フレッシュに読むのでこのキャッシュは「自社品検索」専用。force で破棄して読み直せる。
 let _hanbaiCache = null; // { at, records }
+// buildCustomerCandidates の「全CSV×calcAll→byCustomer」結果キャッシュ。
+//  行まるめ/行ルール/手入力売価などは split 段だけ再実行＝再照合なしの再計算を高速化。
+let _candRawCache = null; // { key, byCustomer, fileCount, errors, thr, baseMeta }
 // 照合し直したら呼ぶ：自社品検索キャッシュ（5分TTL）と照合結果CSVキャッシュを破棄して次回フレッシュに読む。
 function invalidateCaches() {
   _hanbaiCache = null;
+  _candRawCache = null;
+  _calcAllResultCache = null;
   _latestCsvCache = null;
   invalidateMakerCaches();
   try { cache.clear(); } catch (_) {}
+}
+// 「販売実績や照合結果CSVは変わらないが calcAll の結果に効く」変更（手動紐付け・得意先除外）のあとに呼ぶ軽量版。
+//  販売実績(_hanbaiCache)やCSV一覧は破棄せず、計算結果キャッシュだけ捨てて即時に表示へ反映する。
+function invalidateCalcCaches() {
+  _candRawCache = null;
+  _calcAllResultCache = null;
 }
 function getHanbaiRecordsCached(force) {
   const TTL = 5 * 60 * 1000; // 5分（DB読取は約1.5秒・ファイルも数秒かかるため）
@@ -962,7 +1161,7 @@ function calcByDate(body) {
   const supSet = new Set();
   for (const f of files) {
     let res;
-    try { res = calcAll({ file: f, rule, rounding, selfUplift }); } catch (e) { continue; }
+    try { res = calcAllCached({ file: f, rule, rounding, selfUplift }); } catch (e) { continue; }
     const sup = res.supplier || String(f).split('_照合結果_')[0] || '';
     for (const r of (res.rows || [])) {
       if (!r.customerName || r.customerName === '-' || /未一致/.test(r.matchStatus || '')) continue; // 休眠/未一致は除外
@@ -996,8 +1195,14 @@ function calcByDate(body) {
     String(a.customerName).localeCompare(String(b.customerName), 'ja') ||
     String(a.productName).localeCompare(String(b.productName), 'ja'));
   // 進捗の内訳（提出済み／検討中／未提出）。カレンダー日付ビューの「どこまで進んだか」表示用。
-  const statusCounts = { issued: 0, hold: 0, todo: 0 };
-  for (const r of rows) { const s = r.itemStatus; if (s === 'issued') statusCounts.issued++; else if (s === 'hold') statusCounts.hold++; else statusCounts.todo++; }
+  const statusCounts = { issued: 0, hold: 0, manual: 0, todo: 0 };
+  for (const r of rows) {
+    const s = r.itemStatus;
+    if (s === 'issued') statusCounts.issued++;
+    else if (s === 'hold') statusCounts.hold++;
+    else if (s === 'manual') statusCounts.manual++;
+    else statusCounts.todo++;
+  }
   return { ok: true, date, rows, summary: summarizeRows(rows), count: rows.length, supplierCount: supSet.size, statusCounts };
 }
 
@@ -1020,7 +1225,7 @@ function buildCalendar() {
   const itemStatus = readItemStatus(); // 提出済みアイテムの実施日（自社製造＝切替日なしでも提出見積の実施日を反映）
   for (const f of files) {
     let data;
-    try { data = calcAll({ file: f }); } catch (e) { continue; }
+    try { data = calcAllCached({ file: f }); } catch (e) { continue; }
     const sup = (data.supplier || (String(f).split('_照合結果_')[0]) || '').trim();
     if (sup && !suppliers.includes(sup)) suppliers.push(sup);
     for (const r of data.rows) {
@@ -1035,6 +1240,7 @@ function buildCalendar() {
         customer: r.customerName,
         product: r.productNameCore || (r.productName && r.productName !== '-' ? r.productName : '') || r.makerName || '(商品名なし)',
         supplier: sup,
+        itemStatus: (st && st.s) || '', // ''=未提出/対象 / hold=検討中 / manual=手動修正 / issued=提出済み
       });
     }
   }
@@ -1096,7 +1302,14 @@ function normDateInput(v) {
 // 実施日が「有効な日付（ISO YYYY-MM-DD）」かどうか。normDateInput は解釈不能な入力
 //  （空・「未定」等）を ISO に揃えられないので、その判定に使う＝得意先ページの見積発行で実施日を必須にする。
 function isValidEff(v) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(v == null ? '' : v).trim());
+  const s = String(v == null ? '' : v).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  // 形だけでなく「実在する日付」かを確認（2026-02-31 / 2026-99-01 等を弾く）。
+  //  発行ゲートと基幹CSV(splitIsoDate)の不整合を防ぐ。
+  const y = Number(s.slice(0, 4)), mo = Number(s.slice(5, 7)), da = Number(s.slice(8, 10));
+  if (mo < 1 || mo > 12 || da < 1 || da > 31) return false;
+  const d = new Date(y, mo - 1, da);
+  return d.getFullYear() === y && d.getMonth() === mo - 1 && d.getDate() === da;
 }
 // 売価の手入力を「クリーンな数値」に揃える。¥ / 円 / カンマ / 全角 / 余分な空白を除去。
 //  数値にできなければ null（＝手入力なしとして扱い、ルール計算に戻す）。
@@ -1275,8 +1488,7 @@ function buildMakerImportHint(supplier, previewItems) {
   };
   const items = Array.isArray(previewItems) ? previewItems : [];
   if (items.length) {
-    const merged = getMergedMakerMap();
-    const existing = merged.get(supplier) || [];
+    const existing = getMakerItemsForSupplier(supplier);
     const keySet = new Set(existing.map((it) => makerProdKey(it)));
     let matched = 0;
     let withKey = 0;
@@ -1323,10 +1535,10 @@ function safeOpenPath(rel) {
 
 function saveMakerQuote(body) {
   const supplier = String((body && body.supplier) || '').trim() || '仕入先不明';
-  const items = Array.isArray(body && body.items) ? body.items : [];
-  if (!items.length) return { ok: false, error: 'データがありません' };
+  const rawItems = Array.isArray(body && body.items) ? body.items : [];
+  if (!rawItems.length) return { ok: false, error: 'データがありません' };
   // クライアントを信用せず、保存時に必ず銭丸め（2.54999 → 2.55）
-  for (const it of items) {
+  for (const it of rawItems) {
     if (it.currentCost != null && String(it.currentCost).trim() !== '') {
       if (Number.isFinite(sen(it.currentCost))) it.currentCost = senStr(it.currentCost);
     }
@@ -1341,6 +1553,30 @@ function saveMakerQuote(body) {
       : (((getMakers() || {})[supplier] || {}).purchaseCode || '')
   ).trim();
   const isSelfMade = effPurchase === '9000';
+  // Web取込も照合/xlsx経路と同じく非商品行を除外（運賃案内・見出し再掲等）
+  const items = [];
+  let droppedNoise = 0;
+  for (const it of rawItems) {
+    if (isNoiseRow({
+      name: it.makerName,
+      makerCode: it.makerCode,
+      currentCost: it.currentCost,
+      newCost: it.newCost,
+    })) {
+      droppedNoise++;
+      continue;
+    }
+    items.push(it);
+  }
+  if (!items.length) {
+    return {
+      ok: false,
+      error: droppedNoise
+        ? '取り込み対象が非商品行のみです（運賃案内・見出し再掲などは保存されません）'
+        : 'データがありません',
+      droppedNoise,
+    };
+  }
   // 防止策①（自動補完）：自社製造は「メーカー品番＝自社商品コード」。自社コード欄(selfCode)に入れていて
   //  メーカー品番が空なら、照合(matchSelf)が使う makerCode へ補完する＝どちらの列に入れても照合でき、
   //  自社コード無しの重複休眠を未然に防ぐ。
@@ -1392,6 +1628,7 @@ function saveMakerQuote(body) {
     }
   }
   const result = { ok: true, count: items.length, file: 'maker_quotes/' + fname, linkedCount };
+  if (droppedNoise) result.droppedNoise = droppedNoise;
   invalidateMakerCaches(); // 新CSV追加＝統合キャッシュを破棄（照合前でも取込ヒントに反映）
   const skippedItems = Array.isArray(body && body.skippedItems) ? body.skippedItems : [];
   if (skippedItems.length || items.length) {
@@ -1399,7 +1636,9 @@ function saveMakerQuote(body) {
       const saved = updateImportSkips(supplier, items, skippedItems);
       if (skippedItems.length) result.recordedSkips = skippedItems.length;
       result.savedSkipTotal = saved.length;
-    } catch (_) { /* 記録失敗でも見積保存は成功 */ }
+    } catch (e) {
+      result.skipRecordError = String(e && e.message || e);
+    }
   }
   // 防止策②（警告）：自社製造で、補完しても自社コードが全く無い商品は照合できず休眠になる→重複の原因。
   if (isSelfMade) {
@@ -1452,7 +1691,7 @@ function refreshSelfFromDb() {
 }
 
 function exportQuotes(body) {
-  const calc = calcAll(body);
+  const calc = calcAllCached(body);
   const { rows } = calc;
   const supplier = calc.supplier || '';
   // 提出先のある明細だけ（未一致・得意先なしは除外）
@@ -1578,36 +1817,61 @@ function exportQuotes(body) {
 //  未指定の項目は settings.json の既定値にフォールバック（＝従来どおり）。
 // 共通コア：全CSVを計算し、得意先ごとに keep（見積書に載る）/ review（要確認）へ分けて返す。
 //  表示(aggregateCustomers)と出力(exportCustomerQuotes)の両方がこれを使う＝画面と提出物が必ず一致。
-function buildCustomerCandidates(opts) {
+function candCacheBaseKey(opts) {
+  opts = opts || {};
+  const st = getSettings();
+  const dflt = st.default || {};
+  const files = listLatestCsv();
+  return JSON.stringify({
+    files,
+    ruleType: opts.ruleType || dflt.type || 'add_increase',
+    factor: Number.isFinite(Number(opts.factor)) ? Number(opts.factor) : ((dflt.factor) || 1.25),
+    roundingUnit: Number.isFinite(Number(opts.roundingUnit)) ? Number(opts.roundingUnit) : ((st.rounding && st.rounding.unit) || 0.01),
+    roundingMode: opts.roundingMode || (st.rounding && st.rounding.mode) || 'round',
+    selfUplift: Number.isFinite(Number(opts.selfUplift)) ? Number(opts.selfUplift) : Number((st.selfCostUplift && st.selfCostUplift.rate) || 0),
+    matchThreshold: (st.matchThreshold != null ? st.matchThreshold : 80), // しきい値変更を要確認判定へ反映（古いraw候補を使い回さない）
+  });
+}
+// 照合CSVに指定得意先の一致行があるか（getRecs のみ＝calcAll より軽い）。
+function fileHasCustomerMatched(file, customerName) {
+  try {
+    const recs = getRecs(file);
+    for (const rec of recs) {
+      const cust = rec.customerName || rec['得意先名'] || '';
+      if (cust !== customerName || !cust || cust === '-') continue;
+      const st = rec.matchStatus || rec['照合'] || '';
+      if (/未一致/.test(st) || /休眠/.test(st)) continue;
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
+// 全仕入先CSVを calcAll し、得意先→商品候補の生マップを作る（行まるめ等の split 前段）。
+//  opts.customerFilter があるときはその得意先が載るファイルだけ calcAll（得意先別の遅延取得を軽くする）。
+function buildCustomerRawMap(opts) {
   opts = opts || {};
   const st = getSettings();
   const thr = Number.isFinite(Number(st.matchThreshold)) ? Number(st.matchThreshold) : 80;
   const dflt = st.default || {};
   const ruleType = opts.ruleType || dflt.type || 'add_increase';
-  // 自社製造（メーカーコード9000）判定用。原価0で「値上げなのに同額」を要確認に落とさないため。
-  const makersProf = getMakers() || {};
-  const isSelfMadeSup = (sup) => String((makersProf[sup] || {}).purchaseCode || '').trim() === '9000';
   const factor = Number.isFinite(Number(opts.factor)) ? Number(opts.factor) : ((dflt.factor) || 1.25);
   const rounding = {
     unit: Number.isFinite(Number(opts.roundingUnit)) ? Number(opts.roundingUnit) : ((st.rounding && st.rounding.unit) || 0.01),
     mode: opts.roundingMode || (st.rounding && st.rounding.mode) || 'round',
   };
   const selfUplift = Number.isFinite(Number(opts.selfUplift)) ? Number(opts.selfUplift) : Number((st.selfCostUplift && st.selfCostUplift.rate) || 0);
-  const forceDate = String(opts.forceEffectiveDate || '').trim(); // 実施日 一括上書き（空なら各行の切替日）
-  const baseBody = {
-    rule: { type: ruleType, factor },
-    rounding,
-    selfUplift,
-  };
-  // 仕入先ごと最新1本だけ読む（案A：照合は仕入先ごとに統合済み＝最新の取り込みが反映される）。
-  //  以前は input/ の全CSVを読んでいたため、古い照合結果が混ざって更新前の価格が残る恐れがあった。
-  const files = listLatestCsv();
-  // 得意先名 -> Map(key=仕入先\u0001商品 -> { supplier, r, score, priceReason })
+  const baseBody = { rule: { type: ruleType, factor }, rounding, selfUplift };
+  const customerFilter = String(opts.customerFilter || '').trim();
+  let files = listLatestCsv();
+  if (customerFilter) {
+    files = files.filter((f) => fileHasCustomerMatched(f, customerFilter));
+  }
   const byCustomer = new Map();
   const errors = [];
   for (const file of files) {
     let calc;
-    try { calc = calcAll(Object.assign({ file }, baseBody)); }
+    try { calc = calcAllCached(Object.assign({ file }, baseBody)); }
     catch (e) { errors.push({ file, error: String(e && e.message || e) }); continue; }
     const supplier = calc.supplier || file;
     const rows = calc.rows || [];
@@ -1618,16 +1882,37 @@ function buildCustomerCandidates(opts) {
       const m = byCustomer.get(cust);
       const prodKey = (r.productCode != null && String(r.productCode).trim() !== '')
         ? normName(r.productCode) : ('名:' + normName(r.productName));
-      const key = supplier + '\u0001' + prodKey; // 仕入先が違えば別行（統合見積書と同じ扱い）
+      const key = supplier + '\u0001' + prodKey;
       const cand = { supplier, r, score: matchScore(r.matchStatus), priceReason: r.priceWarning || r.costConflict };
       const prev = m.get(key);
       if (!prev) { m.set(key, cand); }
       else if (cand.score > prev.score ||
         (cand.score === prev.score && makerTokenCount(r.makerName) > makerTokenCount(prev.r.makerName))) {
-        m.set(key, cand); // 同一仕入先×同一商品が複数CSVに出たら信頼できる方
+        m.set(key, cand);
       }
     }
   }
+  return { byCustomer, fileCount: files.length, errors, thr, ruleType, factor, rounding, selfUplift };
+}
+function buildCustomerCandidates(opts) {
+  opts = opts || {};
+  const st = getSettings();
+  const dflt = st.default || {};
+  const customerFilter = String(opts.customerFilter || '').trim();
+  const cacheKey = candCacheBaseKey(opts);
+  let raw;
+  if (!customerFilter && _candRawCache && _candRawCache.key === cacheKey) {
+    raw = _candRawCache;
+  } else {
+    const built = buildCustomerRawMap(opts);
+    raw = Object.assign({ key: customerFilter ? (cacheKey + '|' + customerFilter) : cacheKey }, built);
+    if (!customerFilter) _candRawCache = raw;
+  }
+  const { byCustomer: rawByCustomer, fileCount, errors, thr, ruleType, factor, rounding, selfUplift } = raw;
+  // 自社製造（メーカーコード9000）判定用。原価0で「値上げなのに同額」を要確認に落とさないため。
+  const makersProf = getMakers() || {};
+  const isSelfMadeSup = (sup) => String((makersProf[sup] || {}).purchaseCode || '').trim() === '9000';
+  const forceDate = String(opts.forceEffectiveDate || '').trim(); // 実施日 一括上書き（空なら各行の切替日）
   // 行ごと転嫁ルール（得意先ページで営業が微調整）。{ rowKey: ruleType }。無ければ全体ルール。
   const rowRules = (opts.rowRules && typeof opts.rowRules === 'object') ? opts.rowRules : {};
   // 行ごと 改定後売価／実施日 の手入力（得意先ページで直接入力）。{ rowKey: 値 }。
@@ -1639,16 +1924,22 @@ function buildCustomerCandidates(opts) {
   const rowRound = (opts.rowRound && typeof opts.rowRound === 'object') ? opts.rowRound : {};
   // 行ごと 掛率（行ルール=掛率×のときのその行の掛率）。{ rowKey: 数値 }。無ければ全体の factor。
   const rowFactor = (opts.rowFactor && typeof opts.rowFactor === 'object') ? opts.rowFactor : {};
-  // 価格帯別ルール（全体反映）：現売価で転嫁ルールを変える。[{max:数値|null, rule, factor}] を max 昇順（null=それ以上は最後）。
-  //  優先順位＝手入力売価 > 行ルール上書き > 価格帯別 > 全体ルール。行ルール上書きが無い行にだけ帯ルールを当てる。
+  // 価格帯別ルール（全体反映）：現売価で転嫁ルール・まるめを変える。[{max, rule, factor, roundUnit, roundMode}] を max 昇順（null=それ以上は最後）。
+  //  優先順位＝手入力売価 > 行ルール上書き > 価格帯別 > 全体ルール。まるめ＝行まるめ > 価格帯別まるめ > 全体まるめ。
   let priceBands = [];
   if (Array.isArray(opts.priceBands)) {
     priceBands = opts.priceBands
-      .map((b) => ({
-        max: (b && b.max != null && Number.isFinite(Number(b.max))) ? Number(b.max) : null,
-        rule: String((b && b.rule) || '').trim(),
-        factor: (b && Number.isFinite(Number(b.factor)) && Number(b.factor) > 0) ? Number(b.factor) : factor,
-      }))
+      .map((b) => {
+        const ru = Number(b && b.roundUnit);
+        const rm = String((b && b.roundMode) || '').trim();
+        return {
+          max: (b && b.max != null && Number.isFinite(Number(b.max))) ? Number(b.max) : null,
+          rule: String((b && b.rule) || '').trim(),
+          factor: (b && Number.isFinite(Number(b.factor)) && Number(b.factor) > 0) ? Number(b.factor) : factor,
+          roundUnit: (ru === 1 || ru === 0.1 || ru === 0.01) ? ru : null,
+          roundMode: (rm === 'floor' || rm === 'round' || rm === 'ceil') ? rm : '',
+        };
+      })
       .filter((b) => b.rule);
     priceBands.sort((a, b) => (a.max == null ? Infinity : a.max) - (b.max == null ? Infinity : b.max));
   }
@@ -1662,7 +1953,8 @@ function buildCustomerCandidates(opts) {
   // keep（見積書に載る）/ review（要確認）へ振り分け（理由つき）
   const itemStatusMap = readItemStatus(); // アイテムの状態（検討中/提出済み）。keep行に status を付ける。
   const byCustomerSplit = new Map(); // name -> { keep:[item], review:[item] }
-  for (const [name, m] of byCustomer) {
+  for (const [name, m] of rawByCustomer) {
+    if (customerFilter && name !== customerFilter) continue;
     const keep = [], review = [];
     for (const cand of m.values()) {
       const r = cand.r;
@@ -1678,8 +1970,9 @@ function buildCustomerCandidates(opts) {
       // 価格帯別ルール：行ルール上書きが無い行にだけ、現売価で帯のルール/掛率を当てる。
       const band = hasRowRuleOv ? null : bandFor(r.currentSell);
       const effRuleType = hasRowRuleOv ? ov : (band && band.rule ? band.rule : ruleType);
-      // まるめの上書き "単位|処理"（例 "1|floor"）を解釈。無ければ全体の rounding。
+      // まるめ：行上書き > 価格帯別 > 全体。
       let effRounding = rounding;
+      let roundDiffers = false;
       const roundOv = rowRound[rowKey];
       const roundManual = roundOv != null && String(roundOv).trim() !== '';
       if (roundManual) {
@@ -1691,15 +1984,21 @@ function buildCustomerCandidates(opts) {
           if (pr[0] !== '' && Number.isFinite(u) && (u === 1 || u === 0.1 || u === 0.01)) eu = u;
           const m = pr[1] || '';
           if (m === 'floor' || m === 'round' || m === 'ceil') em = m;
-          effRounding = { unit: eu, mode: em };
         } else {
           const u = parseFloat(s);
           if (Number.isFinite(u) && u > 0 && (u === 1 || u === 0.1 || u === 0.01)) {
-            effRounding = { unit: u, mode: rounding.mode };
+            eu = u;
           } else if (s === 'floor' || s === 'round' || s === 'ceil') {
-            effRounding = { unit: rounding.unit, mode: s };
+            em = s;
           }
         }
+        effRounding = { unit: eu, mode: em };
+        roundDiffers = effRounding.unit !== rounding.unit || effRounding.mode !== rounding.mode;
+      } else if (band && (band.roundUnit != null || band.roundMode)) {
+        const eu = (band.roundUnit === 1 || band.roundUnit === 0.1 || band.roundUnit === 0.01) ? band.roundUnit : rounding.unit;
+        const em = (band.roundMode === 'floor' || band.roundMode === 'round' || band.roundMode === 'ceil') ? band.roundMode : rounding.mode;
+        effRounding = { unit: eu, mode: em };
+        roundDiffers = effRounding.unit !== rounding.unit || effRounding.mode !== rounding.mode;
       }
       // 掛率（markupのとき）：行掛率 > 帯の掛率 > 全体factor。
       let effFactor = factor;
@@ -1710,7 +2009,6 @@ function buildCustomerCandidates(opts) {
       }
       // ルール／まるめ／掛率 のいずれかが全体と違えば、その行だけ再計算（全体と同じ calcRow 経路＝ズレない）。
       const ruleDiffers = effRuleType !== ruleType;
-      const roundDiffers = roundManual && (effRounding.unit !== rounding.unit || effRounding.mode !== rounding.mode);
       const factorDiffers = effFactor !== factor;
       if (ruleDiffers || roundDiffers || factorDiffers) {
         const rr = calcRow(r, { default: { type: effRuleType, factor: effFactor }, overrides: [], rounding: effRounding, selfCostUplift: { rate: selfUplift } });
@@ -1748,7 +2046,7 @@ function buildCustomerCandidates(opts) {
       //  価格異常・低一致のゲートでは弾かない＝再照合や全体ルール変更で「提出済みが要確認に落ちて消える／
       //  発行時単価が復元されず基幹CSVに出ない」事故を防ぐ（CLAUDE.md: 発行時単価保存の方針を徹底）。
       const stEntry = (itemStatusMap[name] && itemStatusMap[name][rowKey]) || null;
-      item.status = (stEntry && stEntry.s) || ''; // ''=対象 / 'hold'=検討中 / 'issued'=提出済み
+      item.status = (stEntry && stEntry.s) || ''; // ''=対象 / 'hold'=検討中 / 'manual'=手動修正 / 'issued'=提出済み
       if (item.status === 'issued') {
         item.issuedAt = stEntry.at || ''; item.issuedQuoteNo = stEntry.quoteNo || '';
         // 提出済みは「発行に使った実施日」を採用（自社製造＝切替日なしでも実施日が残り、単価履歴CSV/カレンダーに反映）。
@@ -1760,11 +2058,28 @@ function buildCustomerCandidates(opts) {
         keep.push(item); // 提出済み＝発行済みの確定行。価格異常・低一致のゲートを通さずそのまま採用する。
         continue;
       }
-      // 以下は提出済み以外（対象/検討中）＝価格異常・低一致を判定して要確認(review)へ振り分ける。
+      if (item.status === 'hold') {
+        keep.push(item); // 検討中＝見積から除外。あとで対象に戻して検討・発行できる。
+        continue;
+      }
+      if (item.status === 'manual') {
+        item.manualAt = stEntry.at || '';
+        if (stEntry.sell != null && Number.isFinite(Number(stEntry.sell))) item.newSell = Number(stEntry.sell);
+        if (stEntry.cost != null && Number.isFinite(Number(stEntry.cost))) item.newCost = Number(stEntry.cost);
+        if (stEntry.eff) { item.effectiveDate = stEntry.eff; item.noEff = !isValidEff(item.effectiveDate); }
+        if (stEntry.note) item.note = stEntry.note;
+        if (stEntry.productName) item.productName = stEntry.productName;
+        if (stEntry.supplier) item.supplier = stEntry.supplier;
+        if (stEntry.productCode) item.productCode = stEntry.productCode;
+        if (stEntry.matchStatus) item.matchStatus = stEntry.matchStatus;
+        keep.push(item); // 手動修正＝見積から除外。登録時の単価等をスナップショットで保持。
+        continue;
+      }
+      // 以下は提出済み・検討中・手動修正以外（対象）＝価格異常・低一致を判定して要確認(review)へ振り分ける。
       // 価格異常は「行ごと上書き後の改定後売価・ルール」で判定し直す（古い全体ルールの判定を使わない）。
       //  例: 全体=値上げ → ある行だけ keep_sell/手入力に上書きしても、上書き後の値で正しく判定。
       //  costConflict（同一メーカー品番に新仕入が複数＝売価に依らないメーカー見積の重複）は売価上書きと無関係なので元判定を保持。
-      const effPriceWarning = priceRowAnomaly(item.currentSell, item.newSell, ruleForRow, isSelfMadeSup(cand.supplier));
+      const effPriceWarning = priceRowAnomaly(item.currentSell, item.newSell, ruleForRow, isSelfMadeSup(cand.supplier), item.currentCost, item.newCost);
       const effPriceReason = effPriceWarning || (cand.r.costConflict || '');
       if (effPriceReason) { review.push(Object.assign({ reason: effPriceReason, reasonType: 'price' }, item)); continue; } // 価格異常
       if (cand.score < thr) { review.push(Object.assign({ reason: '一致度が低い（' + (r.matchStatus || '') + '）', reasonType: 'match' }, item)); continue; } // 低一致
@@ -1773,39 +2088,126 @@ function buildCustomerCandidates(opts) {
     byCustomerSplit.set(name, { keep, review });
   }
   const applied = { ruleType, factor, roundingUnit: rounding.unit, roundingMode: rounding.mode, selfUplift, forceEffectiveDate: forceDate, priceBands };
-  return { byCustomer: byCustomerSplit, fileCount: files.length, errors, thr, applied };
+  return { byCustomer: byCustomerSplit, fileCount, errors, thr, applied };
 }
 
+const bySupNameCust = (a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.productName).localeCompare(String(b.productName), 'ja');
+// split 結果から /customers 画面用の1得意先レコードを組み立てる。
+function customerRecordFromSplit(name, split, masterMap) {
+  const { keep, review } = split;
+  // 要確認(review)だけの得意先も画面に出す（軽量一覧の件数と明細の不整合を防ぐ）。
+  if (!keep.length && !review.length) return null;
+  const active = keep.filter((p) => !p.status).sort(bySupNameCust);
+  const holdProducts = keep.filter((p) => p.status === 'hold').sort(bySupNameCust);
+  const manualProducts = keep.filter((p) => p.status === 'manual').sort(bySupNameCust);
+  const issuedProducts = keep.filter((p) => p.status === 'issued').sort(bySupNameCust);
+  const suppliers = [...new Set(active.map((p) => p.supplier))].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
+  const allItems = keep;
+  const code = (allItems.find((p) => p.customerCode && String(p.customerCode).trim()) || {}).customerCode || '';
+  const kana = (code && masterMap[code] && masterMap[code].kana) || '';
+  const hasRecent = allItems.some((p) => Number(p.annualQty) > 0);
+  let lastDate = '';
+  for (const p of allItems) { if (p.lastDate && p.lastDate > lastDate) lastDate = p.lastDate; }
+  return {
+    name, code, kana, hasRecent, lastDate,
+    productCount: active.length, supplierCount: suppliers.length,
+    suppliers, reviewCount: review.length, products: active,
+    holdProducts, manualProducts, issuedProducts,
+    holdCount: holdProducts.length, manualCount: manualProducts.length, issuedCount: issuedProducts.length,
+  };
+}
 // /customers 画面の表示用。keep だけを「該当商品」に集め、要確認は件数のみ返す（従来互換）。
+// opts.refreshOne + opts.customer ＝選択中得意先だけ返す（partial:true）＝再計算の体感を軽くする。
 function aggregateCustomers(opts) {
-  const { byCustomer, fileCount, errors, applied } = buildCustomerCandidates(opts);
-  const masterMap = getCustomerMasterMap(); // 得意先コード→{name,kana}（DB直結時のみ・無ければ空）
+  opts = opts || {};
+  const refreshOne = !!(opts.refreshOne && opts.customer);
+  const customerName = refreshOne ? String(opts.customer).trim() : '';
+  const buildOpts = refreshOne ? Object.assign({}, opts, { customerFilter: customerName }) : opts;
+  const { byCustomer, fileCount, errors, applied } = buildCustomerCandidates(buildOpts);
+  const masterMap = getCustomerMasterMap();
+  if (refreshOne && customerName) {
+    const split = byCustomer.get(customerName);
+    const customer = split ? customerRecordFromSplit(customerName, split, masterMap) : null;
+    return { partial: true, customer, fileCount, errors, applied };
+  }
   const customers = [];
-  const bySupName = (a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.productName).localeCompare(String(b.productName), 'ja');
-  for (const [name, { keep, review }] of byCustomer) {
-    if (!keep.length) continue;
-    // 状態で3分割：対象（見積に載る）／検討中（除外）／提出済み（別枠）
-    const active = keep.filter((p) => !p.status).sort(bySupName);
-    const holdProducts = keep.filter((p) => p.status === 'hold').sort(bySupName);
-    const issuedProducts = keep.filter((p) => p.status === 'issued').sort(bySupName);
-    const suppliers = [...new Set(active.map((p) => p.supplier))].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
-    // 得意先コード（全アイテム共通）と 検索カナ（DBマスタから）。取引あり＝直近約1年に数量がある品が1つでもある。
-    const allItems = keep; // 対象/検討中/提出済み すべてからコード・取引判定を拾う
-    const code = (allItems.find((p) => p.customerCode && String(p.customerCode).trim()) || {}).customerCode || '';
-    const kana = (code && masterMap[code] && masterMap[code].kana) || '';
-    const hasRecent = allItems.some((p) => Number(p.annualQty) > 0);
-    // 最終売上日＝この得意先の全アイテム中で最新の売上日（ISO）。得意先ページの「過去N年」フィルタに使う。
-    let lastDate = '';
-    for (const p of allItems) { if (p.lastDate && p.lastDate > lastDate) lastDate = p.lastDate; }
-    customers.push({
-      name, code, kana, hasRecent, lastDate,
-      productCount: active.length, supplierCount: suppliers.length,
-      suppliers, reviewCount: review.length, products: active,
-      holdProducts, issuedProducts, holdCount: holdProducts.length, issuedCount: issuedProducts.length,
-    });
+  for (const [name, split] of byCustomer) {
+    const rec = customerRecordFromSplit(name, split, masterMap);
+    if (rec) customers.push(rec);
   }
   customers.sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
   return { customers, fileCount, errors, applied };
+}
+
+// /customers 起動用の軽量一覧：getRecs のみで得意先名・件数・コード等を集計（calcAll/calcRow なし）。
+//  明細（価格・行ルール）は得意先選択時に aggregateCustomers(refreshOne) で遅延取得する。
+function aggregateCustomersSummary() {
+  const files = listLatestCsv();
+  const excludedCust = getExcludedCustomers();
+  const masterMap = getCustomerMasterMap();
+  const itemStatusMap = readItemStatus();
+  const byName = new Map();
+  const errors = [];
+  for (const file of files) {
+    let recs;
+    try { recs = getRecs(file); } catch (e) { errors.push({ file, error: String(e && e.message || e) }); continue; }
+    const supplier = String(file).split('_照合結果_')[0] || '';
+    for (const rec of recs) {
+      const cust = rec.customerName || rec['得意先名'] || '';
+      if (!cust || cust === '-' || excludedCust[cust]) continue;
+      const st = rec.matchStatus || rec['照合'] || '';
+      if (/未一致/.test(st) || /休眠/.test(st)) continue;
+      if (!byName.has(cust)) {
+        byName.set(cust, {
+          keys: new Set(), suppliers: new Set(),
+          customerCode: '', lastDate: '', hasRecent: false, earliestEff: '',
+          holdCount: 0, manualCount: 0, issuedCount: 0,
+        });
+      }
+      const c = byName.get(cust);
+      const prodKey = (rec.productCode != null && String(rec.productCode).trim() !== '')
+        ? normName(String(rec.productCode)) : ('名:' + normName(rec.productName));
+      c.keys.add(supplier + '\u0001' + prodKey);
+      if (supplier) c.suppliers.add(supplier);
+      if (rec.customerCode && String(rec.customerCode).trim()) c.customerCode = String(rec.customerCode).trim();
+      if (rec.lastDate && rec.lastDate > c.lastDate) c.lastDate = rec.lastDate;
+      if (Number(rec.qty) > 0) c.hasRecent = true;
+      const effRaw = (rec.effectiveDate && String(rec.effectiveDate).trim()) || rec.switchDate || '';
+      const eff = normDateInput(effRaw);
+      if (isValidEff(eff) && (!c.earliestEff || eff < c.earliestEff)) c.earliestEff = eff;
+    }
+  }
+  // 品目ステータス（検討中/手動修正/提出済み）の件数だけ先に付与（価格計算は不要）。
+  for (const [name, ent] of Object.entries(itemStatusMap)) {
+    if (!byName.has(name)) continue;
+    let hold = 0, manual = 0, issued = 0;
+    for (const rk of Object.keys(ent)) {
+      if (ent[rk].s === 'hold') hold++;
+      else if (ent[rk].s === 'manual') manual++;
+      else if (ent[rk].s === 'issued') issued++;
+    }
+    const c = byName.get(name);
+    c.holdCount = hold;
+    c.manualCount = manual;
+    c.issuedCount = issued;
+  }
+  const customers = [];
+  for (const [name, c] of byName) {
+    if (!c.keys.size) continue;
+    const code = c.customerCode || '';
+    const kana = (code && masterMap[code] && masterMap[code].kana) || '';
+    const suppliers = [...c.suppliers].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
+    customers.push({
+      name, code, kana, hasRecent: !!c.hasRecent, lastDate: c.lastDate || '',
+      productCount: c.keys.size, supplierCount: suppliers.length, suppliers,
+      reviewCount: 0, holdCount: c.holdCount, manualCount: c.manualCount, issuedCount: c.issuedCount,
+      products: c.earliestEff ? [{ effectiveDate: c.earliestEff }] : [],
+      holdProducts: null, manualProducts: null, issuedProducts: null,
+      _lazy: true,
+    });
+  }
+  customers.sort((a, b) => String(a.name).localeCompare(String(b.name), 'ja'));
+  return { customers, fileCount: files.length, errors };
 }
 
 // 得意先 除外設定モーダル用データ：
@@ -1819,7 +2221,7 @@ function customerExclusionData() {
     const byName = new Map();
     for (const file of listLatestCsv()) {
       let calc;
-      try { calc = calcAll({ file }); } catch (e) { continue; }
+      try { calc = calcAllCached({ file }); } catch (e) { continue; }
       const supplier = calc.supplier || String(file).split('_照合結果_')[0] || '';
       for (const r of calc.rows || []) {
         const name = r.customerName;
@@ -1856,7 +2258,7 @@ function exportCustomerQuotes(opts, doIssue) {
   if (opts.scope === 'one' && opts.customer) entries = entries.filter(([n]) => n === opts.customer);
   const reviewAll = [];
   for (const [name, d] of entries) for (const rv of d.review) reviewAll.push(Object.assign({ customer: name }, rv));
-  // 見積書に載るのは「対象」のみ＝検討中(hold)・提出済み(issued)は除外。
+  // 見積書に載るのは「対象」のみ＝検討中(hold)・手動修正(manual)・提出済み(issued)は除外。
   const activeOf = (d) => d.keep.filter((p) => !p.status);
   const issuable = entries.filter(([, d]) => activeOf(d).length > 0);
   const issuableRowCount = issuable.reduce((s, [, d]) => s + activeOf(d).length, 0);
@@ -1967,7 +2369,7 @@ function collectHanbaiExportLines(cutoffIso, issuedOnly) {
       // issuedOnly（既定・推奨）＝「発行した見積のみ」＝アイテム単位で提出済み(issued)の品だけ。
       //  発行時に確定した単価(newSell/newCost)が保存済み＝CSVが見積書と完全一致。未発行は載せない。
       if (issuedOnly) { if (it.status !== 'issued') continue; }
-      else if (it.status === 'hold') continue;                 // 「改定すべて」＝検討中(除外)以外（未発行は既定再計算）
+      else if (it.status === 'hold' || it.status === 'manual') continue; // 検討中・手動修正は基幹更新に載せない
       const eff = String(it.effectiveDate || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;         // 実施日がISOで取れない行は対象外
       if (cutoff && eff > cutoff) continue;                    // まだ実施日が来ていない行は除外
@@ -2014,7 +2416,7 @@ function collectCostUpdateLines(cutoffIso) {
   const byProduct = new Map(); // 商品コード -> line（実施日が新しい方）
   for (const [, sp] of byCustomer) {
     for (const it of sp.keep) {
-      if (it.status === 'hold') continue;                  // 検討中（除外）は基幹更新にも載せない（提出済みは載せる）
+      if (it.status === 'hold' || it.status === 'manual') continue; // 検討中・手動修正は基幹更新にも載せない
       const eff = String(it.effectiveDate || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;     // 実施日がISOで取れない行は対象外
       if (cutoff && eff > cutoff) continue;                // まだ実施日が来ていない行は除外
@@ -2038,6 +2440,7 @@ function buildCostExport(cutoffIso) {
 }
 
 // ---- HTTP ----------------------------------------------------------
+const MAX_BODY_BYTES = 20 * 1024 * 1024; // POST本文上限（base64 xlsx 取込でも十分。巨大POSTによるOOM/DoS対策）
 function sendJson(res, code, obj) {
   const buf = Buffer.from(JSON.stringify(obj), 'utf8');
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': buf.length });
@@ -2046,7 +2449,16 @@ function sendJson(res, code, obj) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let total = 0;
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error('リクエスト本文が大きすぎます（上限 ' + Math.round(MAX_BODY_BYTES / 1024 / 1024) + 'MB）'));
+        return;
+      }
+      chunks.push(c);
+    });
     // 不正/空のJSONでも reject せず空オブジェクトで解決（各APIが 200+{ok:false} を返せる＝フロントの分岐が崩れない）。
     req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); } catch (e) { resolve({}); } });
     req.on('error', reject);
@@ -2106,6 +2518,9 @@ const server = http.createServer(async (req, res) => {
     // 死活確認（起動時の二重起動防止に使う）。ローカル限定・パスワード不要・機微情報なし。
     if (url === '/api/ping') {
       return sendJson(res, 200, { ok: true, app: 'kakaku-tenka-sim', rev: SIM_PAGE_REV });
+    }
+    if (url === '/api/shogo-status') {
+      return sendJson(res, 200, shogoStatusPayload());
     }
     // #2 アクセスパスワード（settings.accessPassword が設定されている場合のみ）
     const accessPw = String((getSettings().accessPassword) || '').trim();
@@ -2170,7 +2585,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url === '/api/settings') {
       const body = await readBody(req);
-      return sendJson(res, 200, { ok: true, settings: saveSettings(body || {}) });
+      try {
+        const settings = saveSettings(body || {});
+        invalidateCalcCaches(); // matchThreshold/既定ルール/端数/自社上乗せ等の変更を計算結果へ即反映
+        return sendJson(res, 200, { ok: true, settings });
+      } catch (e) {
+        // saveSettings は settings.json 破損時など保存中止で throw する＝成功扱いにしない
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
     }
     if (req.method === 'GET' && url === '/import') {
       const buf = Buffer.from(IMPORT_PAGE, 'utf8');
@@ -2202,6 +2624,9 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length });
       return res.end(buf);
     }
+    if (url === '/api/customers-summary' && (req.method === 'GET' || req.method === 'POST')) {
+      return sendJson(res, 200, aggregateCustomersSummary());
+    }
     if (url === '/api/customers' && (req.method === 'GET' || req.method === 'POST')) {
       const opts = req.method === 'POST' ? (await readBody(req)) : {};
       return sendJson(res, 200, aggregateCustomers(opts));
@@ -2219,32 +2644,55 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url === '/api/issued-quotes-list') {
       return sendJson(res, 200, { ok: true, ...buildIssuedQuotesList() });
     }
+    if (req.method === 'GET' && url === '/api/manual-corrections-list') {
+      return sendJson(res, 200, { ok: true, ...buildManualCorrectionsList() });
+    }
+    if (req.method === 'GET' && url === '/api/manual-corrections.csv') {
+      const buf = Buffer.from(buildManualCorrectionsCsv(), 'utf8');
+      res.writeHead(200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="手動修正一覧.csv"',
+        'Content-Length': buf.length,
+      });
+      return res.end(buf);
+    }
     if (req.method === 'POST' && url === '/api/issue-log-reset') {
       const body = await readBody(req);
       const cust = body && body.customer;
-      if (cust) { const log = readIssueLog(); delete log[cust]; writeIssueLog(log); } // 1得意先だけ取消
-      else { writeIssueLog({}); }                                                     // 全リセット（新サイクル用）
-      clearIssuedStatuses(cust || null); // 提出済みアイテムも対象へ戻す（検討中は残す）＝バッジと別枠を同期
+      let ok;
+      if (cust) { const log = readIssueLog(); delete log[cust]; ok = writeIssueLog(log); } // 1得意先だけ取消
+      else { ok = writeIssueLog({}); }                                                     // 全リセット（新サイクル用）
+      if (!ok) return sendJson(res, 200, { ok: false, error: '保存に失敗しました（発行履歴.json に書き込めません）' });
+      clearIssuedStatuses(cust || null); // 提出済みアイテムも対象へ戻す（検討中・手動修正は残す）＝バッジと別枠を同期
+      invalidateCalcCaches(); // 提出済みバッジ（calcAllが焼き込む itemStatus）をメイン表示へ即反映
       return sendJson(res, 200, { ok: true, log: readIssueLog() });
     }
     if (req.method === 'POST' && url === '/api/item-status') {
-      // 得意先別アイテムの状態：'hold'=検討中（見積から除外）/ ''=対象に戻す（提出済みの戻しにも使う）。
+      // 得意先別アイテムの状態：'hold'=検討中 / 'manual'=手動修正 / ''=対象に戻す。
       const body = await readBody(req);
       const customer = String((body && body.customer) || '').trim();
       const rowKey = String((body && body.rowKey) || '').trim();
-      const status = (body && body.status === 'hold') ? 'hold' : '';
+      const st = body && body.status;
+      const status = (st === 'manual' || st === 'hold') ? st : '';
       if (!customer || !rowKey) return sendJson(res, 200, { ok: false, error: 'customer と rowKey は必須です' });
-      setItemStatus(customer, rowKey, status);
+      const snap = (body && body.snapshot) || body || {};
+      const ok = setItemStatus(customer, rowKey, status, snap);
+      invalidateCalcCaches(); // 検討中/手動修正/対象 の切替を calcAll（メイン表示の非表示判定）へ即反映
+      if (!ok) return sendJson(res, 200, { ok: false, error: '保存に失敗しました（品目ステータス.json に書き込めません）' });
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === 'POST' && url === '/api/item-status-bulk') {
-      // 複数アイテムをまとめて 検討中('hold') / 対象('') へ。得意先ページのチェックボックス一括移動用。
+      // 複数アイテムをまとめて 検討中('hold') / 手動修正('manual') / 対象('') へ。
       const body = await readBody(req);
       const customer = String((body && body.customer) || '').trim();
-      const status = (body && body.status === 'hold') ? 'hold' : '';
+      const st = body && body.status;
+      const status = (st === 'manual' || st === 'hold') ? st : '';
+      const items = Array.isArray(body && body.items) ? body.items : [];
       const rowKeys = Array.isArray(body && body.rowKeys) ? body.rowKeys : [];
-      if (!customer || !rowKeys.length) return sendJson(res, 200, { ok: false, error: 'customer と rowKeys は必須です' });
-      const r = setItemStatusBulk(customer, rowKeys, status);
+      if (!customer || (!items.length && !rowKeys.length)) return sendJson(res, 200, { ok: false, error: 'customer と rowKeys/items は必須です' });
+      const r = setItemStatusBulk(customer, rowKeys, status, items.length ? items : null);
+      invalidateCalcCaches(); // 一括の状態変更も calcAll へ即反映
+      if (!r.ok) return sendJson(res, 200, { ok: false, changed: r.changed, error: '保存に失敗しました（品目ステータス.json に書き込めません）' });
       return sendJson(res, 200, { ok: true, changed: r.changed });
     }
     if (req.method === 'GET' && url === '/api/suppliers') {
@@ -2281,6 +2729,7 @@ const server = http.createServer(async (req, res) => {
       const code = String((body && body.code) || '').trim();
       if (!maker) return sendJson(res, 200, { ok: false, error: 'メーカー名が空です' });
       saveMakerProfile(maker, { purchaseCode: code });
+      invalidateCalcCaches(); // 9000=自社製造 切替は calcAll の isSelfMade/価格異常判定に効く（完全反映は↻照合）
       return sendJson(res, 200, { ok: true, maker, purchaseCode: code });
     }
     if (req.method === 'GET' && url === '/api/self-profile') {
@@ -2377,6 +2826,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const supplier = String((body && body.supplier) || '').trim();
       const rows = Array.isArray(body && body.rows) ? body.rows : [];
+      const skipMap = supplier ? importSkipMap(supplier) : null;
       const flags = rows.map((r) => {
         const base = describeNoiseRow({
           name: r.makerName,
@@ -2384,7 +2834,7 @@ const server = http.createServer(async (req, res) => {
           currentCost: r.currentCost,
           newCost: r.newCost,
         });
-        const saved = supplier ? lookupImportSkip(supplier, r) : null;
+        const saved = supplier ? lookupImportSkip(supplier, r, skipMap) : null;
         if (saved) {
           return {
             noise: base.noise,
@@ -2532,6 +2982,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const links = saveProductLink(sup, code, name);
+      invalidateCalcCaches(); // 紐付けは calcAll に即反映（古い計算結果キャッシュを破棄＝再照合せずとも画面が更新される）
       return sendJson(res, 200, { ok: true, productLinks: links, linkWarn: linkWarn || undefined });
     }
     if (req.method === 'POST' && url === '/api/maker-quote') {
@@ -2541,7 +2992,7 @@ const server = http.createServer(async (req, res) => {
       //  利用者が「↻ 照合を実行」を押さなくても対象に出るようにする。
       if (saved && saved.ok) {
         try {
-          const outFiles = runShogo(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
+          const outFiles = runShogoGuarded(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
           invalidateCaches(); // 照合し直したので古いキャッシュを破棄
           saved.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)) };
           // 二重登録の検知：取り込んだ仕入先と「別の仕入先」に同じ自社商品が出ていないか。
@@ -2553,7 +3004,9 @@ const server = http.createServer(async (req, res) => {
             if (mine.length) saved.dupWarning = { count: mine.length, supplier: mySup, items: mine.slice(0, 8) };
           } catch (_) { /* 検知失敗は無視（保存は成功） */ }
         } catch (e) {
-          saved.shogo = { ok: false, error: String(e && e.message || e) };
+          saved.shogo = e.code === 'SHOGO_BUSY'
+            ? { ok: false, busy: true, error: e.message }
+            : { ok: false, error: String(e && e.message || e) };
         }
       }
       return sendJson(res, 200, saved);
@@ -2563,10 +3016,14 @@ const server = http.createServer(async (req, res) => {
       const r = refreshSelfFromDb();
       if (r && r.ok) {
         try {
-          const outFiles = runShogo(['', '']);
+          const outFiles = runShogoGuarded(['', '']);
           invalidateCaches(); // 照合し直したので古いキャッシュを破棄
           r.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)) };
-        } catch (e) { r.shogo = { ok: false, error: String(e && e.message || e) }; }
+        } catch (e) {
+          r.shogo = e.code === 'SHOGO_BUSY'
+            ? { ok: false, busy: true, error: e.message }
+            : { ok: false, error: String(e && e.message || e) };
+        }
       }
       return sendJson(res, 200, r);
     }
@@ -2611,16 +3068,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url === '/api/shogo') {
       // メーカー見積 × 販売実績 を照合し input/ へ出力（中身は 照合.bat と同じ）
       try {
-        const outFiles = runShogo(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
+        const outFiles = runShogoGuarded(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
         invalidateCaches(); // 照合し直したので古いキャッシュ（自社品検索・照合結果）を破棄
         return sendJson(res, 200, { ok: true, files: (outFiles || []).map((f) => path.basename(f)) });
       } catch (e) {
+        if (e.code === 'SHOGO_BUSY') return sendJson(res, 200, shogoBusyJson());
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
       }
     }
     if (req.method === 'POST' && url === '/api/calc') {
       const body = await readBody(req);
-      return sendJson(res, 200, calcAll(body));
+      return sendJson(res, 200, calcAllCached(body));
     }
     if (req.method === 'POST' && url === '/api/calc-all') {
       const body = await readBody(req);
@@ -2634,12 +3092,14 @@ const server = http.createServer(async (req, res) => {
       const customer = String((body && body.customer) || '').trim();
       if (!customer) return sendJson(res, 200, { ok: false, error: '得意先名が空です' });
       setExcludedCustomer(customer, !!(body && body.exclude));
+      invalidateCalcCaches(); // 除外/復活は calcAll の対象に即反映（メイン・損益・得意先別・見積書から外す/戻す）
       return sendJson(res, 200, Object.assign({ ok: true }, customerExclusionData()));
     }
     if (req.method === 'POST' && url === '/api/exclude-customers-bulk') {
       const body = await readBody(req);
       const names = Array.isArray(body && body.names) ? body.names : [];
       setExcludedCustomersBulk(names, !!(body && body.exclude));
+      invalidateCalcCaches(); // 一括除外/復活も同様に即反映
       return sendJson(res, 200, Object.assign({ ok: true }, customerExclusionData()));
     }
     if (req.method === 'POST' && url === '/api/impact-all') {
@@ -2729,7 +3189,7 @@ const server = http.createServer(async (req, res) => {
       const sup = String((body && body.supplier) || '').trim();
       const sc = String((body && body.selfCode) || '').trim();
       if (!sup || !sc) return sendJson(res, 200, { ok: false, error: 'supplier と selfCode は必須です' });
-      try { confirmCdLink(sup, sc, (body && body.makerCode) || '', (body && body.makerName) || ''); return sendJson(res, 200, { ok: true }); }
+      try { confirmCdLink(sup, sc, (body && body.makerCode) || '', (body && body.makerName) || ''); invalidateCalcCaches(); return sendJson(res, 200, { ok: true }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
     }
     if (req.method === 'POST' && url === '/api/cd-reject') {
@@ -2737,7 +3197,7 @@ const server = http.createServer(async (req, res) => {
       const sup = String((body && body.supplier) || '').trim();
       const sc = String((body && body.selfCode) || '').trim();
       if (!sup || !sc) return sendJson(res, 200, { ok: false, error: 'supplier と selfCode は必須です' });
-      try { rejectCdLink(sup, sc, (body && body.makerCode) || ''); return sendJson(res, 200, { ok: true }); }
+      try { rejectCdLink(sup, sc, (body && body.makerCode) || ''); invalidateCalcCaches(); return sendJson(res, 200, { ok: true }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
     }
     if (req.method === 'POST' && url === '/api/cd-unconfirm') {
@@ -2745,7 +3205,7 @@ const server = http.createServer(async (req, res) => {
       const sup = String((body && body.supplier) || '').trim();
       const sc = String((body && body.selfCode) || '').trim();
       if (!sup || !sc) return sendJson(res, 200, { ok: false, error: 'supplier と selfCode は必須です' });
-      try { unconfirmCdLink(sup, sc); return sendJson(res, 200, { ok: true }); }
+      try { unconfirmCdLink(sup, sc); invalidateCalcCaches(); return sendJson(res, 200, { ok: true }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
     }
     if (req.method === 'GET' && url === '/api/cd-confirmed') {
@@ -2864,6 +3324,13 @@ if (require.main === module) {
   //  （1回のエラーで全停止すると、以降すべての操作が「Failed to fetch」になるのを防ぐ）
   process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e && e.stack || e); });
   process.on('unhandledRejection', (e) => { console.error('[unhandledRejection]', e && e.stack || e); });
+  try {
+    const pr = pruneInputCsv({ minStale: 3 });
+    if (pr.moved > 0) {
+      console.log('✓ 古い照合CSV ' + pr.moved + ' 件を input/_old/ へ退避（最新 ' + pr.kept + ' 本を残しました）');
+      invalidateCaches();
+    }
+  } catch (e) { console.error('[pruneInput]', e && e.message || e); }
   startOrReuse();
 }
 
@@ -3041,7 +3508,17 @@ const PAGE = `<!doctype html>
   #calDetail td{ border-bottom:1px solid #f1f4f7; padding:5px 8px; vertical-align:top; }
   #calDetail tr:hover td{ background:#f8fafc; }
   #calDetail .empty{ color:#9aa6b2; padding:8px 0; }
-  #calDetail .calnote{ background:#eef7ee; border:1px solid #cfe6cf; border-radius:8px; padding:10px 14px; font-size:13px; color:#2e5a2e; }
+  #calDetail .calnote{ background:#eef7ee; border:1px solid #cfe6cf; border-radius:8px; padding:10px 14px; font-size:13px; color:#2e5a2e; margin-bottom:12px; }
+  #calDetail .calsec{ margin-top:14px; }
+  #calDetail .calsec h3{ margin:0 0 6px; font-size:13px; padding:6px 10px; border-radius:6px; }
+  #calDetail .calsec.issued h3{ background:#eaf6ee; color:#1b6b3a; border-left:4px solid #1b6b3a; }
+  #calDetail .calsec.todo h3{ background:#fff8ee; color:#8a5a12; border-left:4px solid #d4a017; }
+  #calDetail .calsec.emptysec{ color:#9aa6b2; font-size:12px; padding:4px 0; }
+  .calcell .cnts{ display:flex; flex-direction:column; gap:2px; margin-top:3px; }
+  .calcell .cnt-issued,.calcell .cnt-todo,.chip .cnt-issued,.chip .cnt-todo{ display:inline-block; border-radius:999px; font-size:10px; font-weight:700; padding:1px 6px; }
+  .calcell .cnt-issued,.chip .cnt-issued{ background:#1b6b3a; color:#fff; }
+  .calcell .cnt-todo,.chip .cnt-todo{ background:#d4a017; color:#fff; }
+  .chip .cnt-hold{ display:inline-block; border-radius:999px; font-size:10px; font-weight:700; padding:1px 6px; background:#8a5a12; color:#fff; margin-left:2px; }
   #importLink{ margin-left:auto; }
   #importLink:hover, #listLink:hover, #suppliersLink:hover, #selfLink:hover{ background:#dbe8f5; }
   #settingsBtn:hover{ background:#eaf1f8; }
@@ -3064,8 +3541,10 @@ const PAGE = `<!doctype html>
   button.ghost{ background:#fff; color:var(--sub); border:1px solid #c7ced8; border-radius:8px; padding:9px 16px; font-size:13px; cursor:pointer; }
   .welcome{ background:#fff7ec; border:1px solid #f0d9a8; color:#8a5a12; padding:9px 12px; border-radius:8px; margin:0 0 12px; font-size:12px; line-height:1.6; display:none; }
   .welcome.show{ display:block; }
+${SHOGO_LOCK_CSS}
 </style></head>
 <body>
+${SHOGO_LOCK_HTML}
 <header>
   <h1>価格転嫁シミュレーション</h1>
   <span class="sub">メーカー改定額を入れて、転嫁後の単価・粗利・年間影響を試算</span>
@@ -3252,6 +3731,7 @@ const PAGE = `<!doctype html>
 </div>
 
 <script>
+${SHOGO_LOCK_JS}
 const SIM_PAGE_REV='${SIM_PAGE_REV}';
 const $ = (s) => document.querySelector(s);
 const RULE_LABEL = { add_increase:'上乗せ', keep_margin_rate:'粗利維持', markup:'掛率', sell_cost_rate:'売価×仕入率', keep_sell:'据置' };
@@ -3527,21 +4007,34 @@ async function loadFiles(selectFile){
   const r = await fetch('/api/files').then(x=>x.json());
   const sel = $('#file'); sel.innerHTML='';
   if(r.files && r.files.length){
-    // 先頭に「★全部（全仕入先まとめ）」＝取り込んでいる全件を1つの表に。既定もこれ。
-    const oAll=document.createElement('option'); oAll.value='*ALL*'; oAll.textContent='★ 全部（全仕入先まとめて表示）'; sel.appendChild(oAll);
+    // 先頭に「★全部」＝全仕入先横断（件数が多く重いので既定は各仕入先の最新1本）。
+    const oAll=document.createElement('option'); oAll.value='*ALL*'; oAll.textContent='★ 全部（全仕入先まとめて表示・重い）'; sel.appendChild(oAll);
   }
   (r.files||[]).forEach(f=>{ const o=document.createElement('option'); o.value=f; o.textContent=f; sel.appendChild(o); });
   if(!r.files || !r.files.length){ $('#msg').textContent='input フォルダに照合結果CSVがありません。「↻ 照合を実行」でメーカー見積から作れます。'; return; }
-  // 指定があればその仕入先ファイル、無ければ既定＝★全部。
-  sel.value = (selectFile && r.files.indexOf(selectFile)>=0) ? selectFile : '*ALL*';
+  // 指定があればその仕入先、無ければ最新1仕入先（前回選択を sessionStorage に記憶）。
+  let def = r.files[0];
+  try{
+    const saved = sessionStorage.getItem('simFileSel');
+    // ★全部は重いので起動時の既定復元から除外（明示選択時のみ *ALL* を使う）。
+    if(saved && saved!=='*ALL*' && r.files.indexOf(saved)>=0) def = saved;
+  }catch(e){}
+  sel.value = (selectFile && r.files.indexOf(selectFile)>=0) ? selectFile : def;
   await loadFile();
 }
 // メーカー見積×販売実績を照合し、新しい照合結果CSVを作って読み込む
 async function runShogo(){
-  const btn=$('#shogoBtn'); btn.disabled=true;
+  const btn=$('#shogoBtn');
+  if(btn.disabled) return;
+  btn.disabled=true;
+  setShogoLock(true,'メーカー見積と販売実績を照合しています…');
   $('#shogoMsg').style.color='#6b7785'; $('#shogoMsg').textContent='照合中…（販売実績の変換に時間がかかる場合があります）';
   try{
     const res=await fetch('/api/shogo',{method:'POST'}).then(x=>x.json());
+    if(res.busy){
+      $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent=res.error||'照合が既に実行中です';
+      return;
+    }
     if(res.ok){
       const newest=(res.files&&res.files.length)?res.files[res.files.length-1]:null;
       $('#shogoMsg').style.color='#2e7d32'; $('#shogoMsg').textContent='✓ 照合完了（'+(res.files?res.files.length:0)+'件のCSVを作成）';
@@ -3552,15 +4045,45 @@ async function runShogo(){
       $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent='照合できません: '+(res.error||'');
     }
   }catch(e){ $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent='照合に失敗: '+e; }
-  finally{ btn.disabled=false; }
+  finally{ btn.disabled=false; setShogoLock(false); }
 }
 
 // 進捗バッジ（実施日カレンダーの横断ビュー用）。得意先別ページの状態を表示＝この実施日の品が
 //  どこまで進んだか（提出済み／検討中で外した／まだ未提出）が一目で分かる。
 function progressBadge(st){
   if(st==='issued') return '<div style="font-size:10px;font-weight:700;color:#1f6b35;margin-top:1px">✅ 提出済み</div>';
-  if(st==='hold')   return '<div style="font-size:10px;font-weight:700;color:#8a5a12;margin-top:1px">🤔 検討中（除外）</div>';
+  if(st==='hold')   return '<div style="font-size:10px;font-weight:700;color:#8a5a12;margin-top:1px">🤔 検討中</div>';
+  if(st==='manual') return '<div style="font-size:10px;font-weight:700;color:#5a4a8a;margin-top:1px">✏ 手動修正</div>';
   return '<div style="font-size:10px;font-weight:700;color:#b1432f;margin-top:1px">⬜ 未提出</div>';
+}
+// 行メトリクス（仕入値上額・数量・年影響・改定後仕入）をHTML化。初回描画と updateView で共用。
+function costIncreaseCellHtml(r){
+  const rate = rateOf(r.currentCost, r.newCost);
+  let html = '<span class="'+signCls(r.costIncrease)+'">'+num(r.costIncrease)+'</span>';
+  if(Number.isFinite(rate)){
+    const rc = rate>0.05 ? 'pos' : (rate<-0.05 ? 'neg' : 'flat');
+    html += '<span class="ratetag '+rc+'">'+(rate>0?'+':'')+rate.toFixed(1)+'%</span>';
+  }
+  return html;
+}
+function qtyCellHtml(r){
+  if(Number.isFinite(r.qty) && r.qty>0){
+    const b = r.qtySource==='actual' ? '<span class="badge act">実</span>' : '<span class="badge est">推</span>';
+    return Math.round(r.qty).toLocaleString('ja-JP') + ' <span class="ml6">'+b+'</span>';
+  }
+  return '—';
+}
+function newCostCellHtml(r){
+  const red = r.priceWarning || r.costConflict || '';
+  let cls = 'r', extra = '', content = num(r.newCost);
+  if(red){ cls += ' pricewarn'; extra = ' title="⚠ '+esc(red)+'"'; content = '⚠ '+content; }
+  else if(r.rateWarning){ cls += ' ratewarn'; extra = ' title="注意: '+r.rateWarning+'"'; content = '▲ '+content; }
+  return { cls, extra, content, warn: !!red, rate: !!(r.rateWarning && !red) };
+}
+function rowWarnFlags(r){
+  if(r.priceWarning || r.costConflict) return { warn: true, rate: false };
+  if(r.rateWarning) return { warn: false, rate: true };
+  return { warn: false, rate: false };
 }
 // 1行ぶんの <tr> を組み立てて tbody へ。readOnly=true（実施日フィルタの横断ビュー）では
 //  改定後仕入の編集欄・行ルール・紐付けボタンを出さず、仕入先名＋進捗を商品名の下に小さく添える。
@@ -3570,10 +4093,7 @@ function buildMainRow(r, i, readOnly){
   if(isUnmatched(r)) tr.className='unmatched';
   let prodName = buildProdNameHtml(r); // 仕入先は商品名内の「🏢 仕入先」バッジで全ビュー共通に表示（buildProdNameHtml）
   if(readOnly) prodName += progressBadge(r.itemStatus);
-  // メイン画面は照合・紐付けの確認用＝価格は編集しない（改定後仕入は読み取り表示）。
-  //  価格の設定・行ごとの転嫁ルールは得意先別ページに集約した。
-  // 改定後仕入単価セルにはメーカーデータの疑わしさ警告（赤/黄）も出すので id を付ける（updateView で設定）。
-  const costCell = '<td class="r" id="nc'+i+'">'+num(r.newCost)+'</td>';
+  const nc = newCostCellHtml(r);
   const linkCell = '<td class="c">'+linkCellHtml(r, i)+'</td>'; // 横断（読み取り）ビューでも紐付けは可能
   tr.innerHTML =
     '<td class="c shogo-col"></td>'+
@@ -3582,10 +4102,10 @@ function buildMainRow(r, i, readOnly){
     '<td class="pn">'+prodName+'</td>'+
     linkCell+
     '<td class="r">'+num(r.currentCost)+'</td>'+
-    costCell+
-    '<td class="r" id="ci'+i+'"></td>'+
-    '<td class="c" id="qt'+i+'"></td>'+
-    '<td class="r" id="aci'+i+'"></td>';
+    '<td class="'+nc.cls+'" id="nc'+i+'"'+nc.extra+'>'+nc.content+'</td>'+
+    '<td class="r" id="ci'+i+'">'+costIncreaseCellHtml(r)+'</td>'+
+    '<td class="c" id="qt'+i+'">'+qtyCellHtml(r)+'</td>'+
+    '<td class="r '+signCls(r.annualCostImpact)+'" id="aci'+i+'">'+yen(r.annualCostImpact)+'</td>';
   return tr;
 }
 // 区切り見出しの行（一致品／休眠の境目）。セルIDを持たないので updateView は素通り。
@@ -3595,31 +4115,55 @@ function sectionHeaderRow(text, bg, fg){
   return tr;
 }
 // baseRows を表に描画。readOnly のときは編集系イベントを配線しない。
-//  並び順：①一致品（得意先別＝同じ得意先がまとまる）を先頭、②休眠・未一致を末尾、の2ブロックに分ける。
+//  通常：①一致品 ②休眠。実施日カレンダー横断(readOnly)：①提出済み ②未提出 に分ける。
 //  ※並べ替えても buildMainRow には元のインデックス i を渡す（セルIDが updateView と対応＝値がズレない）。
 function renderMainRows(readOnly){
   const tb = $('#tbody'); tb.innerHTML='';
   // 見積書を作成済み（提出済み）の行は通常表示では出さない（作業中の品だけに絞る）。
-  //  ※実施日カレンダーの横断（読み取り）ビューでは進捗確認のため従来どおり表示する。
+  //  ※実施日カレンダー横断ビューでは提出済／未提出を分けて表示する。
   let hiddenIssued=0;
-  const matched=[], dormant=[];
+  const matched=[], dormant=[], issued=[], todo=[];
   baseRows.forEach((r,i)=>{
-    if(!readOnly && r.itemStatus==='issued'){ hiddenIssued++; return; }
+    if(readOnly){
+      if(r.itemStatus==='issued') issued.push(i);
+      else todo.push(i);
+      return;
+    }
+    if(r.itemStatus==='issued'){ hiddenIssued++; return; }
     (isUnmatched(r)?dormant:matched).push(i);
   });
   const col = new Intl.Collator('ja');
-  sortMatchedIndices(matched);
-  // 休眠＝仕入先 → メーカー商品名 で並べる（誰の未一致品か分かりやすく）
-  dormant.sort((a,b)=> col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
-    || col.compare(baseRows[a].makerName||'', baseRows[b].makerName||''));
-  if(matched.length){
-    const sortLbl = mainSortMode === 'matchDesc' ? '一致度 高い順' : (mainSortMode === 'matchAsc' ? '一致度 低い順' : '得意先別');
-    tb.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（'+sortLbl+'）', '#eaf6ee', '#1b6b3a'));
-    matched.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
-  }
-  if(dormant.length){
-    tb.appendChild(sectionHeaderRow('💤 休眠・未一致 '+dormant.length+'件（販売実績なし／商品名が一致せず＝見積対象外。紐付けで救済できます）', '#f1f1f1', '#7a7a7a'));
-    dormant.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
+  if(readOnly){
+    const byCustSup=(a,b)=> col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
+      || col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
+      || col.compare(baseRows[a].productName||'', baseRows[b].productName||'');
+    issued.sort(byCustSup); todo.sort(byCustSup);
+    const holdN=todo.filter(i=>baseRows[i].itemStatus==='hold').length;
+    const manualN=todo.filter(i=>baseRows[i].itemStatus==='manual').length;
+    if(issued.length){
+      tb.appendChild(sectionHeaderRow('✅ 提出済み '+issued.length+'件（見積書を発行済み）', '#eaf6ee', '#1b6b3a'));
+      issued.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, true)));
+    }
+    if(todo.length){
+      let todoLbl='⬜ 未提出 '+todo.length+'件（見積書 未発行・要対応）';
+      if(holdN) todoLbl+=' — うち検討中 '+holdN+'件';
+      if(manualN) todoLbl+=' — うち手動修正 '+manualN+'件';
+      tb.appendChild(sectionHeaderRow(todoLbl, '#fff8ee', '#8a5a12'));
+      todo.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, true)));
+    }
+  } else {
+    sortMatchedIndices(matched);
+    dormant.sort((a,b)=> col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
+      || col.compare(baseRows[a].makerName||'', baseRows[b].makerName||''));
+    if(matched.length){
+      const sortLbl = mainSortMode === 'matchDesc' ? '一致度 高い順' : (mainSortMode === 'matchAsc' ? '一致度 低い順' : '得意先別');
+      tb.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（'+sortLbl+'）', '#eaf6ee', '#1b6b3a'));
+      matched.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
+    }
+    if(dormant.length){
+      tb.appendChild(sectionHeaderRow('💤 休眠・未一致 '+dormant.length+'件（販売実績なし／商品名が一致せず＝見積対象外。紐付けで救済できます）', '#f1f1f1', '#7a7a7a'));
+      dormant.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
+    }
   }
   const note=$('#issuedHideNote');
   if(note){
@@ -3644,7 +4188,7 @@ async function loadAll(){
   allMakerNames = res.makerNames || [];
   currentSuppliers = res.suppliers || {};
   renderMainRows(false); // 全部ビューでも提出済みは隠す＝作業中の品だけ
-  updateView(res.rows, res.summary);
+  updateView(res.rows, res.summary, { skipMetrics: true });
   syncHScroll();
 }
 // ファイルを読み込み、表の“構造”を作る（入力欄やルール選択を配置）
@@ -3663,7 +4207,7 @@ async function loadFile(){
   allMakerNames = res.makerNames || [];
   currentSuppliers = res.suppliers || {};
   renderMainRows(false);
-  updateView(res.rows, res.summary);
+  updateView(res.rows, res.summary, { skipMetrics: true });
   syncHScroll();
 }
 // 実施日カレンダーで選んだ日の改定を、全仕入先 横断で表に表示（読み取り）。
@@ -3681,11 +4225,13 @@ async function loadByDate(dateIso, label){
   syncHScroll();
   const lab = label || (function(d){ const p=String(d).split('-'); return Number(p[0])+'年'+Number(p[1])+'月'+Number(p[2])+'日'; })(dateIso);
   const bar=$('#dateFilterBar');
-  const sc = res.statusCounts || {issued:0,hold:0,todo:0};
+  const sc = res.statusCounts || {issued:0,hold:0,manual:0,todo:0};
+  const todoAll=sc.todo+(sc.hold||0)+(sc.manual||0);
   $('#dateFilterLabel').innerHTML='📅 '+esc(lab)+' の改定 '+res.count+'件（全'+res.supplierCount+'仕入先）'
     +' ｜ <span style="color:#1f6b35">✅提出済 '+sc.issued+'</span>'
-    +' <span style="color:#8a5a12">🤔検討中 '+sc.hold+'</span>'
-    +' <span style="color:#b1432f">⬜未提出 '+sc.todo+'</span>';
+    +' <span style="color:#b1432f">⬜未提出 '+todoAll+'</span>'
+    +(sc.hold?' <span style="color:#8a5a12;font-size:11px">(うち検討中 '+sc.hold+')</span>':'')
+    +(sc.manual?' <span style="color:#5a4a8a;font-size:11px">(うち手動修正 '+sc.manual+')</span>':'');
   bar.style.display='flex';
   // 表が見えるようにスクロール
   const w=$('#wrap'); if(w) w.scrollIntoView({behavior:'smooth',block:'start'});
@@ -3995,29 +4541,31 @@ async function recalc(){
   updateView(res.rows, res.summary);
 }
 
-function updateView(rows, sm){
+function updateView(rows, sm, opts){
+  opts = opts || {};
   let warnN=0, rateN=0;
   const warnIdx=[], rateIdx=[];
   rows.forEach((r,i)=>{
+    const flags = rowWarnFlags(r);
+    if(flags.warn){ warnN++; warnIdx.push(i); }
+    else if(flags.rate){ rateN++; rateIdx.push(i); }
+    if(opts.skipMetrics) return;
     setAmtRate('ci'+i, r.costIncrease, rateOf(r.currentCost, r.newCost)); // 仕入値上額＋改定%
     // 改定後仕入単価セルの色分け：赤＝メーカーデータ疑わしい/重複（出力時に除外）、黄＝値上率が大きい（注意のみ）
-    setCell('nc'+i, num(r.newCost));
+    const nc = newCostCellHtml(r);
     const ncEl=$('#nc'+i);
     if(ncEl){
-      ncEl.classList.remove('pricewarn','ratewarn');
+      ncEl.className = nc.cls;
       const red=r.priceWarning||r.costConflict||'';
-      if(red){ ncEl.classList.add('pricewarn'); ncEl.title='⚠ '+red; ncEl.innerHTML='⚠ '+ncEl.textContent; warnN++; warnIdx.push(i); }
-      else if(r.rateWarning){ ncEl.classList.add('ratewarn'); ncEl.title='注意: '+r.rateWarning; ncEl.innerHTML='▲ '+ncEl.textContent; rateN++; rateIdx.push(i); }
-      else { ncEl.title=''; }
+      if(red) ncEl.title='⚠ '+red;
+      else if(r.rateWarning) ncEl.title='注意: '+r.rateWarning;
+      else ncEl.title='';
+      ncEl.innerHTML = nc.content;
     }
     const q = $('#qt'+i);
-    if(q){
-      if(Number.isFinite(r.qty) && r.qty>0){
-        const b = r.qtySource==='actual' ? '<span class="badge act">実</span>' : '<span class="badge est">推</span>';
-        q.innerHTML = Math.round(r.qty).toLocaleString('ja-JP') + ' <span class="ml6">'+b+'</span>';
-      } else q.textContent='—';
-    }
-    setCell('aci'+i, yen(r.annualCostImpact), signCls(r.annualCostImpact));
+    if(q) q.innerHTML = qtyCellHtml(r);
+    const aci = $('#aci'+i);
+    if(aci){ aci.innerHTML = yen(r.annualCostImpact); aci.className = 'r '+signCls(r.annualCostImpact); }
   });
   const pa=$('#priceAlert');
   if(pa){
@@ -4077,6 +4625,8 @@ function renderCards(sm){
 function card(k,v,sub,cls){ return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+(sub||'')+'</div></div>'; }
 
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+// confirm() 用：ユーザー/業務データを文字列連結するとき ' \\ \n でJSが壊れるのを防ぐ
+function escConfirm(s){ return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/\\r/g,'').replace(/\\n/g,'\\\\n'); }
 function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
 
 // ---- 全社損益インパクト（変動損益）-------------------------------------
@@ -4156,7 +4706,10 @@ function renderPL(){
 // 全体方針(ルール/端数/自社上乗せ%)を変えたら、選択中ファイルの再計算に加えて
 //  全仕入先 合算の損益も取り直す（損益パネルが全商品を反映するように）。
 function recalcAll(){ if(dateFilter){ loadByDate(dateFilter); return; } recalc(); loadAllImpact(); }
-$('#file').addEventListener('change', loadFile); // ファイル切替は表示の切替だけ＝損益(全社)は不変
+$('#file').addEventListener('change', ()=>{
+  try{ sessionStorage.setItem('simFileSel', $('#file').value); }catch(e){}
+  loadFile(); // ファイル切替は表示の切替だけ＝損益(全社)は不変
+});
 $('#shogoBtn').addEventListener('click', runShogo);
 // 全体方針（転嫁ルール・端数・自社上乗せ%）はメイン画面から撤去し ⚙設定 に集約。
 //  設定で保存すると applyToBar が savedPolicy を更新し、表示・損益にも反映される（setSave 内で再計算）。
@@ -4272,13 +4825,56 @@ const pad2 = (n)=> String(n).padStart(2,'0');
 const ymdKey = (o)=> o ? (o.y+'-'+pad2(o.m)+'-'+pad2(o.d)) : '';
 const todayKeyStr = ()=>{ const n=new Date(); return n.getFullYear()+'-'+pad2(n.getMonth()+1)+'-'+pad2(n.getDate()); };
 
+// カレンダー明細の提出状況を集計（issued / hold / manual / todo）。
+function calStatusCounts(list){
+  const c={ issued:0, hold:0, manual:0, todo:0 };
+  (list||[]).forEach(it=>{
+    if(it.itemStatus==='issued') c.issued++;
+    else if(it.itemStatus==='hold') c.hold++;
+    else if(it.itemStatus==='manual') c.manual++;
+    else c.todo++;
+  });
+  return c;
+}
+// チップ・グリッド用の提出済／未提出バッジHTML。
+function calStatusBadgesHtml(c, inline){
+  if(!c) return '';
+  const parts=[];
+  if(c.issued) parts.push('<span class="cnt-issued">✅'+c.issued+'</span>');
+  const todo=c.todo+(c.hold||0)+(c.manual||0);
+  if(todo) parts.push('<span class="cnt-todo">⬜'+todo+'</span>');
+  if(!parts.length) return '';
+  return inline ? parts.join(' ') : '<div class="cnts">'+parts.join('')+'</div>';
+}
+// カレンダー詳細パネル用の明細表HTML（提出済／未提出で2ブロック）。
+function calDetailSplitHtml(list){
+  const issued=[], todo=[];
+  (list||[]).forEach(it=>{ (it.itemStatus==='issued'?issued:todo).push(it); });
+  const col=new Intl.Collator('ja');
+  const sort=(a,b)=> col.compare(a.supplier,b.supplier)||col.compare(a.customer,b.customer)||col.compare(a.name,b.name);
+  issued.sort(sort); todo.sort(sort);
+  const row=(it)=> '<tr><td>'+esc(it.supplier||'—')+'</td><td>'+esc(it.customer)+'</td><td>'+esc(it.name)+'</td></tr>';
+  const tbl=(rows)=> rows.length
+    ? '<table><thead><tr><th style="width:18%">仕入先</th><th style="width:28%">得意先</th><th>商品名</th></tr></thead><tbody>'+rows.map(row).join('')+'</tbody></table>'
+    : '<div class="emptysec">（該当なし）</div>';
+  let html='';
+  html+='<div class="calsec issued"><h3>✅ 提出済み '+issued.length+'件</h3>'+tbl(issued)+'</div>';
+  const holdN=todo.filter(it=>it.itemStatus==='hold').length;
+  const manualN=todo.filter(it=>it.itemStatus==='manual').length;
+  let todoH='⬜ 未提出 '+todo.length+'件';
+  if(holdN) todoH+='（うち検討中 '+holdN+'件）';
+  if(manualN) todoH+='（うち手動修正 '+manualN+'件）';
+  html+='<div class="calsec todo"><h3>'+esc(todoH)+'</h3>'+tbl(todo)+'</div>';
+  return html;
+}
+
 // 全仕入先 横断の明細(calData.entries) から「実施日キー → 明細[]」を作る。
 // 日付が読めない/空の行は noDate にまとめる（実施日 未設定＝要入力の気づき）。
 function buildEffIndex(){
-  const byKey = new Map();   // 'YYYY-MM-DD' -> [{customer, name, supplier}]
+  const byKey = new Map();   // 'YYYY-MM-DD' -> [{customer, name, supplier, itemStatus}]
   const noDate = [];
   (calData.entries||[]).forEach(e=>{
-    const item = { customer: e.customer||'—', name: e.product||'(商品名なし)', supplier: e.supplier||'' };
+    const item = { customer: e.customer||'—', name: e.product||'(商品名なし)', supplier: e.supplier||'', itemStatus: e.itemStatus||'' };
     const o = parseEffDate(e.date);
     if(!o){ noDate.push(item); return; }
     const k = ymdKey(o);
@@ -4371,12 +4967,14 @@ function renderTodayBanner(idx){
   const todayList = idx.byKey.get(todayKey);
   if(!(todayList && todayList.length)){ tb.innerHTML=''; return; }
   const p=todayKey.split('-');
+  const sc=calStatusCounts(todayList);
+  const scTxt='（✅提出済 '+sc.issued+' / ⬜未提出 '+(sc.todo+sc.hold+sc.manual)+'）';
   const collapsed = $('#calBody') && $('#calBody').classList.contains('collapsed');
   const cta = collapsed
     ? '<span class="tbtn">▼ カレンダーを開いて確認する</span>'
     : '<span class="thint">クリックでその日の改定を表で表示（カレンダーは赤で強調）</span>';
   tb.innerHTML='<div class="tbnr" title="クリックすると本日の改定を表示します">'
-    +'🔔 <span>本日 '+Number(p[1])+'/'+Number(p[2])+' が実施日の商品が <b>'+todayList.length+'件</b> あります。基幹システムへの取込・見積提出のタイミングです。</span>'
+    +'🔔 <span>本日 '+Number(p[1])+'/'+Number(p[2])+' が実施日の商品が <b>'+todayList.length+'件</b>'+esc(scTxt)+' あります。基幹システムへの取込・見積提出のタイミングです。</span>'
     +cta+'</div>';
 }
 
@@ -4394,9 +4992,10 @@ function renderCalendar(){
   // 実施日チップ（全期間・件数つき）＝よく使う 06/01 等にワンタップ移動。本日は🔔赤で強調
   const keys = Array.from(idx.byKey.keys()).sort();
   let chips = keys.map(k=>{
-    const p=k.split('-'); const n=idx.byKey.get(k).length;
+    const p=k.split('-'); const list=idx.byKey.get(k);
+    const n=list.length; const badges=calStatusBadgesHtml(calStatusCounts(list), true);
     const isT = (k===todayKey) ? ' style="border-color:#e0392c;color:#a01b10;font-weight:800"' : '';
-    return '<span class="chip" data-key="'+k+'"'+isT+'>'+(k===todayKey?'🔔 ':'')+Number(p[1])+'/'+Number(p[2])+' <b>'+n+'件</b></span>';
+    return '<span class="chip" data-key="'+k+'"'+isT+'>'+(k===todayKey?'🔔 ':'')+Number(p[1])+'/'+Number(p[2])+' <b>'+n+'件</b> '+badges+'</span>';
   }).join('');
   if(idx.noDate.length) chips += '<span class="chip empty" data-key="__none">実施日 未設定 '+idx.noDate.length+'件</span>';
   $('#calChips').innerHTML = chips || '<span class="chip empty">価格改定行がありません（input/ に照合結果CSVがありません）</span>';
@@ -4415,9 +5014,10 @@ function renderCalendar(){
     const cls=['calcell'];
     if(dow===0) cls.push('sun'); if(dow===6) cls.push('sat');
     if(list) cls.push('has'); if(k===calState.selKey) cls.push('sel'); if(k===todayKey) cls.push('today');
+    const badges = list ? calStatusBadgesHtml(calStatusCounts(list), false) : '';
     html+='<div class="'+cls.join(' ')+'" data-key="'+k+'">'+
       '<div class="dn">'+day+'</div>'+
-      (list?'<span class="cnt">'+list.length+'件</span>':'')+'</div>';
+      badges+'</div>';
   }
   $('#calGrid').innerHTML=html;
   // グリッドのクリック（実施日のある日だけ）
@@ -4446,7 +5046,10 @@ function renderCalDetail(idx){
   const p=k.split('-');
   const label=Number(p[0])+'年'+Number(p[1])+'月'+Number(p[2])+'日';
   const supN=(calData.suppliers && calData.suppliers.length)||0;
-  box.innerHTML='<div class="calnote">▼ <b>下のシミュレーション表</b>に '+(k===tk?'🔔 本日 ':'')+esc(label)+' の改定（'+list.length+'件・全'+supN+'仕入先）を表示しました。価格・損益はいつもの表で確認できます（読み取り表示）。</div>';
+  const sc=calStatusCounts(list);
+  box.innerHTML='<div class="calnote">▼ <b>下のシミュレーション表</b>に '+(k===tk?'🔔 本日 ':'')+esc(label)+' の改定（'+list.length+'件・全'+supN+'仕入先'
+    +' ｜ ✅提出済 '+sc.issued+' / ⬜未提出 '+(sc.todo+sc.hold+sc.manual)+'）を <b>提出済み・未提出で分けて</b>表示しました。</div>'
+    +calDetailSplitHtml(list);
   if(dateFilter!==k) loadByDate(k, label); // 既に同じ日を表示中なら再取得しない（月送り等での無駄打ち防止）
 }
 
@@ -4692,8 +5295,8 @@ async function editLinkRow(supplier, code, better){
 async function switchLinkTo(supplier, code, better){
   const isUnlink=!better;
   const msg=isUnlink
-    ? '「'+supplier+'  '+code+'」の手動紐付けを\\n解除します（自動マッチに戻す）。よろしいですか？\\n\\n※照合結果への反映には 会社PC(DBあり) で「↻ 照合」が必要です。'
-    : '「'+supplier+'  '+code+'」の紐付けを\\n「'+better+'」に切り替えます。よろしいですか？\\n\\n※照合結果への反映には 会社PC(DBあり) で「↻ 照合」が必要です。';
+    ? '「'+escConfirm(supplier)+'  '+escConfirm(code)+'」の手動紐付けを\\n解除します（自動マッチに戻す）。よろしいですか？\\n\\n※照合結果への反映には 会社PC(DBあり) で「↻ 照合」が必要です。'
+    : '「'+escConfirm(supplier)+'  '+escConfirm(code)+'」の紐付けを\\n「'+escConfirm(better)+'」に切り替えます。よろしいですか？\\n\\n※照合結果への反映には 会社PC(DBあり) で「↻ 照合」が必要です。';
   if(!confirm(msg)) return;
   try{
     const res=await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -4792,9 +5395,11 @@ async function loadCdCandidates(){
   } else {
     await loadFiles();
   }
-  loadAllImpact(); // 表の表示後に全社損益（重い集計は後回し）
-  // バナー類は表の描画を阻害しないよう少し遅らせる
-  setTimeout(()=>{ loadDupCheck(); loadLinkCheck(); loadCdCandidates(); }, 80);
+  // 全社損益（全仕入先 calcAll）は表表示の後に遅延＝起動の体感を軽くする。
+  setTimeout(()=>{ loadAllImpact(); }, 400);
+  // バナー類も表の描画を阻害しないよう遅らせる
+  setTimeout(()=>{ loadDupCheck(); loadLinkCheck(); loadCdCandidates(); }, 600);
+  initShogoLockWatch();
 })();
 </script>
 </body></html>`;
