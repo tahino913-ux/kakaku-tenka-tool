@@ -6,6 +6,7 @@
 //     を一行ずつ表示してユーザが確認できる
 //   ・列の役割と「使う/使わない」設定を settings.json:selfProfile に保存
 // =====================================================================
+const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
 const SELF_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -37,7 +38,9 @@ const SELF_PAGE = `<!doctype html>
   .swatch{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle}
   .sw-name{background:#2e7d32} .sw-code{background:#1976d2} .sw-unused{background:#aa6}
   .info-box{background:#fff8e1;border:1px solid #ffe082;padding:8px 10px;border-radius:6px;font-size:12px;margin:6px 0}
+${SHOGO_LOCK_CSS}
 </style></head><body>
+${SHOGO_LOCK_HTML}
 <header>
   <h1>🗂 自社データ取込設定</h1>
   <span class="hint" style="color:#cfe0f0">販売実績を読み込み、どこが何の情報か確認・保存</span>
@@ -141,6 +144,7 @@ const SELF_PAGE = `<!doctype html>
 </details>
 
 <script>
+${SHOGO_LOCK_JS}
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const ROLES = [
@@ -201,7 +205,7 @@ function renderAll() {
   $('#previewSum').textContent = pendingGrid.length+'行を表示（全'+pendingGrid.length+'件中）';
 
   // 生データテーブル
-  const th = pendingHeaders.map((h,i)=>'<th>'+(h||'(列'+(i+1)+')')+'</th>').join('');
+  const th = pendingHeaders.map((h,i)=>'<th>'+(h?esc(h):'(列'+(i+1)+')')+'</th>').join('');
   $('#rawTbl thead').innerHTML = '<tr>'+th+'</tr>';
   const tb = $('#rawTbl tbody'); tb.innerHTML = '';
   pendingGrid.slice(0, 15).forEach((row) => {
@@ -322,14 +326,19 @@ async function loadHanbaiSource(){
         const msg = $('#selfDbMsg');
         if(!confirm('自社製造品をDBの商品分類から取り込み直します。\\n既存の自社製造の取込CSVはDB版に置き換わります（_old へ退避＝戻せます）。よろしいですか？')) return;
         b.disabled=true; msg.style.color='#6b7785'; msg.textContent='DBから抽出して照合中…（数秒かかります）';
+        setShogoLock(true,'自社製造品をDBから取り込み、照合を実行しています…');
         try{
           const res = await fetch('/api/self-from-db',{method:'POST'}).then(x=>x.json());
+          if(res.busy){
+            msg.style.color='#c0392b'; msg.textContent=res.error||'照合が既に実行中です';
+            return;
+          }
           if(res.ok){
             const sh = (res.shogo && res.shogo.ok) ? '・照合を更新しました' : (res.shogo ? '・⚠ 照合失敗:'+(res.shogo.error||'') : '');
             msg.style.color='#1f6b35'; msg.textContent='✓ '+res.count+'品をDBから取り込み（'+esc(res.supplier)+'／旧'+res.retired+'本を退避）'+sh+'。シミュレーション画面の「対象」で確認できます。';
           } else { msg.style.color='#c0392b'; msg.textContent='失敗: '+(res.error||''); }
         }catch(e){ msg.style.color='#c0392b'; msg.textContent='失敗: '+e; }
-        finally{ b.disabled=false; }
+        finally{ b.disabled=false; setShogoLock(false); }
       });
     }
     // 「照合に含める期間」保存ボタンを配線（DB案内バナーがあるときだけ要素が存在）
@@ -375,6 +384,7 @@ async function loadHanbaiSource(){
   }
 }
 loadHanbaiSource();
+initShogoLockWatch();
 </script>
 </body></html>`;
 

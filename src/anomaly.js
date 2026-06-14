@@ -8,7 +8,7 @@
 // 1行の価格を見て、異常があれば理由文字列、無ければ '' を返す。
 //   ① 売単価が無い/0      … 社内消費分・データ欠落（見積書に載せられない）
 //   ② 値上げなのに改定単価が下がる/同じ … メーカー見積の食い違い（例: 同一品番に新単価2種）
-function priceRowAnomaly(currentSell, newSell, ruleType, selfMade) {
+function priceRowAnomaly(currentSell, newSell, ruleType, selfMade, currentCost, newCost) {
   const cur = Number(currentSell), nw = Number(newSell);
   if (!(cur > 0) || !(nw > 0)) return '売単価が無い/0（社内消費・データ欠落の可能性）';
   // 据置(keep_sell)は「改定単価＝現単価」が正常仕様なので ② は判定しない。
@@ -18,7 +18,16 @@ function priceRowAnomaly(currentSell, newSell, ruleType, selfMade) {
   // selfMade（自社製造＝メーカーコード9000）は原価0で値上げは利用者が決める（掛率/手入力）。
   //  メーカー見積の食い違いという概念が無いので ② は判定しない（同額でも要確認に落とさない）。①は検知。
   if (ruleType === 'keep_sell' || ruleType === 'manual' || selfMade) return '';
-  if (nw <= cur) return '値上げなのに改定単価が下がる/同じ（メーカー見積の食い違いの可能性）';
+  if (nw <= cur) {
+    // ② は「メーカーが仕入を値上げしたのに改定後売価が同額/値下げ」を疑うもの。前提＝“仕入が実際に上がった”。
+    //  仕入が据置/値下げ(=値上げでない)なら売価据置は正常（現売価×仕入改定%=sell_cost_rate・掛率×1 等で起こる）。
+    //  ＝仕入の現/新が分かるときは、仕入が上がっていなければ ② を出さない（正常行を要確認に落とさない）。
+    //  仕入が不明（cost未指定）のときは従来どおり ② を判定する（安全側）。
+    const cc = Number(currentCost), nc = Number(newCost);
+    const costKnown = Number.isFinite(cc) && Number.isFinite(nc);
+    if (costKnown && !(nc > cc + 0.005)) return '';
+    return '値上げなのに改定単価が下がる/同じ（メーカー見積の食い違いの可能性）';
+  }
   return '';
 }
 

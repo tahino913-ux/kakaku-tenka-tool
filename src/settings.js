@@ -11,11 +11,29 @@ const base = require('../config');
 const ROOT = path.join(__dirname, '..');
 const SETTINGS_PATH = path.join(ROOT, 'settings.json');
 
+// 原子的書き込み：一時ファイルへ書いてから rename で本体へ置換する。
+//  途中でクラッシュ/Drive同期割り込みが起きても settings.json 本体が壊れない
+//  （rename は同一フォルダ＝同一ボリュームで原子的に置換される）。失敗時は throw。
+function writeJsonAtomic(file, obj) {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+// settings.json のプロセス内キャッシュ。getSettings/getProductLinks/getMakers 等がほぼ全API・全calcで
+//  何度も呼ばれ、毎回 readFileSync+JSON.parse すると遅い（Drive同期中は特に）。mtime が同じ間は再パースしない。
+//  ・他PC(Drive同期)が更新→mtimeが変わる→自動で読み直す。
+//  ・自分が saveSettings で書く→ _userCache=null で明示破棄（同一ms内の書込みでも確実に最新化）。
+let _userCache = null; // { mtimeMs, data }
 function readUser() {
   try {
-    if (!fs.existsSync(SETTINGS_PATH)) return null;
-    return JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8') || '{}');
+    const st = fs.statSync(SETTINGS_PATH); // 無ければ throw → catch で null（旧 existsSync と同じ挙動）
+    if (_userCache && _userCache.mtimeMs === st.mtimeMs) return _userCache.data;
+    const data = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8') || '{}');
+    _userCache = { mtimeMs: st.mtimeMs, data };
+    return data;
   } catch (e) {
+    _userCache = null;
     return null; // 壊れていても既定値で動く
   }
 }
@@ -73,7 +91,16 @@ function getSettings() {
 // 画面から来た編集内容を settings.json に保存（既存とマージ）。
 function saveSettings(patch) {
   patch = patch || {};
-  const cur = readUser() || {};
+  // 既存設定の保護：settings.json が「在るのに読めない」（破損 or Drive同期途中）なら保存を中止する。
+  //  ここで cur={} ベースに上書きすると productLinks/makers/除外設定 等を全消ししてしまうため。
+  //  ・ファイルが無い（初回）→ cur=null だが fileExists=false なので通常どおり作成する。
+  let fileExists = false;
+  try { fs.statSync(SETTINGS_PATH); fileExists = true; } catch (_) {}
+  const cur0 = readUser();
+  if (fileExists && cur0 === null) {
+    throw new Error('settings.json を読み込めませんでした（破損 or 同期中の可能性）。既存設定を守るため保存を中止しました。少し待って再度お試しください。');
+  }
+  const cur = cur0 || {};
   const next = {
     default:        patch.default || cur.default || base.default || { type: 'add_increase' },
     rounding:       Object.assign({}, cur.rounding, patch.rounding),
@@ -97,7 +124,9 @@ function saveSettings(patch) {
     excludedCustomers: patch.excludedCustomers !== undefined ? patch.excludedCustomers : (cur.excludedCustomers || {}),
     _savedAt:       new Date().toISOString(),
   };
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2), 'utf8');
+  try { writeJsonAtomic(SETTINGS_PATH, next); }
+  catch (e) { _userCache = null; throw e; } // 書込失敗：キャッシュも破棄して次回ファイルから読み直す
+  _userCache = null; // 書いたのでキャッシュ破棄（次回 readUser は最新を読む）
   return getSettings();
 }
 

@@ -9,7 +9,7 @@
 //
 //   データモデル（HBDATA0001_001C）:
 //     URIMEI=売上明細（SUU/TANK/BTANK は ×10000 格納＝/10000 で実値。KG=金額は素の円）。
-//     得意先×商品(自社CD)で集計：現売単価=最新DENDATE行のTANK、年間金額=期間内SUM(KG)。
+//     得意先×商品(自社CD)で集計：現売単価=最新の実売上(51/52)行のTANK、原単価=19/59除外の最新BTANK、年間金額=51+52のSUM(KG)。
 //     TOKSHI→TOKUI(得意先)、SHO→SHOHIN(自社CD)、SHIIRE→SHIIRE(仕入先CD) を ICODE で結合。
 // =====================================================================
 const fs = require('fs');
@@ -46,10 +46,28 @@ function monthsBackStart(months) {
   return s.getFullYear() + '-' + String(s.getMonth() + 1).padStart(2, '0') + '-' + String(s.getDate()).padStart(2, '0');
 }
 
-// 読み取り専用の集計SQLを組み立てる（パラメータは検証済みの定数のみ＝SQLインジェクション面なし）。
+// 伝票種(DSHU)の扱い（販売大臣・日野運用）
+//  51=売上 / 52=現金売  … 実売上（現売単価・年間金額の対象）
+//  59=区分別売上（仮）  … 消込等の仮計上。実績に反映しない＝拾わない
+//  19=区分別仕入（仮）  … 仕入側の仮計上。原単価の参照から除外
+const DSHU_ACTUAL_SELL = '51, 52';
+const DSHU_EXCLUDE_COST = '19, 59';
+
 //  candidateStart..end = 照合の候補に含める期間（さかのぼり可変）。この間に売上があれば候補に出る。
 //  annualStart..end    = 年間金額(損益)の集計期間（常に直近約1年）。候補期間を延ばしても損益は歪まない。
 function buildSql(candidateStart, end, annualStart, scale) {
+  // 「SELECTのみ」を堅牢化：SQLに埋め込む日付は必ず ISO(YYYY-MM-DD) だけ許可する。
+  //  settings.json の hanbai.db.start/end は検証なしでマージされるため、不正値での文字列連結（SQL injection）を
+  //  ここで遮断する＝販売大臣DBへ書込み系SQLが渡る経路を断つ。正常な日付は常に通る。
+  const isIso = (s) => {
+    const t = String(s == null ? '' : s);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) return false;
+    const mo = Number(t.slice(5, 7)), da = Number(t.slice(8, 10));
+    return mo >= 1 && mo <= 12 && da >= 1 && da <= 31;
+  };
+  if (!isIso(candidateStart) || !isIso(end) || !isIso(annualStart)) {
+    throw new Error('期間(日付)が不正です（YYYY-MM-DD のみ）。settings.json の hanbai.db.start/end を確認してください。');
+  }
   const sc = Number(scale) || 10000;
   return `;WITH base AS (
   SELECT u.TOKSHI, u.SHO, u.DENDATE, u.NO, u.GYO, u.DSHU,
@@ -63,36 +81,39 @@ function buildSql(candidateStart, end, annualStart, scale) {
   FROM dbo.URIMEI u
   WHERE u.DENDATE >= '${candidateStart}' AND u.DENDATE < '${end}'
 ),
-latest AS (
-  -- 現売単価＝得意先×商品の「最新DENDATE行のTANK」。伝票種(DSHU)で絞らない＝全種から最新を採る。
-  --  ※実測：現行エクスポート(2025-05〜2026-05)との突合で、全DSHU最新が97.1%一致。
-  --    DSHU=51(売上)＆TANK>0 に絞ると79.8%に悪化したため、絞らない現行ロジックを維持する。
-  SELECT *, ROW_NUMBER() OVER (PARTITION BY TOKSHI, SHO ORDER BY DENDATE DESC, NO DESC, GYO DESC) AS rn
+latest_sell AS (
+  -- 現売単価＝得意先×商品の最新「実売上」行(51/52)のTANK。59(区分別・仮売上)は除外。
+  SELECT TOKSHI, SHO, DENDATE, NO, GYO, sell, pname, shiicode,
+    ROW_NUMBER() OVER (PARTITION BY TOKSHI, SHO ORDER BY DENDATE DESC, NO DESC, GYO DESC) AS rn
   FROM base
+  WHERE DSHU IN (${DSHU_ACTUAL_SELL}) AND sell > 0
 ),
--- 年間金額＝期間内の 売上(51)＋値引(52) の KG 合計。
---  ※実測：全DSHU合計=76.0%／51のみ=68.8%／51+52=83.2%／51+52+59=76.0% 一致。
---    現行エクスポートの「年間金額」は 売上−値引（51+52）が最も合うため 51,52 に限定する。
---    （別区分59・無償81 は現行レポートの年間金額には含まれない）
-agg AS ( SELECT TOKSHI, SHO, SUM(CASE WHEN DSHU IN (51, 52) AND DENDATE >= '${annualStart}' THEN amt ELSE 0 END) AS annual FROM base GROUP BY TOKSHI, SHO )
+latest_cost AS (
+  -- 原単価＝最新の実績行のBTANK。19(区分別仕入・仮)と59(区分別売上・仮)は除外。
+  SELECT TOKSHI, SHO, cost,
+    ROW_NUMBER() OVER (PARTITION BY TOKSHI, SHO ORDER BY DENDATE DESC, NO DESC, GYO DESC) AS rn
+  FROM base
+  WHERE DSHU NOT IN (${DSHU_EXCLUDE_COST}) AND cost > 0
+),
+-- 年間金額＝期間内の 売上(51)＋現金売(52) の KG 合計（59区分別・仮は含めない）。
+--  ※実測：51+52=83.2%が現行エクスポートの年間金額に最も合う。
+agg AS ( SELECT TOKSHI, SHO, SUM(CASE WHEN DSHU IN (${DSHU_ACTUAL_SELL}) AND DENDATE >= '${annualStart}' THEN amt ELSE 0 END) AS annual FROM base GROUP BY TOKSHI, SHO )
 SELECT
   RTRIM(tk.CODE) AS tcd, RTRIM(sh.CODE) AS pcd,
-  l.sell AS sell, a.annual AS amt, l.cost AS cost,
-  CONVERT(char(10), l.DENDATE, 23) AS lastdate,
+  ls.sell AS sell, a.annual AS amt, ISNULL(lc.cost, 0) AS cost,
+  CONVERT(char(10), ls.DENDATE, 23) AS lastdate,
   RTRIM(ISNULL(si.CODE,'')) AS scd,
   RTRIM(ISNULL(tk.NM1,'')) AS cname,
-  RTRIM(ISNULL(sh.NM1,'')) AS sname,   -- 商品マスタのクリーンな商品名（表示用＝伝票テキストの運賃/入数ゴミを含まない）
-  l.pname AS pname,
-  -- 商品マスタのフィールド規約：商品名1(NM1)=商品名（表示/名前照合）・商品名3(NM3)=メーカーコード（CD一致専用）。
-  --  商品名2/4/5・摘要は「使わない」（運賃/入数/発注先などのゴミが入るため、CD一致に混ぜると誤マッチの元）。
-  --  ＝メーカー品番をマスタの商品名3に入れておけば CD一致で確実に拾える（名前一致には使わない）。
+  RTRIM(ISNULL(sh.NM1,'')) AS sname,
+  ls.pname AS pname,
   RTRIM(ISNULL(sh.NM3,'')) AS mname
-FROM latest l
-JOIN agg a ON a.TOKSHI = l.TOKSHI AND a.SHO = l.SHO
-LEFT JOIN dbo.TOKUI  tk ON tk.ICODE = l.TOKSHI
-LEFT JOIN dbo.SHOHIN sh ON sh.ICODE = l.SHO
-LEFT JOIN dbo.SHIIRE si ON si.ICODE = l.shiicode
-WHERE l.rn = 1
+FROM latest_sell ls
+JOIN agg a ON a.TOKSHI = ls.TOKSHI AND a.SHO = ls.SHO
+LEFT JOIN latest_cost lc ON lc.TOKSHI = ls.TOKSHI AND lc.SHO = ls.SHO AND lc.rn = 1
+LEFT JOIN dbo.TOKUI  tk ON tk.ICODE = ls.TOKSHI
+LEFT JOIN dbo.SHOHIN sh ON sh.ICODE = ls.SHO
+LEFT JOIN dbo.SHIIRE si ON si.ICODE = ls.shiicode
+WHERE ls.rn = 1
   AND RTRIM(ISNULL(tk.CODE,'')) <> '' AND RTRIM(ISNULL(tk.CODE,'')) <> '0000'  -- 諸口(0000)・得意先未設定は除外
   AND RTRIM(ISNULL(sh.CODE,'')) <> ''                                          -- 自社CDが無い行は除外
   AND REPLACE(RTRIM(ISNULL(sh.CODE,'')),'0','') <> ''                          -- 000000等の全ゼロ(プレースホルダ/未設定品)は除外`;

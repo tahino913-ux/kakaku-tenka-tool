@@ -4,6 +4,7 @@
 //   input/<仕入先>_照合結果_*.csv の有無で「照合済み」、
 //   output/<仕入先>_照合結果_見積書_*\ の有無で「見積書作成済み」を判定。
 // =====================================================================
+const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
 const LIST_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -37,7 +38,9 @@ const LIST_PAGE = `<!doctype html>
   .empty{padding:30px;text-align:center;color:#6b7785}
   #msg{font-size:12px}
   .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:6px;font-size:11px;color:#6b7785}
+${SHOGO_LOCK_CSS}
 </style></head><body>
+${SHOGO_LOCK_HTML}
 <header>
   <h1>メーカー見積 一覧 / 進捗</h1>
   <span class="sub">取り込み・照合・見積書の進み具合をひと目で</span>
@@ -77,8 +80,10 @@ const LIST_PAGE = `<!doctype html>
 </div>
 
 <script>
+${SHOGO_LOCK_JS}
 const $=s=>document.querySelector(s);
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function escConfirm(s){return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/\\r/g,'').replace(/\\n/g,'\\\\n');}
 function fmtDate(iso){
   if(!iso) return '';
   const d=new Date(iso); if(isNaN(d)) return '';
@@ -151,14 +156,20 @@ function openInSim(matchFile){
   location.href='/?file='+encodeURIComponent(matchFile);
 }
 async function runShogo(){
+  if($('#runShogoBtn').disabled) return;
   $('#msg').style.color='#6b7785'; $('#msg').textContent='照合中… しばらくお待ちください';
   $('#runShogoBtn').disabled=true;
+  setShogoLock(true,'メーカー見積と販売実績を照合しています…');
   try{
     const r=await fetch('/api/shogo',{method:'POST'}).then(x=>x.json());
+    if(r.busy){
+      $('#msg').style.color='#c0392b'; $('#msg').textContent=r.error||'照合が既に実行中です';
+      return;
+    }
     if(r.ok){ $('#msg').style.color='#2e7d32'; $('#msg').textContent='✓ 完了：'+((r.files&&r.files.length)||0)+' 件の照合結果を出力'; load(); }
     else { $('#msg').style.color='#c0392b'; $('#msg').textContent='失敗：'+(r.error||''); }
   }catch(e){ $('#msg').style.color='#c0392b'; $('#msg').textContent='失敗：'+(e&&e.message||e); }
-  finally{ $('#runShogoBtn').disabled=false; }
+  finally{ $('#runShogoBtn').disabled=false; setShogoLock(false); }
 }
 async function loadLinks(){
   $('#linksArea').innerHTML='<div class="empty">読み込み中…</div>';
@@ -196,7 +207,7 @@ async function unlink(btn){
   const sup = btn.getAttribute('data-sup');
   const code = btn.getAttribute('data-code');
   const maker = btn.getAttribute('data-maker');
-  if(!confirm('紐付けを解除します。よろしいですか？\\n\\n仕入先: '+sup+'\\n自社CD: '+code+'\\nメーカー商品: '+maker)) return;
+  if(!confirm('紐付けを解除します。よろしいですか？\\n\\n仕入先: '+escConfirm(sup)+'\\n自社CD: '+escConfirm(code)+'\\nメーカー商品: '+escConfirm(maker))) return;
   btn.disabled = true;
   try{
     const r = await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -210,6 +221,7 @@ $('#runShogoBtn').addEventListener('click',runShogo);
 $('#reloadLinksBtn').addEventListener('click',loadLinks);
 load();
 loadLinks();
+initShogoLockWatch();
 </script>
 </body></html>`;
 

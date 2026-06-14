@@ -127,7 +127,7 @@ function auditProductLinks(productLinks, matchRowsBySupplier) {
     for (const [code, linked] of Object.entries(codes || {})) {
       const linkedName = String(linked || '').trim();
       if (!linkedName) continue;
-      const hit = rows.filter((r) => r.productCode === code);
+      const hit = rows.filter((r) => codesEqual(r.productCode, code));
       const makers = [...new Set(hit.map((r) => r.makerName).filter(Boolean))];
       if (!hit.length) {
         issues.push({ supplier, code, linked: linkedName, kind: 'orphan', makers: [] });
@@ -176,8 +176,13 @@ function selfTest() {
   const ok2 = !sprayWrong && sprayRight;
   const okPad = lookupProductLink({ '000062': 'テスト品A' }, '62') === 'テスト品A'
     && lookupProductLink({ '62': 'テスト品B' }, '000062') === 'テスト品B';
-  if (!ok || !ok2 || !okPad) {
-    console.error('productLink selfTest FAILED', { exclWrong, exclRight, active, linkSelf, blockOther, sprayWrong, sprayRight, okPad });
+  const auditOk = auditProductLinks(
+    { テスト仕入: { '000062': 'テスト品' } },
+    { テスト仕入: [{ 販売実績商品コード: '62', 照合: '✓ 名前一致(100%)', メーカー商品名: 'テスト品' }] },
+  );
+  const okAudit = auditOk.orphanCount === 0 && auditOk.count === 0;
+  if (!ok || !ok2 || !okPad || !okAudit) {
+    console.error('productLink selfTest FAILED', { exclWrong, exclRight, active, linkSelf, blockOther, sprayWrong, sprayRight, okPad, okAudit, auditOk });
     process.exit(1);
   }
   console.log('productLink selfTest OK');

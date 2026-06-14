@@ -100,6 +100,7 @@ const CDLINK_PAGE = `<!doctype html>
 <script>
 const $=s=>document.querySelector(s);
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function escConfirm(s){return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/\\r/g,'').replace(/\\n/g,'\\\\n');}
 let allCand=[];
 
 function pctTag(p){
@@ -210,7 +211,7 @@ async function loadConf(){
   $('#confArea').querySelectorAll('.act-un').forEach(b=>b.addEventListener('click',()=>unconfirm(b.getAttribute('data-sup'),b.getAttribute('data-code'))));
 }
 async function unconfirm(sup,code){
-  if(!confirm('確定を取り消します。よろしいですか？\\n\\n仕入先: '+sup+'\\n自社コード: '+code)) return;
+  if(!confirm('確定を取り消します。よろしいですか？\\n\\n仕入先: '+escConfirm(sup)+'\\n自社コード: '+escConfirm(code))) return;
   try{
     const r=await fetch('/api/cd-unconfirm',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({supplier:sup,selfCode:code})}).then(x=>x.json());
