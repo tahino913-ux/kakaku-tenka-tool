@@ -109,15 +109,32 @@ function makerProdKey(it) {
   const norm = (s) => String(s == null ? '' : s).normalize('NFKC').replace(/\s+/g, '').toLowerCase();
   return (it.makerCode && String(it.makerCode).trim()) ? ('CD:' + norm(it.makerCode)) : ('NM:' + norm(it.makerName));
 }
+// maker_quotes のファイル名から仕入先ラベルを取る（server.js と同じ規則）。
+function extractSupplierFromMakerFile(filename) {
+  const base = path.basename(String(filename || '')).replace(/\.[^.]+$/, '');
+  const m = base.match(/^メーカー見積_(.+?)_\d{8}_\d{4,6}$/);
+  return m ? m[1] : base;
+}
+// 同一商品キーの上書き判定。問屋名で取込んだCSVを、寄せ先の別名CSV（中央化学→朝日 等）より優先する。
+function shouldReplaceMakerSlot(prev, next) {
+  if (!prev) return true;
+  if (next.direct && !prev.direct) return true;
+  if (!next.direct && prev.direct) return false;
+  return next.ft >= prev.ft;
+}
 // 複数のメーカー見積CSVを「仕入先ごと」に統合（同じ商品は新しい取り込みで上書き＝後勝ち）。
 //  戻り値: Map(仕入先 -> items[])。古い→新しい順に upsert するので、最新の改定（価格・実施日）が残る。
 //  channelMap: { メーカー名: 実際に仕入れる問屋名 }。例 {"エフピコ":"朝日食品容器"}。
 //    問屋経由で買うメーカー（中東xlsxのエフピコシート等）を、実際の仕入先（朝日）に寄せて二重計上を防ぐ。
+//  ⚠ 寄せ先の別名CSV（中央化学.csv 等）は照合.bat の xlsx 展開で mtime だけ新しくなることがある。
+//    問屋名で再取込した価格が古い別名CSVに負ける事故を防ぐため、「ファイル名＝その仕入先」の取込を優先する。
 function mergeMakerFiles(makerFiles, channelMap) {
   channelMap = channelMap || {};
-  const bySupplier = new Map(); // supplier -> Map(prodKey -> item)
+  const bySupplier = new Map(); // supplier -> Map(prodKey -> { item, ft, direct })
   const ordered = makerFiles.slice().sort((a, b) => fileTimeOf(a) - fileTimeOf(b));
   for (const mf of ordered) {
+    const ft = fileTimeOf(mf);
+    const fileSup = extractSupplierFromMakerFile(mf);
     let items;
     // 解析失敗は握りつぶさず警告（黙って空にすると、その仕入先の見積が丸ごと消えても気づけない）。
     try { items = loadMakerQuote(mf); } catch (e) { console.warn('[shogo] メーカー見積CSVの読込に失敗（スキップ）: ' + mf + ' / ' + (e && e.message || e)); items = []; }
@@ -125,12 +142,17 @@ function mergeMakerFiles(makerFiles, channelMap) {
       const raw = it.supplier || '仕入先不明';
       const supplier = channelMap[raw] || raw;            // メーカー→問屋に寄せる
       const item = (supplier === raw) ? it : Object.assign({}, it, { supplier }); // 下流の表示も問屋名に
+      const direct = fileSup === supplier;
+      const key = makerProdKey(item);
       if (!bySupplier.has(supplier)) bySupplier.set(supplier, new Map());
-      bySupplier.get(supplier).set(makerProdKey(item), item); // 後勝ち＝最新で上書き
+      const slot = bySupplier.get(supplier);
+      const next = { item, ft, direct };
+      const prev = slot.get(key);
+      if (shouldReplaceMakerSlot(prev, next)) slot.set(key, next);
     }
   }
   const res = new Map();
-  for (const [sup, m] of bySupplier) res.set(sup, [...m.values()]);
+  for (const [sup, m] of bySupplier) res.set(sup, [...m.values()].map((s) => s.item));
   return res;
 }
 
@@ -337,6 +359,13 @@ function run(argv) {
     console.log('✓ ' + supplier + tag + ': 統合メーカー品 ' + items.length + ' → 照合行 ' + rows.length + '（一致 ' + matched + ' / 休眠 ' + dormant + '）');
     console.log('   出力: input/' + path.basename(out));
   }
+  try {
+    const { pruneInputCsv } = require('./pruneInput');
+    const pr = pruneInputCsv({ minStale: 3 });
+    if (pr.moved > 0) {
+      console.log('   整理: 古い照合CSV ' + pr.moved + ' 件を input/_old/ へ退避（最新 ' + pr.kept + ' 本）');
+    }
+  } catch (_) {}
   console.log('\n完了。シミュレーション画面（sim.bat）で照合結果CSVを選んで見積書を出せます。');
   return outFiles;
 }
@@ -345,4 +374,45 @@ if (require.main === module) {
   try { run(process.argv); }
   catch (e) { console.error('✗ ' + (e && e.message || e)); process.exit(1); }
 }
-module.exports = { run, loadHanbaiRecords, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey, fileTimeOf, shogoRequiresDb, assertShogoHanbaiSafe, SELF_HANBAI_MIN_POOL }; // makerProdKey=取込重複ヒント用
+function mergeMakerFilesSelfTest() {
+  const channel = { 中央化学: '朝日食品容器' };
+  const asahi = {
+    supplier: '朝日食品容器', makerCode: '92988', makerName: 'CF寿司容器L 0.4 華紋 身',
+    currentCost: 9.53, newCost: 11.44, switchDate: '2026-06-01',
+  };
+  const chuo = Object.assign({}, asahi, { supplier: '中央化学', newCost: 12.4 });
+  const mk = (basename, ft, items) => {
+    const p = path.join(ROOT, basename);
+    const header = '仕入先,メーカー品番,メーカー商品名,規格,現単価,新単価,切替日';
+    const line = (it) => [it.supplier, it.makerCode, it.makerName, '', it.currentCost, it.newCost, it.switchDate].join(',');
+    fs.writeFileSync(p, header + '\n' + line(items[0]), 'utf8');
+    fs.utimesSync(p, new Date(ft), new Date(ft));
+    return p;
+  };
+  const newer = 2000000000000;
+  const older = 1000000000000;
+  const pAsahi = mk('メーカー見積_朝日食品容器_20260101_120000.csv', older, [asahi]);
+  const pChuo = mk('中央化学.csv', newer, [chuo]);
+  try {
+    const map = mergeMakerFiles([pChuo, pAsahi], channel);
+    const hit = (map.get('朝日食品容器') || []).find((it) => it.makerCode === '92988');
+    if (!hit || hit.newCost !== 11.44) {
+      throw new Error('direct朝日優先: expected 11.44 got ' + (hit && hit.newCost));
+    }
+    const map2 = mergeMakerFiles([pChuo], channel);
+    const only = (map2.get('朝日食品容器') || []).find((it) => it.makerCode === '92988');
+    if (!only || only.newCost !== 12.4) {
+      throw new Error('別名のみ: expected 12.4 got ' + (only && only.newCost));
+    }
+    return true;
+  } finally {
+    try { fs.unlinkSync(pAsahi); } catch (_) {}
+    try { fs.unlinkSync(pChuo); } catch (_) {}
+  }
+}
+
+module.exports = {
+  run, loadHanbaiRecords, loadMakerQuote, resolveHanbaiSource, mergeMakerFiles, makerProdKey,
+  fileTimeOf, extractSupplierFromMakerFile, shouldReplaceMakerSlot, mergeMakerFilesSelfTest,
+  shogoRequiresDb, assertShogoHanbaiSafe, SELF_HANBAI_MIN_POOL,
+}; // makerProdKey=取込重複ヒント用

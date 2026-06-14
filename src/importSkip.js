@@ -13,11 +13,18 @@ function getImportSkips(supplier) {
   return Array.isArray(arr) ? arr : [];
 }
 
-function lookupImportSkip(supplier, row) {
+function importSkipMap(supplier) {
+  const map = new Map();
+  for (const x of getImportSkips(supplier)) map.set(x.key, x);
+  return map;
+}
+
+function lookupImportSkip(supplier, row, skipMap) {
   const sup = String(supplier || '').trim();
   if (!sup) return null;
   const key = makerProdKey({ makerCode: row.makerCode, makerName: row.makerName });
   if (!key) return null;
+  if (skipMap && skipMap instanceof Map) return skipMap.get(key) || null;
   return getImportSkips(sup).find((x) => x.key === key) || null;
 }
 
@@ -87,4 +94,4 @@ function selfTest() {
 
 if (require.main === module) selfTest();
 
-module.exports = { getImportSkips, lookupImportSkip, updateImportSkips, removeImportSkip, selfTest };
+module.exports = { getImportSkips, importSkipMap, lookupImportSkip, updateImportSkips, removeImportSkip, selfTest };

@@ -3,6 +3,7 @@
 //  PDF/Excelの表をコピペ → 自動で列に分解 → 列の意味を指定・ズレを修正 →
 //  正規化したメーカー見積CSV(maker_quotes/)として保存。
 // =====================================================================
+const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
 const IMPORT_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -49,7 +50,9 @@ const IMPORT_PAGE = `<!doctype html>
   #skipPanelBody .skipRmBtn{ border:1px solid #c7b8d8; border-radius:5px; background:#fff; color:#4a3560; cursor:pointer }
   #skipPanelBody .skipRmBtn:hover{ background:#ede4f4 }
   a.skipPanelLink{ color:#1f4e78; font-weight:700 }
+${SHOGO_LOCK_CSS}
 </style></head><body>
+${SHOGO_LOCK_HTML}
 <header>
   <h1>メーカー見積 取り込み</h1>
   <button id="resetBtn" type="button" title="入力中の仕入先・取り込みデータをすべて消して、別の仕入先を最初から取り込みます" style="margin-left:auto;background:rgba(255,255,255,.18);color:#fff;border:1px solid rgba(255,255,255,.6);border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer">🆕 入力をクリア（別の仕入先へ）</button>
@@ -182,6 +185,7 @@ const IMPORT_PAGE = `<!doctype html>
 </div>
 
 <script>
+${SHOGO_LOCK_JS}
 const $=s=>document.querySelector(s);
 const FIELDS=[['','（無視）'],['makerCode','メーカー品番'],['makerName','メーカー商品名'],['selfCode','自社コード'],['spec','規格'],['currentCost','現単価'],['newCost','新単価'],['switchDate','切替日']];
 let grid=[];
@@ -260,6 +264,9 @@ function renderImportHintHtml(res, detailed){
     html='ℹ️ <b>この仕入先は過去に取込済みです</b>'+meta;
     html+='<br>表を読み込むと品番・商品名で重複をチェックします。';
   }
+  if(res.savedSkipCount>0){
+    html+='<br>📝 <b>取込対象外の記録 '+res.savedSkipCount+' 品</b>あり。該当品は<b>自動でチェック OFF</b>（紫背景）。'+skipLink;
+  }
   if(res.needsRematch) html+='<br><span style="color:#7a5300">※ 前回の取込後、まだ再照合されていません（保存後は自動照合されます）。</span>';
   return { html, kind, style: importHintBoxStyle(kind) };
 }
@@ -293,19 +300,28 @@ function updateNoiseBarCount(){
 }
 function bindNoiseBarButtons(){
   const ex=$('#noiseExcludeAll'), inc=$('#noiseIncludeAll');
-  if(ex) ex.onclick=()=>{ $('#grid').querySelectorAll('tr.noise-row input.rowinc').forEach(c=>{ c.checked=false; }); updateNoiseBarCount(); scheduleImportHint(); };
+  if(ex) ex.onclick=()=>{ $('#grid').querySelectorAll('tr.noise-row input.rowinc').forEach(c=>{ c.checked=false; c.dataset.userToggled='1'; }); updateNoiseBarCount(); scheduleImportHint(); };
   if(inc) inc.onclick=()=>{ $('#grid').querySelectorAll('input.rowinc').forEach(c=>{ c.checked=true; c.dataset.userToggled='1'; }); updateNoiseBarCount(); scheduleImportHint(); };
 }
 function collectSkipped(){
   const rows=previewRowsFromGrid();
   const skipped=[];
+  const els=rowElMap();
   rows.forEach(row=>{
-    const cb=$('#grid').querySelector('input.rowinc[data-r="'+row.ri+'"]');
+    const el=els.get(String(row.ri));
+    const cb=el&&el.cb;
     if(cb&&!cb.checked){
       skipped.push({makerCode:row.makerCode,makerName:row.makerName,reason:String(cb.title||'').trim()||'取込対象外'});
     }
   });
   return skipped;
+}
+function rowElMap(){
+  const m=new Map();
+  $('#grid').querySelectorAll('tbody tr[data-ri]').forEach(tr=>{
+    m.set(tr.dataset.ri, {tr, cb: tr.querySelector('input.rowinc')});
+  });
+  return m;
 }
 async function refreshNoiseRows(){
   const bar=$('#noiseBar'); const rows=previewRowsFromGrid();
@@ -314,10 +330,12 @@ async function refreshNoiseRows(){
   try{
     const res=await fetch('/api/noise-rows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,rows:rows.map(({ri,...rest})=>rest)})}).then(x=>x.json());
     let noiseCount=0, rememberedCount=0;
+    const els=rowElMap();
     rows.forEach((row,i)=>{
       const info=(res.flags||[])[i]||{};
-      const cb=$('#grid').querySelector('input.rowinc[data-r="'+row.ri+'"]');
-      const tr=cb&&cb.closest('tr');
+      const el=els.get(String(row.ri));
+      const cb=el&&el.cb;
+      const tr=el&&el.tr;
       const exclude=!!info.noise||!!info.remembered;
       if(info.remembered) rememberedCount++;
       if(info.noise&&!info.remembered) noiseCount++;
@@ -344,7 +362,7 @@ async function refreshNoiseRows(){
       let msg='';
       if(rememberedCount>0) msg+='📝 <b>前回取込対象外 '+rememberedCount+' 件</b>をこの表で検出（自動でチェック OFF）。記録済みは合計 '+savedTotal+' 品。';
       if(noiseCount>0) msg+=(msg?'<br>':'')+'⚠ <b>非商品の可能性 '+noiseCount+' 件</b>（運賃案内・見出し再掲・休暇告知など）。';
-      msg+=' <b>チェックを外した行は保存されません</b>（次回も記憶します）。';
+      msg+=' <b>チェックを外した行は今回の CSV に含まれません</b>（次回も記憶）。※既に maker_quotes にある品は残ります。';
       bar.innerHTML=msg
         +' <span class="noiseCnt" style="display:none"></span>'
         +' <button type="button" id="noiseExcludeAll" class="go" style="background:#8a6d3b;padding:4px 10px;font-size:11px;margin-left:6px">非商品候補をすべて除外</button>'
@@ -374,7 +392,7 @@ async function refreshSkipRecordPanel(){
     if(cnt) cnt.textContent=String(skips.length);
     if(!skips.length){ panel.style.display='none'; return; }
     panel.style.display='block';
-    let h='<p style="margin:0 0 8px;font-size:11px;color:#6b5785">チェックを外して保存した品です。次回同じ品番・商品名が表に出ると<b>自動でチェック OFF</b>（紫背景）になります。<br>「解除」すると記録から消え、次回は自動除外されません。</p>';
+    let h='<p style="margin:0 0 8px;font-size:11px;color:#6b5785">チェックを外して保存した品です。次回同じ品番・商品名が表に出ると<b>自動でチェック OFF</b>（紫背景）になります。<br>「解除」すると記録から消え、次回は自動除外されません。<br>※記録は最大250件（古いものから削除）。既に取込済みの品は maker_quotes からは消えません。</p>';
     h+='<div class="wrap" style="max-height:220px"><table style="width:100%"><thead><tr><th>品番</th><th>商品名</th><th>理由</th><th>記録日</th><th>回</th><th></th></tr></thead><tbody>';
     const show=skips.slice(0, 80);
     show.forEach(s=>{
@@ -433,16 +451,29 @@ async function refreshImportHintEarly(){
     el.style.display='block';
   }catch(e){ el.style.display='none'; }
 }
+function previewItemsForHint(){
+  if(!grid.length) return [];
+  if($('#mapArea').style.display!=='none' && $('#grid').querySelector('thead select')){
+    const map={};
+    $('#grid').querySelectorAll('thead select').forEach(s=>{ if(s.value) map[s.value]=+s.dataset.c; });
+    const hasH=$('#hasHeader').checked;
+    const dataRows=hasH?grid.slice(1):grid;
+    const items=[];
+    dataRows.forEach(r=>{
+      const get=f=>map[f]!=null?String(r[map[f]]||'').trim():'';
+      const mc=get('makerCode'), mn=get('makerName');
+      if(mc||mn) items.push({makerCode:mc,makerName:mn});
+    });
+    return items;
+  }
+  return previewItemsFromGrid();
+}
 async function refreshImportHint(){
   const el=$('#importHint'); if(!el) return;
   const supplier=$('#supplier').value.trim();
   if(!supplier||!grid.length){ if(el) el.style.display='none'; refreshImportHintEarly(); return; }
   $('#importHintEarly').style.display='none';
-  let items=[];
-  if($('#mapArea').style.display!=='none'){
-    try{ const c=collect(); items=(c.items||[]).filter(it=>String(it.makerCode||'').trim()||String(it.makerName||'').trim()); }catch(e){}
-  }
-  if(!items.length) items=previewItemsFromGrid();
+  const items=previewItemsForHint();
   try{
     const res=items.length
       ? await fetch('/api/maker-import-check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({supplier,items})}).then(x=>x.json())
@@ -550,6 +581,7 @@ function onPurchaseCodePick(){
   warnSupplierMismatch();
   refreshImportHintEarly();
   scheduleSkipRecordPanel();
+  if(grid.length){ scheduleNoiseRefresh(); scheduleImportHint(); }
 }
 function updatePurchaseBadge(){
   const code=$('#purchaseCodeSel').value;
@@ -565,7 +597,9 @@ function onSupplierPick(){
     //  （問屋の下のメーカー名を手入力するケース＝コードは問屋のまま）。
     activeProfile=null; $('#supplier').value=''; $('#supplier').focus();
     $('#profMsg').textContent='';
-    showProfSummary(); updateStep2Lock(); scheduleSkipRecordPanel(); return;
+    showProfSummary(); updateStep2Lock(); scheduleSkipRecordPanel();
+    if(grid.length){ scheduleNoiseRefresh(); scheduleImportHint(); }
+    return;
   }
   $('#supplier').value=v;
   activeProfile=MAKERS[v]||null;
@@ -584,6 +618,7 @@ function onSupplierPick(){
   warnSupplierMismatch();
   refreshImportHintEarly();
   scheduleSkipRecordPanel();
+  if(grid.length){ scheduleNoiseRefresh(); scheduleImportHint(); }
 }
 // ① の入力状態に応じて ② のフォームを有効／無効化
 function updateStep2Lock(){
@@ -743,13 +778,35 @@ function jpDateToISO(s,refDate){
 //  正規表現は使わない（テンプレ配信での \\d 事故回避）。
 function isIso10(e){ if(!e||e.length!==10||e[4]!=='-'||e[7]!=='-') return false; for(let i=0;i<10;i++){ if(i===4||i===7) continue; if(e[i]<'0'||e[i]>'9') return false; } return true; }
 function plus3moIso(){ const d=new Date(); d.setMonth(d.getMonth()+3); const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
-// 現在のマッピングで実施日が3か月以上先の行を返す（[{name,date}]）。
+// 現在のマッピングで実施日が3か月以上先の行を返す（[{name,date}]）。collect() は使わず日付・名前列だけ読む。
 function farFutureDates(){
-  let items=[]; try{ items=(collect().items)||[]; }catch(e){ items=[]; }
   const lim=plus3moIso(); const ref=new Date(); const bad=[];
-  items.forEach(it=>{ const iso=jpDateToISO(it.switchDate,ref); if(isIso10(iso) && iso>lim) bad.push({name:it.makerName||it.makerCode||it.selfCode||'(無名)', date:iso}); });
+  if(!grid.length) return {bad, lim};
+  const map={};
+  $('#grid').querySelectorAll('thead select').forEach(s=>{ if(s.value) map[s.value]=+s.dataset.c; });
+  const dateCol=map.switchDate;
+  const nameCols=[map.makerName,map.makerCode,map.selfCode].filter(c=>c!=null);
+  if(dateCol==null && !(forcedSwitchDate&&forcedSwitchDate.date)) return {bad, lim};
+  $('#grid').querySelectorAll('tbody tr[data-ri]').forEach(tr=>{
+    let sd='';
+    if(dateCol!=null){
+      const inp=tr.querySelector('input[data-c="'+dateCol+'"]');
+      if(inp) sd=inp.value.trim();
+    }
+    if(forcedSwitchDate&&forcedSwitchDate.date&&(forcedSwitchDate.scope==='all'||!sd)) sd=forcedSwitchDate.date;
+    const iso=jpDateToISO(sd,ref);
+    if(!isIso10(iso)||iso<=lim) return;
+    let name='(無名)';
+    for(let i=0;i<nameCols.length;i++){
+      const inp=tr.querySelector('input[data-c="'+nameCols[i]+'"]');
+      if(inp&&inp.value.trim()){ name=inp.value.trim(); break; }
+    }
+    bad.push({name, date:iso});
+  });
   return {bad, lim};
 }
+let farFutureTimer=null;
+function scheduleFarFutureCheck(){ clearTimeout(farFutureTimer); farFutureTimer=setTimeout(checkFarFutureDates, 350); }
 // アラート枠の表示／非表示を更新（保存はブロックしない＝注意喚起のみ）。
 function checkFarFutureDates(){
   const el=$('#dateAlert'); if(!el) return 0;
@@ -786,7 +843,6 @@ function loadRows(rows){
     ? '✓ '+auto+' 行の挨拶文・余白を自動で除外しました（違う場合は数字を変更できます）'
     : '（必要なら数字を変えて先頭行を捨てられます）';
   applySkipAndRender();
-  scheduleImportHint();
 }
 function applySkipAndRender(){
   if(!originalRows.length) return;
@@ -821,7 +877,7 @@ function applySkipAndRender(){
   render(cols, skippedPadded);
   if(!suppressProfile) applyProfile();
   else applyPriceFormatToGrid();
-  checkFarFutureDates();
+  scheduleFarFutureCheck();
   scheduleImportHint();
 }
 // 適切なCSVパーサ（クォート対応）。ファイル選択でのCSV読み込みに使用。
@@ -935,7 +991,7 @@ function render(cols, skippedRows){
   }
   html+='</tr></thead><tbody>';
   dataRows.forEach((r,ri)=>{
-    html+='<tr>';
+    html+='<tr data-ri="'+ri+'">';
     html+='<td class="incell"><input type="checkbox" class="rowinc" data-r="'+ri+'" checked title="取り込む"></td>';
     for(let c=0;c<cols;c++){
       const fld=hasH?guess(headerRow[c]):'';
@@ -950,7 +1006,7 @@ function render(cols, skippedRows){
   $('#mapArea').style.display='block';
   applyPriceFormatToGrid(); // 列対応プルダウンに合わせて現・新単価を銭表示に
   applyForcedDateToGrid(); // 一括 実施日が設定済みなら、再描画後も切替日列へ反映し続ける
-  checkFarFutureDates();   // 実施日が3か月以上先の行があれば警告（年の打ち間違い検知）
+  requestAnimationFrame(()=>{ scheduleFarFutureCheck(); }); // 初回描画後に日付警告（大量行の描画を先に終える）
   $('#grid').querySelectorAll('thead select').forEach(s=>{
     s.addEventListener('change', ()=>{ scheduleImportHint(); scheduleNoiseRefresh(); });
   });
@@ -961,6 +1017,7 @@ function render(cols, skippedRows){
   scheduleNoiseRefresh();
 }
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function escConfirm(s){return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/\\r/g,'').replace(/\\n/g,'\\\\n');}
 function collect(){
   const map={};
   $('#grid').querySelectorAll('thead select').forEach(s=>{ if(s.value) map[s.value]=+s.dataset.c; });
@@ -978,7 +1035,7 @@ function collect(){
     }
     if(String(it.currentCost||'').trim()!=='') it.currentCost=senPrice(it.currentCost);
     if(String(it.newCost||'').trim()!=='') it.newCost=senPrice(it.newCost);
-    if(it.makerName||it.makerCode||it.newCost) items.push(it);
+    if(it.makerName||it.makerCode||it.newCost||it.currentCost) items.push(it);
   });
   return {map,items};
 }
@@ -1084,8 +1141,8 @@ $('#bulkDateBtn').addEventListener('click',()=>{
 // 列の再マップ（thead select）やセルの直接編集（tbody input）で実施日アラートを再判定。
 $('#grid').addEventListener('change',e=>{
   if(!e.target) return;
-  if(e.target.tagName==='SELECT'){ applyPriceFormatToGrid(); checkFarFutureDates(); }
-  else if(e.target.tagName==='INPUT') checkFarFutureDates();
+  if(e.target.tagName==='SELECT'){ applyPriceFormatToGrid(); scheduleFarFutureCheck(); }
+  else if(e.target.tagName==='INPUT') scheduleFarFutureCheck();
 });
 $('#grid').addEventListener('blur',e=>{
   const inp=e.target; if(!inp||!inp.dataset||inp.dataset.c==null) return;
@@ -1174,16 +1231,21 @@ $('#saveBtn').addEventListener('click',async()=>{
   const excludedCount=$('#grid').querySelectorAll('input.rowinc:not(:checked)').length;
   // 取り違えガード：表示中のデータを読み込んだ仕入先と、保存先の仕入先が違うときは確認する。
   if(loadedForSupplier && loadedForSupplier!==supplier &&
-     !confirm('表示中のデータは「'+loadedForSupplier+'」で読み込んだものです。\\nこれを「'+supplier+'」として保存します。よろしいですか？')){ return; }
+     !confirm('表示中のデータは「'+escConfirm(loadedForSupplier)+'」で読み込んだものです。\\nこれを「'+escConfirm(supplier)+'」として保存します。よろしいですか？')){ return; }
   // 実施日が3か月以上先の行があれば、年の打ち間違いの可能性を確認（保存はブロックしない）。
   const ff=checkFarFutureDates();
   if(ff>0 && !confirm('実施日が3か月以上先の行が '+ff+' 件あります。\\n年の打ち間違い（例 2027→2026）ではありませんか？\\nこのまま保存しますか？')){ return; }
   $('#msg').style.color='#6b7785'; $('#msg').textContent='保存中…';
+  setShogoLock(true,'メーカー見積を保存し、照合を実行しています…');
   const purchaseCode=$('#purchaseCodeSel').value.trim();
   const skippedItems=collectSkipped();
   const payload={supplier,items,map,delim:$('#delim').value,hasHeader:$('#hasHeader').checked,purchaseCode,skippedItems};
   try{
     const res=await fetch('/api/maker-quote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(x=>x.json());
+    if(res.busy){
+      $('#msg').style.color='#c0392b'; $('#msg').textContent=res.error||'照合が既に実行中です。完了までお待ちください。';
+      return;
+    }
     if(res.ok){
       let extra='', kind='ok';
       if(res.shogo && res.shogo.ok){
@@ -1196,6 +1258,8 @@ $('#saveBtn').addEventListener('click',async()=>{
       const linkMsg=(res.linkedCount>0)?' ／ 📌 自社コード入力 '+res.linkedCount+'件を手動紐付け（100%確定）として登録しました。':'';
       let okMsg='✓ <b>'+esc(supplier)+'</b> を保存しました（'+res.count+'件'+(excludedCount?('・除外 '+excludedCount+' 行'):'')+'）。書式（列の対応）も登録したので次回から自動適用されます。 → '+esc(res.file||'')+linkMsg+extra;
       if(res.recordedSkips) okMsg+='<br>📝 取込対象外 <b>'+res.recordedSkips+' 件</b>を記録しました（次回同じ品は自動で除外）。'+(res.savedSkipTotal!=null?' 記録合計 '+res.savedSkipTotal+' 品。':'');
+      if(res.droppedNoise) okMsg+='<br>ℹ 非商品行 <b>'+res.droppedNoise+' 件</b>は保存から除外しました（照合経路と同じ判定）。';
+      if(res.skipRecordError){ kind='warn'; okMsg+='<br>⚠ 取込対象外の記録の保存に失敗しました：'+esc(res.skipRecordError); }
       okMsg+='<br><b>続けて別の仕入先を取り込めます</b>（入力はクリアしました。① で次の仕入先を選んでください）。';
       // 二重登録の警告：同じ商品が「別の仕入先」にも登録されている＝取り違えの可能性。
       const dw=res.dupWarning;
@@ -1218,7 +1282,9 @@ $('#saveBtn').addEventListener('click',async()=>{
     }
     else { $('#msg').style.color='#c0392b'; $('#msg').textContent='保存失敗: '+(res.error||''); }
   }catch(e){ $('#msg').style.color='#c0392b'; $('#msg').textContent='保存失敗: '+e; }
+  finally{ setShogoLock(false); }
 });
+initShogoLockWatch();
 </script>
 </body></html>`;
 
