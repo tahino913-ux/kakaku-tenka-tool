@@ -361,11 +361,30 @@ function matchOne(item, hanbai, opts = {}) {
   //  例 008080「ﾄﾚｰ279-1」は自社製造分類だが過去伝票の発注先が0014(北原)のため、除外しないと北原の値上げ
   //  「トレー279-1」に名前一致して二重計上になる（自社製造品は9000側だけに出すのが正）。
   const excludeSelf = opts.excludeSelfCodes;
+  // 却下ペア（人が /cdlink で「別物」と却下した 自社CD｜メーカー品番）はこのメーカー品の照合候補から除外する。
+  //  ＝同名・別品番の取り違え（例 007798「WS-120」に W-120 のメーカー品番3500813が名前一致100%）の再発防止。
+  //  rejected は settings.cdReview.rejected[仕入先]={ '自社CD|メーカー品番': 却下日時 }（raw形式）。
+  //  メーカー品番を NFKC+小文字+空白除去 で正規化して item.makerCode と突き合わせ、一致する却下分の自社CD集合を作る。
+  const supRejected = (opts.rejected && opts.rejected[item.supplier]) || null;
+  const rejectedSelf = new Set();
+  if (supRejected) {
+    const normCode = (x) => String(x == null ? '' : x).normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+    const mcNorm = normCode(item.makerCode);
+    if (mcNorm) {
+      for (const key of Object.keys(supRejected)) {
+        const bar = key.lastIndexOf('|');
+        if (bar < 0) continue;
+        if (normCode(key.slice(bar + 1)) === mcNorm) rejectedSelf.add(padSelfCode(key.slice(0, bar)));
+      }
+    }
+  }
   // (得意先CD + 自社商品CD) ごとに最良の1件へ集約
   const best = new Map();
   for (const r of hanbai) {
     // 自社製造分類の自社CDは他の仕入先には出さない（名前一致・CD一致・手動紐付けすべてに優先して除外）
     if (excludeSelf && excludeSelf.size && excludeSelf.has(padSelfCode(r.productCode))) continue;
+    // 却下済みの (自社CD × このメーカー品番) は照合しない（CD一致・名前一致・価格救済すべてに優先）
+    if (rejectedSelf.size && rejectedSelf.has(padSelfCode(r.productCode))) continue;
     // 手動紐付けチェック: その自社CDが他メーカー品に予約されているならスキップ（取り合い防止）
     const linkedMakerName = lookupProductLink(supLinks, r.productCode);
     const makerNamesInQuote = opts.makerNamesInQuote;

@@ -248,6 +248,8 @@ function run(argv) {
   // 価格不一致による除外しきい値＝見積書しきい値(matchThreshold)。これ未満（=要確認ノイズ）だけを掃除する。
   const priceVetoBelow = Number(s.matchThreshold) || 80;
   const productLinks = s.productLinks || {};
+  // 却下情報（/cdlink で「別物」と却下した 自社CD｜メーカー品番）。照合エンジンが取り違え再発を防ぐのに使う。
+  const rejected = (s.cdReview && s.cdReview.rejected) || {};
 
   // 引数解釈：拡張子で「メーカー見積(.xlsx/.csv)」か「販売実績(.xls)」かをざっくり判定
   const args = argv.slice(2);
@@ -349,7 +351,7 @@ function run(argv) {
     const pool = isSelf ? getSelfHanbai() : hanbai;
     // 非9000の照合だけ、自社製造分類の自社CDを候補から除外（9000自身の照合には渡さない＝自社製造品はそのまま拾う）。
     const excludeSelfCodes = isSelf ? null : selfMadeCodes;
-    const rows = matchAll(items, pool, { nameFloor, productLinks, purchaseCode, priceVetoBelow, excludeSelfCodes });
+    const rows = matchAll(items, pool, { nameFloor, productLinks, rejected, purchaseCode, priceVetoBelow, excludeSelfCodes });
     const matched = rows.filter((r) => /^✓/.test(r.status)).length;
     const dormant = rows.length - matched;
     const out = uniqueOutPath(INPUT_DIR, supplier, usedOut);
