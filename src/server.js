@@ -3348,7 +3348,7 @@ const PAGE = `<!doctype html>
          --accent:#1f4e78; --pos:#2e7d32; --neg:#c0392b; --hi:#fff7ec; }
   *{ box-sizing:border-box }
   body{ margin:0; font-family:"メイリオ","Meiryo","Segoe UI",sans-serif; background:var(--bg); color:var(--ink); font-size:13px; }
-  header{ background:var(--accent); color:#fff; padding:10px 16px; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header{ background:var(--accent); color:#fff; padding:10px 16px; display:flex; align-items:center; gap:14px; flex-wrap:wrap; position:sticky; top:0; z-index:50; }
   header h1{ font-size:16px; margin:0; font-weight:700; }
   header .sub{ color:#cfe0f0; font-size:12px; }
   .bar{ background:var(--card); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:18px; align-items:flex-end; flex-wrap:wrap; }
@@ -3369,7 +3369,7 @@ const PAGE = `<!doctype html>
   .wrap::-webkit-scrollbar-thumb:hover{ background:#9aa9b8; }
   /* 表のすぐ上に「常に見える」横スクロールバー。画面に貼り付き、表と左右が連動する。
      表の下端まで行かなくても右側の列へスライドできるようにするための補助バー。 */
-  .hbar{ position:sticky; top:0; z-index:6; margin:0 16px; height:16px; overflow-x:auto; overflow-y:hidden;
+  .hbar{ position:sticky; top:var(--hdr-h,52px); z-index:6; margin:0 16px; height:16px; overflow-x:auto; overflow-y:hidden;
          background:#e3eaf2; border:1px solid var(--line); border-bottom:none; border-radius:8px 8px 0 0; display:none; }
   .hbar::-webkit-scrollbar{ height:14px; }
   .hbar::-webkit-scrollbar-thumb{ background:#8fa3b8; border-radius:7px; }
@@ -3548,7 +3548,8 @@ ${SHOGO_LOCK_HTML}
 <header>
   <h1>価格転嫁シミュレーション</h1>
   <span class="sub">メーカー改定額を入れて、転嫁後の単価・粗利・年間影響を試算</span>
-  <button id="calBtn" style="margin-left:auto" title="実施日カレンダーの表示／非表示を切り替えます（常にページ上部に表示されています）">📅 実施日カレンダー</button>
+  <a id="toCustomersBtnNav" href="/customers" style="margin-left:auto;background:#1b6b3a;color:#fff;text-decoration:none;padding:8px 14px;border-radius:8px;font-weight:700;white-space:nowrap" title="得意先別ページを開いて、得意先ごとに価格を決めて見積書を作成します" onmouseover="this.style.background='#15532c'" onmouseout="this.style.background='#1b6b3a'">👥 見積書を作成</a>
+  <button id="calBtn" style="margin-left:0" title="実施日カレンダーの表示／非表示を切り替えます（常にページ上部に表示されています）">📅 実施日カレンダー</button>
   <button id="exclBtn" style="margin-left:0" title="すでに取引が無いのに照合に出てくる得意先を、画面・損益・見積書から隠します（いつでも復活できます）">🚫 得意先 除外設定</button>
   <a href="/manual" id="manualLink" target="_blank" style="margin-left:0" title="このツールの使い方手順書を新しいタブで開きます">📖 使い方</a>
   <a href="/list" id="listLink" style="margin-left:0">📊 一覧・進捗</a>
@@ -3662,15 +3663,8 @@ ${SHOGO_LOCK_HTML}
   </div>
 </div>
 
-<!-- 見積書作成への導線（メインは照合確認用 → 見積書は得意先別ページで）。独立バナーで目立たせる。 -->
-<div style="margin:0 16px 12px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:#eaf6ee;border:1px solid #bfe0c4;border-left:6px solid #1b6b3a;border-radius:10px;padding:12px 16px">
-  <span style="font-size:20px">🧾</span>
-  <div style="flex:1;min-width:200px">
-    <div style="font-weight:700;color:#1b5e34;font-size:14px">価格の設定・見積書の作成は「得意先別ページ」で行います</div>
-    <div style="color:#3c6b4a;font-size:12px;margin-top:2px">このメイン画面は<b>照合・紐付けの確認</b>用です（照合が正しいかを確認し、休眠は紐付けで救済）。価格は得意先ごとに得意先別ページで設定してください。</div>
-  </div>
-  <a id="toCustomersBtn" href="/customers" style="background:#1b6b3a;color:#fff;text-decoration:none;display:inline-block;text-align:center;padding:11px 20px;border-radius:8px;font-size:14px;font-weight:700;white-space:nowrap" onmouseover="this.style.background='#15532c'" onmouseout="this.style.background='#1b6b3a'">👥 得意先別ページで見積書を作成 →</a>
-</div>
+<!-- メインは照合・紐付けの確認用。価格設定・見積書作成は得意先別ページ（ヘッダーの「👥 見積書を作成」）で。 -->
+<div style="margin:2px 16px 10px;color:#5a6b7d;font-size:12px">※ この画面は<b>照合・紐付けの確認</b>用です。価格の設定・見積書の作成は上部の「👥 見積書を作成」から。</div>
 
 <div id="msg"></div>
 
@@ -5378,8 +5372,13 @@ async function loadCdCandidates(){
       +'<div style="font-size:11px;margin-top:3px;color:#3a567a">「コード化ページ」で1件ずつ確認→確定（確定はすぐ手動紐付けで効きます）→ たまったら商品名3登録用CSVで販売大臣に登録 → 「↻ 照合を実行」でCD一致に昇格。</div>';
   }catch(e){ box.style.display='none'; }
 }
+// 固定ヘッダーの高さを測り、横スクロールバー(.hbar)の sticky 位置をヘッダー直下に合わせる（折り返しで高さが変わるため）。
+function syncHdrH(){ const h=document.querySelector('header'); if(h) document.documentElement.style.setProperty('--hdr-h', Math.ceil(h.getBoundingClientRect().height)+'px'); }
+window.addEventListener('resize', syncHdrH);
 (async ()=>{
+  syncHdrH();
   await initSettings();
+  syncHdrH();
   fetchPL();
   const smTh = $('#sortMatchTh');
   if (smTh) { updateSortMatchTh(); smTh.addEventListener('click', cycleMainSort); }
