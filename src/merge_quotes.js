@@ -30,6 +30,11 @@ function jpDate() {
 function sanitizeName(s) {
   return String(s || '得意先不明').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').replace(/[.\s]+$/, '').trim() || '得意先不明';
 }
+// 見積書ファイル名の得意先名には必ず敬称「様」を付ける（既に 様/御中/殿 で終わる場合は付けない）。server.js と同じ規則。
+function quoteFileName(customer) {
+  const base = sanitizeName(customer);
+  return '見積_' + (/(様|御中|殿)$/.test(base) ? base : base + '様') + '.xlsx';
+}
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : v; }
 
 // 実施日の正常化:
@@ -169,7 +174,7 @@ function run(folders) {
     if (!rows.length) return;   // 全行が異常な得意先（自社消費分など）は見積書を作らない
     idx++;
     const quoteNo = ymd + '-' + String(idx).padStart(3, '0');
-    const fname = `見積_${sanitizeName(customer)}.xlsx`;
+    const fname = quoteFileName(customer);
     writeQuote(customer, rows, path.join(outFolder, fname), Object.assign({}, opt, { quoteNo }));
     written.push({ customer, items: rows.length, suppliers: [...ent.suppliers] });
     if (ent.suppliers.size > 1) multi++;

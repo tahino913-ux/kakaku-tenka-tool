@@ -114,7 +114,7 @@ function buildIssuedQuotesList() {
     if (!ent) continue;
     const folder = String(ent.folder || '');
     const folderPath = folder ? path.join(OUTPUT_DIR, folder) : '';
-    const filePath = folder ? path.join(folderPath, `見積_${sanitizeName(customer)}.xlsx`) : '';
+    const filePath = folder ? findQuoteFile(folderPath, customer) : '';
     const row = {
       customer,
       lastIssuedAt: ent.lastIssuedAt || '',
@@ -122,7 +122,7 @@ function buildIssuedQuotesList() {
       itemCount: Number(ent.itemCount) || 0,
       count: Number(ent.count) || 1,
       folder,
-      fileExists: !!(filePath && fs.existsSync(filePath)),
+      fileExists: !!filePath,
       folderExists: !!(folderPath && fs.existsSync(folderPath)),
     };
     items.push(row);
@@ -1322,6 +1322,25 @@ function parsePriceInput(v) {
 function sanitizeName(s) {
   return String(s || '得意先不明').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').replace(/[.\s]+$/, '').trim() || '得意先不明';
 }
+// 提出見積書のファイル名に使う「敬称付き得意先名」。必ず「様」を付ける（既に 様/御中/殿 で終わる場合は付けない）。
+function honorificName(customer) {
+  const base = sanitizeName(customer);
+  return /(様|御中|殿)$/.test(base) ? base : base + '様';
+}
+// 提出見積書のファイル名（得意先名に「様」付き）。例: ホホエミ → 見積_ホホエミ様.xlsx
+function quoteFileName(customer) {
+  return '見積_' + honorificName(customer) + '.xlsx';
+}
+// フォルダ内の見積書ファイルの実パスを返す（様あり＝新名 を優先、様なし＝旧名 もフォールバック）。どちらも無ければ ''。
+function findQuoteFile(folderPath, customer) {
+  if (!folderPath) return '';
+  const cands = [
+    path.join(folderPath, quoteFileName(customer)),                 // 新: 見積_<得意先>様.xlsx
+    path.join(folderPath, '見積_' + sanitizeName(customer) + '.xlsx'), // 旧: 見積_<得意先>.xlsx（過去に発行した分）
+  ];
+  for (const p of cands) { try { if (fs.existsSync(p)) return p; } catch (_) {} }
+  return '';
+}
 
 // 照合の信頼度スコア（大きいほど信頼できる）: 手動紐付け > CD一致 > 名前一致(%) > その他
 // ※ CD一致 = 仕入先(メーカー)商品コードでの一致。名前の類似より確実。
@@ -1766,7 +1785,7 @@ function exportQuotes(body) {
       newSell: r2(r.newSell),
       effectiveDate: forceDate || normalizeEffDate((r.effectiveDate && String(r.effectiveDate).trim()) ? String(r.effectiveDate).trim() : effectiveDate),
     }));
-    const fname = `見積_${sanitizeName(customer)}.xlsx`;
+    const fname = quoteFileName(customer);
     const quoteNo = ymd + '-' + String(files.length + 1).padStart(3, '0');
     writeQuote(customer, qrows, path.join(folder, fname), Object.assign({}, opt, { quoteNo }));
     files.push(fname);
@@ -2329,7 +2348,7 @@ function exportCustomerQuotes(opts, doIssue) {
       productCode: p.productCode || '', productName: p.productName, currentSell: r2(p.currentSell), newSell: r2(p.newSell), effectiveDate: p.effectiveDate, note: p.note || '',
     }));
     const quoteNo = ymd + '-' + String(files.length + 1).padStart(3, '0');
-    const fname = `見積_${sanitizeName(customer)}.xlsx`;
+    const fname = quoteFileName(customer);
     writeQuote(customer, qrows, path.join(folder, fname), Object.assign({}, opt, { quoteNo }));
     files.push(fname);
     issued.push({ customer, quoteNo, itemCount: keep.length });
@@ -2890,8 +2909,8 @@ const server = http.createServer(async (req, res) => {
         const ent = readIssueLog()[customer];
         if (!ent || !ent.folder) return sendJson(res, 200, { ok: false, error: 'この得意先の提出履歴がありません' });
         const folderPath = path.join(OUTPUT_DIR, ent.folder);
-        const filePath = path.join(folderPath, `見積_${sanitizeName(customer)}.xlsx`);
-        if (fs.existsSync(filePath)) { safeOpenPath(filePath); return sendJson(res, 200, { ok: true, opened: 'file' }); }
+        const filePath = findQuoteFile(folderPath, customer); // 様あり優先・旧 様なし もフォールバック
+        if (filePath) { safeOpenPath(filePath); return sendJson(res, 200, { ok: true, opened: 'file' }); }
         if (fs.existsSync(folderPath)) { safeOpenPath(folderPath); return sendJson(res, 200, { ok: true, opened: 'folder', note: '見積書ファイルが見つからないためフォルダを開きました' }); }
         return sendJson(res, 200, { ok: false, error: '見積書フォルダが見つかりません（移動／削除された可能性: ' + ent.folder + '）' });
       } catch (e) {
