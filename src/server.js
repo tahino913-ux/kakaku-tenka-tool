@@ -4625,7 +4625,7 @@ function renderCards(sm){
 function card(k,v,sub,cls){ return '<div class="card"><div class="k">'+k+'</div><div class="v '+(cls||'')+'">'+v+(sub||'')+'</div></div>'; }
 
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-// confirm() 用：ユーザー/業務データを文字列連結するとき ' \\ \n でJSが壊れるのを防ぐ
+// confirm() 用：ユーザー/業務データを文字列連結するとき、クォート・バックスラッシュ・改行文字でJSが壊れるのを防ぐ（配信JS内のテンプレリテラルなので、バックスラッシュ記法はコメントでも書かない）
 function escConfirm(s){ return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/\\r/g,'').replace(/\\n/g,'\\\\n'); }
 function debounce(fn,ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a),ms); }; }
 
