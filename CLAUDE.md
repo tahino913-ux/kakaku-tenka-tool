@@ -144,6 +144,7 @@ Claude Code / Cursor が起動時に読み込むファイルです。
 | `merge_quotes.js` | 得意先別見積の統合（`得意先別.bat`） |
 | `ai.js` | AI取り込みアシスト（既定OFF） |
 | `pruneInput.js` | 古い照合CSVの `input/_old` 退避 |
+| `navUi.js` | 全ページ共通ヘッダーナビの唯一の情報源（`navLinks(現在ページ)`）。**ページを足す/順番を変えるときはここだけ直す**＝全ページに反映（メイン`/`は緑CTA等が固有のため手書き：リンク追加時は server.js も要追記） |
 
 ---
 

@@ -6,6 +6,7 @@
 //   価格は sim/見積書と同じ既定で算出（出力前の総ざらい用）。
 // =====================================================================
 const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
+const { navLinks } = require('./navUi');
 const CUSTOMERS_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -264,11 +265,7 @@ ${SHOGO_LOCK_HTML}
   <h1>👥 得意先別 商品一覧</h1>
   <span class="sub">得意先を選ぶと、その得意先が買う全商品（複数メーカーまたがり）を表示</span>
   <span class="spacer"></span>
-  <a href="/">← シミュレーション</a>
-  <a href="/list">📊 一覧・進捗</a>
-  <a href="/import">＋ メーカー見積取込</a>
-  <a href="/suppliers">📒 仕入先マスタ</a>
-  <a href="/self">🗂 自社データ設定</a>
+  ${navLinks('customers')}
 </header>
 
 <div class="toolbar">

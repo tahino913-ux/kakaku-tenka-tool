@@ -4,6 +4,7 @@
 //  正規化したメーカー見積CSV(maker_quotes/)として保存。
 // =====================================================================
 const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
+const { navLinks } = require('./navUi');
 const IMPORT_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -56,11 +57,7 @@ ${SHOGO_LOCK_HTML}
 <header>
   <h1>メーカー見積 取り込み</h1>
   <button id="resetBtn" type="button" title="入力中の仕入先・取り込みデータをすべて消して、別の仕入先を最初から取り込みます" style="margin-left:auto;background:rgba(255,255,255,.18);color:#fff;border:1px solid rgba(255,255,255,.6);border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer">🆕 入力をクリア（別の仕入先へ）</button>
-  <a href="/">← シミュレーション</a>
-  <a href="/customers">👥 得意先別</a>
-  <a href="/list">📊 一覧・進捗</a>
-  <a href="/suppliers">📒 仕入先マスタ</a>
-  <a href="/self">🗂 自社データ設定</a>
+  ${navLinks('import')}
 </header>
 <div id="topMsg" style="display:none;margin:0 0 10px;padding:10px 14px;border-radius:8px;font-size:12.5px;line-height:1.6"></div>
 

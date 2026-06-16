@@ -5,6 +5,7 @@
 //   output/<仕入先>_照合結果_見積書_*\ の有無で「見積書作成済み」を判定。
 // =====================================================================
 const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
+const { navLinks } = require('./navUi');
 const LIST_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -45,11 +46,7 @@ ${SHOGO_LOCK_HTML}
   <h1>メーカー見積 一覧 / 進捗</h1>
   <span class="sub">取り込み・照合・見積書の進み具合をひと目で</span>
   <span class="spacer"></span>
-  <a href="/">← シミュレーション</a>
-  <a href="/customers">👥 得意先別</a>
-  <a href="/import">＋ メーカー見積取込</a>
-  <a href="/suppliers">📒 仕入先マスタ</a>
-  <a href="/self">🗂 自社データ設定</a>
+  ${navLinks('list')}
 </header>
 
 <div class="card">

@@ -7,6 +7,7 @@
 //   ・列の役割と「使う/使わない」設定を settings.json:selfProfile に保存
 // =====================================================================
 const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockUi');
+const { navLinks } = require('./navUi');
 const SELF_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -45,11 +46,7 @@ ${SHOGO_LOCK_HTML}
   <h1>🗂 自社データ取込設定</h1>
   <span class="hint" style="color:#cfe0f0">販売実績を読み込み、どこが何の情報か確認・保存</span>
   <span class="spacer"></span>
-  <a href="/">← シミュレーション</a>
-  <a href="/customers">👥 得意先別</a>
-  <a href="/list">📊 一覧・進捗</a>
-  <a href="/import">＋ メーカー見積取込</a>
-  <a href="/suppliers">📒 仕入先マスタ</a>
+  ${navLinks('self')}
 </header>
 
 <div class="card" id="srcCard">

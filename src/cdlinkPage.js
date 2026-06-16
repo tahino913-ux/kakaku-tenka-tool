@@ -7,6 +7,7 @@
 //   ・却下 = 候補から消す（誤った取り違え候補のノイズを減らす）。
 //   ※ DBには書かない（鉄則）。書き戻しは販売大臣自身の取込で。
 // =====================================================================
+const { navLinks } = require('./navUi');
 const CDLINK_PAGE = `<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -52,10 +53,7 @@ const CDLINK_PAGE = `<!doctype html>
   <h1>コード化（メーカー品番の登録）</h1>
   <span class="sub">名前一致の品を「品番一致(CD一致)」に格上げして、確実に紐づける</span>
   <span class="spacer"></span>
-  <a href="/">← シミュレーション</a>
-  <a href="/list">📋 一覧/進捗</a>
-  <a href="/customers">👥 得意先別</a>
-  <a href="/self">🗂 自社データ設定</a>
+  ${navLinks('cdlink')}
 </header>
 
 <div class="card">

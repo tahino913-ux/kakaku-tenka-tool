@@ -3473,7 +3473,7 @@ const PAGE = `<!doctype html>
   .pltbl .d{ font-size:10px; margin-left:6px; }
   /* 設定（初回登録）画面 */
   #settingsBtn{ margin-left:8px; background:#fff; color:var(--accent); border:none; border-radius:8px; padding:7px 14px; font-weight:700; cursor:pointer; }
-  #importLink, #listLink, #suppliersLink, #selfLink{ background:#eaf1f8; color:var(--accent); border-radius:8px; padding:7px 14px; font-weight:700; text-decoration:none; font-size:13px; }
+  #importLink, #listLink, #suppliersLink, #selfLink, #cdlinkLink{ background:#eaf1f8; color:var(--accent); border-radius:8px; padding:7px 14px; font-weight:700; text-decoration:none; font-size:13px; }
   #manualLink{ color:#fff; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.55); border-radius:8px; padding:7px 14px; font-weight:700; text-decoration:none; font-size:13px; }
   #manualLink:hover{ background:rgba(255,255,255,.30); }
   #calBtn{ color:#fff; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.55); border-radius:8px; padding:7px 14px; font-weight:700; cursor:pointer; font-size:13px; }
@@ -3554,7 +3554,7 @@ const PAGE = `<!doctype html>
   .calcell .cnt-todo,.chip .cnt-todo{ background:#d4a017; color:#fff; }
   .chip .cnt-hold{ display:inline-block; border-radius:999px; font-size:10px; font-weight:700; padding:1px 6px; background:#8a5a12; color:#fff; margin-left:2px; }
   #importLink{ margin-left:auto; }
-  #importLink:hover, #listLink:hover, #suppliersLink:hover, #selfLink:hover{ background:#dbe8f5; }
+  #importLink:hover, #listLink:hover, #suppliersLink:hover, #selfLink:hover, #cdlinkLink:hover{ background:#dbe8f5; }
   #settingsBtn:hover{ background:#eaf1f8; }
   .overlay{ position:fixed; inset:0; background:rgba(15,25,40,.45); display:none; align-items:flex-start; justify-content:center; z-index:50; overflow:auto; padding:24px 12px; }
   .overlay.show{ display:flex; }
@@ -3588,6 +3588,7 @@ ${SHOGO_LOCK_HTML}
   <a href="/manual" id="manualLink" target="_blank" style="margin-left:0" title="このツールの使い方手順書を新しいタブで開きます">📖 使い方</a>
   <a href="/list" id="listLink" style="margin-left:0">📊 一覧・進捗</a>
   <a href="/import" id="importLink" style="margin-left:0">＋ メーカー見積取込</a>
+  <a href="/cdlink" id="cdlinkLink" style="margin-left:0">🏷 コード化</a>
   <a href="/suppliers" id="suppliersLink" style="margin-left:0">📒 仕入先マスタ</a>
   <a href="/self" id="selfLink" style="margin-left:0">🗂 自社データ設定</a>
   <button id="settingsBtn">⚙ 設定</button>
