@@ -47,6 +47,43 @@ function backupCurrentSettings() {
   } catch (_) { /* バックアップ失敗は保存を止めない */ }
 }
 
+// バックアップ一覧を新しい順で返す。{ file=ファイル名, savedAt=表示用日時, size=バイト } の配列。
+//  /self の「設定の復元」UI が使う。settings_YYYYMMDD_HHMMSS_mmm.json だけを対象にする。
+function listSettingsBackups() {
+  let files = [];
+  try { files = fs.readdirSync(BACKUP_DIR); } catch (_) { return []; } // フォルダ未作成=まだ保存歴なし
+  const out = [];
+  for (const f of files) {
+    const m = f.match(/^settings_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_(\d{3})\.json$/);
+    if (!m) continue;
+    let size = 0;
+    try { size = fs.statSync(path.join(BACKUP_DIR, f)).size; } catch (_) {}
+    out.push({ file: f, savedAt: m[1] + '-' + m[2] + '-' + m[3] + ' ' + m[4] + ':' + m[5] + ':' + m[6], size });
+  }
+  out.sort((a, b) => (a.file < b.file ? 1 : -1)); // 名前=時刻順なので逆順ソート＝新しい順
+  return out;
+}
+
+// 指定したバックアップを settings.json へ復元する。復元前に必ず現状も世代退避＝復元自体も取り消せる。
+//  安全策：
+//   ・file はファイル名のみ許可（パス区切り・連番外の名前は拒否＝ディレクトリトラバーサル防止）。
+//   ・バックアップが妥当なJSONであることを確認してから上書き（壊れたファイルで本体を潰さない）。
+//   ・原子的書込み（tmp→rename）で置換し、書込み途中での破損を防ぐ。
+function restoreSettingsBackup(file) {
+  const name = String(file || '');
+  if (!/^settings_\d{8}_\d{6}_\d{3}\.json$/.test(name)) throw new Error('バックアップ名が不正です。');
+  let raw;
+  try { raw = fs.readFileSync(path.join(BACKUP_DIR, name), 'utf8'); }
+  catch (_) { throw new Error('指定のバックアップが見つかりません。'); }
+  let obj;
+  try { obj = JSON.parse(raw); }
+  catch (_) { throw new Error('バックアップが壊れています（JSONとして読めません）。復元を中止しました。'); }
+  backupCurrentSettings();            // 復元前の現状を退避（戻したあとに「やっぱり元へ」も可能に）
+  writeJsonAtomic(SETTINGS_PATH, obj); // 原子的に置換（検証済みの内容を整形して書き出す）
+  _userCache = null;                   // キャッシュ破棄＝次回 readUser は最新を読む
+  return getSettings();
+}
+
 // settings.json のプロセス内キャッシュ。getSettings/getProductLinks/getMakers 等がほぼ全API・全calcで
 //  何度も呼ばれ、毎回 readFileSync+JSON.parse すると遅い（Drive同期中は特に）。mtime が同じ間は再パースしない。
 //  ・他PC(Drive同期)が更新→mtimeが変わる→自動で読み直す。
@@ -324,4 +361,4 @@ function setExcludedCustomersBulk(names, exclude) {
   return getExcludedCustomers();
 }
 
-module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, backupCurrentSettings, BACKUP_DIR, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk };
+module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, backupCurrentSettings, listSettingsBackups, restoreSettingsBackup, BACKUP_DIR, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk };

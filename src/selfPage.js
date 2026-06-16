@@ -72,6 +72,15 @@ ${SHOGO_LOCK_HTML}
   </div>
 </div>
 
+<div class="card" id="backupCard" style="border-left:4px solid #2e7d32">
+  <h3 style="margin:0 0 6px">💾 設定のバックアップと復元</h3>
+  <div class="hint" style="margin-bottom:8px;line-height:1.8">
+    設定（転嫁ルール・単価調整・<b>商品の手動紐付け（📌）</b>・コード化の確定/却下・除外設定など）を保存するたびに、<b>上書き直前の状態を自動で世代バックアップ</b>しています（直近50世代・<code>settings_backup/</code>）。<br>
+    紐付けやルールを誤って変更してしまったときは、下の一覧から選んで<b>ワンクリックで元に戻せます</b>。復元の前に「今の状態」も自動退避するので、戻したあとに「やっぱり元へ」も可能です。
+  </div>
+  <div id="backupList" class="muted">読込中…</div>
+</div>
+
 <details class="prevwrap" style="border:1px solid #e2e6ec;border-radius:8px;padding:8px 14px;margin-bottom:14px;background:#fff">
 <summary style="cursor:pointer;font-weight:700;font-size:14px;color:#33415a;padding:4px 0">🔍 別ファイルをプレビュー（取込ルールの確認用）　<span class="hint" style="font-weight:normal">※DB直結時は予備（ファイル方式・DBなしPC用）— クリックで開く</span></summary>
 <div style="padding-top:6px">
@@ -383,6 +392,49 @@ async function loadHanbaiSource(){
     target.innerHTML = '<span class="err">読込失敗: '+esc(String(e))+'</span>';
   }
 }
+// 設定バックアップ一覧の表示＋ワンクリック復元
+async function loadBackups(){
+  const box = $('#backupList');
+  try {
+    const r = await fetch('/api/settings-backups').then(x=>x.json());
+    const list = (r && r.backups) || [];
+    if (!list.length) { box.innerHTML = '<span class="hint">まだバックアップはありません（設定を1回保存すると作成されます）。</span>'; return; }
+    let html = '<div style="overflow:auto;max-height:300px"><table style="font-size:12px"><thead><tr>'
+      + '<th>保存日時（この時点の設定に戻せます）</th><th>サイズ</th><th></th></tr></thead><tbody>';
+    list.forEach((b,i)=>{
+      const tag = i===0 ? ' <span class="hint">（最新）</span>' : '';
+      html += '<tr><td>'+esc(b.savedAt)+tag+'</td><td>'+esc(fmtBytes(b.size))+'</td>'
+        + '<td><button class="restoreBtn go" data-file="'+esc(b.file)+'" data-when="'+esc(b.savedAt)+'" '
+        + 'style="background:#2e7d32;padding:4px 12px;font-size:12px">↩ この状態に戻す</button></td></tr>';
+    });
+    html += '</tbody></table></div><div id="restoreMsg" class="muted" style="margin-top:8px"></div>';
+    box.innerHTML = html;
+    box.querySelectorAll('.restoreBtn').forEach((btn)=>{
+      btn.addEventListener('click', async ()=>{
+        const file = btn.getAttribute('data-file'), when = btn.getAttribute('data-when');
+        if (!confirm(when+' 時点の設定に戻します。\\n\\n現在の設定はこの操作の直前に自動バックアップされるので、戻したあとに元へ戻すこともできます。\\nよろしいですか？')) return;
+        const msg = $('#restoreMsg');
+        box.querySelectorAll('.restoreBtn').forEach((b)=>{ b.disabled=true; });
+        msg.style.color='#6b7785'; msg.textContent='復元中…';
+        try {
+          const res = await fetch('/api/settings-restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file})}).then(x=>x.json());
+          if (res.ok) {
+            msg.style.color='#1f6b35';
+            msg.textContent='✓ '+when+' 時点の設定に復元しました。各画面を再読み込みすると反映されます。';
+            loadBackups(); // 復元で「直前の状態」が新たに退避されたので一覧を更新
+          } else {
+            msg.style.color='#c0392b'; msg.textContent='失敗: '+(res.error||'');
+            box.querySelectorAll('.restoreBtn').forEach((b)=>{ b.disabled=false; });
+          }
+        } catch(e){
+          msg.style.color='#c0392b'; msg.textContent='失敗: '+e;
+          box.querySelectorAll('.restoreBtn').forEach((b)=>{ b.disabled=false; });
+        }
+      });
+    });
+  } catch(e){ box.innerHTML = '<span class="err">読込失敗: '+esc(String(e))+'</span>'; }
+}
+loadBackups();
 loadHanbaiSource();
 initShogoLockWatch();
 </script>

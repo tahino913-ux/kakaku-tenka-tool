@@ -22,7 +22,7 @@ const { SUPPLIERS_PAGE } = require('./suppliersPage');
 const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
 const { CDLINK_PAGE } = require('./cdlinkPage');
-const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk } = require('./settings');
+const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, listSettingsBackups, restoreSettingsBackup } = require('./settings');
 const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords, mergeMakerFiles, makerProdKey } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
 const { readXlsxBuffer } = require('./xlsxread');
@@ -2610,6 +2610,21 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, settings });
       } catch (e) {
         // saveSettings は settings.json 破損時など保存中止で throw する＝成功扱いにしない
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
+    // 設定バックアップ一覧（/self の「設定の復元」UI 用）
+    if (req.method === 'GET' && url === '/api/settings-backups') {
+      return sendJson(res, 200, { ok: true, backups: listSettingsBackups() });
+    }
+    // 指定バックアップへ復元（復元前に現状も自動退避＝この復元自体も取り消せる）
+    if (req.method === 'POST' && url === '/api/settings-restore') {
+      const body = await readBody(req);
+      try {
+        const settings = restoreSettingsBackup((body && body.file) || '');
+        invalidateCalcCaches(); // 端数/しきい値/既定ルール等が変わり得るので計算キャッシュを更新
+        return sendJson(res, 200, { ok: true, settings });
+      } catch (e) {
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
       }
     }
