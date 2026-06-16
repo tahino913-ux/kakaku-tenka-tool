@@ -13,6 +13,7 @@ output/
 maker_quotes/
 settings.json
 settings.json.bak*
+settings_backup/
 損益.csv
 発行履歴.json
 # 販売大臣 単価履歴の取込/サンプルCSV(実コードを含む)

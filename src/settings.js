@@ -10,6 +10,8 @@ const base = require('../config');
 
 const ROOT = path.join(__dirname, '..');
 const SETTINGS_PATH = path.join(ROOT, 'settings.json');
+const BACKUP_DIR = path.join(ROOT, 'settings_backup'); // 上書き直前の settings.json を世代退避（gitignore）
+const BACKUP_KEEP = 50;                                // 直近この世代数だけ残す（ファイルは小さい＝50で十分）
 
 // 原子的書き込み：一時ファイルへ書いてから rename で本体へ置換する。
 //  途中でクラッシュ/Drive同期割り込みが起きても settings.json 本体が壊れない
@@ -18,6 +20,31 @@ function writeJsonAtomic(file, obj) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
   fs.renameSync(tmp, file);
+}
+
+// 上書き直前の settings.json を settings_backup/ へ世代退避する。
+//  原子的書込みは「書込み途中のクラッシュで壊れる」事故は防ぐが、「誤った内容で正しく上書きした」事故は救えない。
+//  そこで保存のたびに“上書き前の現物”を1ファイル退避し、紐付け/ルールを壊しても1ファイルで戻せるようにする。
+//  ・バックアップ失敗は保存本体を絶対に止めない（保存が最優先）＝例外はすべて飲み込む。
+//  ・対象は settings_YYYYMMDD_HHMMSS_mmm.json のみ（自分が作った名前だけ剪定＝他ファイルは決して触らない）。
+//  ・名前が時刻順＝辞書順なので、ソートして古い方から BACKUP_KEEP を超える分だけ削除する。
+function pad(n, w) { return String(n).padStart(w || 2, '0'); }
+function backupCurrentSettings() {
+  try { fs.statSync(SETTINGS_PATH); } catch (_) { return; } // 初回(ファイル無し)は退避不要
+  try {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const d = new Date();
+    const stamp = '' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+      '_' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) +
+      '_' + pad(d.getMilliseconds(), 3);
+    fs.copyFileSync(SETTINGS_PATH, path.join(BACKUP_DIR, 'settings_' + stamp + '.json'));
+    const files = fs.readdirSync(BACKUP_DIR)
+      .filter((f) => /^settings_\d{8}_\d{6}_\d{3}\.json$/.test(f))
+      .sort();
+    for (const f of files.slice(0, Math.max(0, files.length - BACKUP_KEEP))) {
+      try { fs.unlinkSync(path.join(BACKUP_DIR, f)); } catch (_) {}
+    }
+  } catch (_) { /* バックアップ失敗は保存を止めない */ }
 }
 
 // settings.json のプロセス内キャッシュ。getSettings/getProductLinks/getMakers 等がほぼ全API・全calcで
@@ -124,6 +151,7 @@ function saveSettings(patch) {
     excludedCustomers: patch.excludedCustomers !== undefined ? patch.excludedCustomers : (cur.excludedCustomers || {}),
     _savedAt:       new Date().toISOString(),
   };
+  backupCurrentSettings(); // 上書き直前の現行 settings.json を世代退避（失敗しても保存は続行）
   try { writeJsonAtomic(SETTINGS_PATH, next); }
   catch (e) { _userCache = null; throw e; } // 書込失敗：キャッシュも破棄して次回ファイルから読み直す
   _userCache = null; // 書いたのでキャッシュ破棄（次回 readUser は最新を読む）
@@ -296,4 +324,4 @@ function setExcludedCustomersBulk(names, exclude) {
   return getExcludedCustomers();
 }
 
-module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk };
+module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, backupCurrentSettings, BACKUP_DIR, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk };
