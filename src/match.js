@@ -299,6 +299,14 @@ function padSelfCode(c) {
   if (!t) return '';
   return /^\d+$/.test(t) ? t.padStart(6, '0') : t.toLowerCase();
 }
+// padSelfCode の結果を販売実績レコードへキャッシュする。
+//  matchOne は「メーカー品 × 販売実績 全件」の二重ループで、item ごとに同じ r.productCode を
+//  何度も padSelfCode し直していた（非9000の自社製造除外・却下除外の判定）。padSelfCode は純関数で
+//  productCode はレコード固定なので、1レコード1回だけ計算してキャッシュする＝結果は完全に不変。
+function padCodeCached(r) {
+  if (r._padCode === undefined) r._padCode = padSelfCode(r.productCode);
+  return r._padCode;
+}
 // 自社製造（メーカーコード9000＝日野折箱店）専用の照合。
 //  取り込んだメーカー品番＝自社商品コードとして、販売実績の商品コードに「完全一致」で当てる。
 //  ＝自社の折箱は過去伝票が発注先0000/別コードで切られており、仕入先フィルタ9000では全滅するため、
@@ -382,9 +390,9 @@ function matchOne(item, hanbai, opts = {}) {
   const best = new Map();
   for (const r of hanbai) {
     // 自社製造分類の自社CDは他の仕入先には出さない（名前一致・CD一致・手動紐付けすべてに優先して除外）
-    if (excludeSelf && excludeSelf.size && excludeSelf.has(padSelfCode(r.productCode))) continue;
+    if (excludeSelf && excludeSelf.size && excludeSelf.has(padCodeCached(r))) continue;
     // 却下済みの (自社CD × このメーカー品番) は照合しない（CD一致・名前一致・価格救済すべてに優先）
-    if (rejectedSelf.size && rejectedSelf.has(padSelfCode(r.productCode))) continue;
+    if (rejectedSelf.size && rejectedSelf.has(padCodeCached(r))) continue;
     // 手動紐付けチェック: その自社CDが他メーカー品に予約されているならスキップ（取り合い防止）
     const linkedMakerName = lookupProductLink(supLinks, r.productCode);
     const makerNamesInQuote = opts.makerNamesInQuote;
