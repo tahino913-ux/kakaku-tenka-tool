@@ -7,7 +7,7 @@
 // =====================================================================
 const { nfkc, normName } = require('./textnorm');
 const { sen } = require('./rules');
-const { isLinkActiveForItem, shouldBlockLinkOther, lookupProductLink } = require('./productLink');
+const { isLinkActiveForItem, shouldBlockLinkOther, lookupProductLink, isExcludeLink } = require('./productLink');
 
 // 名前のトークン分割（全角/半角スペース区切り・1文字ノイズは除外）
 //  英字のみの注記カッコ (D)(KS)(R) 等は照合の邪魔なので除去する。
@@ -399,6 +399,9 @@ function matchOne(item, hanbai, opts = {}) {
     if (rejectedSelf.size && rejectedSelf.has(padCodeCached(r))) continue;
     // 手動紐付けチェック: その自社CDが他メーカー品に予約されているならスキップ（取り合い防止）
     const linkedMakerName = lookupProductLink(supLinks, r.productCode);
+    // 利用者が「このメーカーでは照合しない」と除外指定した自社品は、CD一致・名前一致・価格救済すべてに優先してスキップ。
+    //  ＝販売実績はあるが もう仕入れない品が、似た名前の別メーカー品に誤紐付けされるのを根本から防ぐ（解除で復活）。
+    if (isExcludeLink(linkedMakerName)) continue;
     const makerNamesInQuote = opts.makerNamesInQuote;
     const linkSelf = isLinkActiveForItem(r.productCode, item.makerName, linkedMakerName, makerNamesInQuote);
     if (shouldBlockLinkOther(linkedMakerName, item.makerName, makerNamesInQuote)) continue;

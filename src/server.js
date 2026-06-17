@@ -30,7 +30,7 @@ const { detectColumns: detectMakerCols, normDate } = require('./makerXlsx');
 const { loadCsv, decodeBuffer } = require('./csv');
 const { xlsToCsv } = require('./xls2csv');
 const { priceRowAnomaly } = require('./anomaly');
-const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode } = require('./productLink');
+const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode, EXCLUDE_MARK, isExcludeLink } = require('./productLink');
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
 const { describeNoiseRow, isNoiseRow } = require('./noiserow');
@@ -3036,7 +3036,7 @@ const server = http.createServer(async (req, res) => {
       const name = (body && body.makerName != null) ? String(body.makerName).trim() : '';
       if (!sup || !code) return sendJson(res, 200, { ok: false, error: 'supplier と productCode は必須です' });
       let linkWarn = '';
-      if (name) {
+      if (name && !isExcludeLink(name)) { // 除外マークは実在メーカー名でないので候補チェックを行わない
         const ctx = linkContext(sup);
         const makers = ctx.makerNames || [];
         if (makers.length && !makers.includes(name)) {
@@ -4310,6 +4310,10 @@ function syncHScroll(){
 // 紐付けセルのHTML。確定済(📌)はラベル＋編集ボタン、未確定は淡色の「✏編集」のみ。
 function linkCellHtml(r, i){
   const code = r.productCode || '';
+  // 🚫 除外指定（このメーカーでは照合しない）：↻照合で休眠になる。✏で別品選択/解除に戻せる。確定判定より先に出す。
+  if (code && linkLookup(currentLinks, code) === '__EXCLUDE__') {
+    return '<span style="color:#c0392b;font-weight:700" title="この自社品は このメーカーの照合対象から除外中です。「↻ 照合」で休眠になります。✏ から別のメーカー品を選ぶ／解除すると戻せます。">🚫 除外中</span> <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
+  }
   // 確定済み判定：現在ファイルの紐付け辞書 or 行のステータスが「📌 手動紐付け」（横断ビューは辞書が空なので後者で判定）
   const linked = code && (linkEq(linkLookup(currentLinks, code), r.makerName) || /📌/.test(r.matchStatus||''));
   if (linked) {
@@ -4425,7 +4429,9 @@ async function openLinkModal(idx, preselect){
       '<select id="linkPick" size="8" style="width:100%;padding:4px;font:inherit;border:1px solid #c7ced8;border-radius:4px;box-sizing:border-box"></select>'+
       '<div id="linkWarn" style="margin-top:8px;padding:8px;background:#fdecea;border:1px solid #f3c0c0;border-radius:4px;font-size:12px;color:#8a3a3a;display:none"></div>'+
       '<div style="margin-top:10px;background:#fff8e1;border:1px solid #ffe082;padding:8px;border-radius:4px;font-size:11px;color:#5a4a1a">'+noteHtml+'</div>'+
-      '<div style="text-align:right;margin-top:12px">'+
+      '<div style="display:flex;align-items:center;margin-top:12px">'+
+        (mode==='maker' ? '<button id="linkExclude" style="padding:6px 12px;background:#fff;border:1px solid #c0392b;color:#c0392b;border-radius:4px;cursor:pointer;font-size:12px" title="この自社品を、この仕入先（メーカー）の照合対象から外します。メーカー見積が来ない品が似た名前の別メーカー品に誤って紐づくのを防ぎます。解除はこの画面で別のメーカー品を選び保存／または先頭の「— 解除」で戻せます。">🚫 このメーカーでは照合しない</button>' : '')+
+        '<span style="margin-left:auto"></span>'+
         '<button id="linkCancel" style="margin-right:8px;padding:6px 14px">キャンセル</button>'+
         '<button id="linkSave" style="padding:6px 14px;background:#1976d2;color:#fff;border:none;border-radius:4px;cursor:pointer">保存</button>'+
       '</div>'+
@@ -4579,6 +4585,20 @@ async function openLinkModal(idx, preselect){
         if (pl && typeof pl === 'object') currentLinks = pl;
       }
       loadLinkCheck(); // 監査バナー・⚠マークを取り直す（直した分は消える）
+    } catch (e) { alert('保存に失敗: '+e); }
+  });
+  // 🚫「このメーカーでは照合しない（除外）」：この自社品をこの仕入先の照合対象から外す（'__EXCLUDE__'をproductLinksに保存）。
+  const exclBtn = $('#linkExclude');
+  if (exclBtn) exclBtn.addEventListener('click', async () => {
+    if (!confirm('自社品「'+(r.productCode||'')+'  '+(selfCore||'')+'」を\\n仕入先「'+supplier+'」の照合対象から除外します。\\n\\n（メーカー見積が来ない品の誤紐付け防止用。\\n　別のメーカー品を選んで保存／先頭の「— 解除」で戻せます）\\n\\nよろしいですか？')) return;
+    try {
+      const res = await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ supplier: supplier, productCode: r.productCode, makerName: '__EXCLUDE__' })}).then(x=>x.json());
+      if (!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
+      close();
+      $('#msg').textContent='🚫 「'+(r.productCode||'')+'」を '+supplier+' の照合対象から除外しました。照合結果に反映するには 表の左「↻ 照合」を押してください。';
+      if (res.productLinks && supplier){ const pl=res.productLinks[supplier]; if (pl && typeof pl==='object') currentLinks=pl; }
+      loadLinkCheck();
     } catch (e) { alert('保存に失敗: '+e); }
   });
 }

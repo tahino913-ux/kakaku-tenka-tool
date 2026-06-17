@@ -2,6 +2,13 @@
 // 手動紐付け（productLinks）の共通ロジック。
 // 紐付け名とメーカー品名の表記ゆれ（全角/半角スペース等）を正規化して比較する。
 
+// 「このメーカーでは照合しない（除外）」の特別マーク。
+//  productLinks[仕入先][自社CD] にこの値を入れると、その自社品はその仕入先の照合候補から完全に外れる。
+//  ＝販売実績はあるが もうそのメーカーから仕入れない品が、似た名前の別メーカー品に誤紐付けされるのを根本から防ぐ。
+//  実在するメーカー品名と衝突しない内部値。解除は通常の📌解除（空保存で削除）でそのまま戻せる＝可逆。
+const EXCLUDE_MARK = '__EXCLUDE__';
+function isExcludeLink(v) { return String(v == null ? '' : v).trim() === EXCLUDE_MARK; }
+
 function normLinkName(s) {
   return String(s || '').normalize('NFKC').replace(/\s+/g, '').toLowerCase();
 }
@@ -88,6 +95,7 @@ function isProductLinkActive(rec, links, peerRows) {
   if (!rec || !rec.productCode) return false;
   const linkedMaker = lookupProductLink(links, rec.productCode);
   if (!linkedMaker) return false;
+  if (isExcludeLink(linkedMaker)) return false; // 「照合しない」除外指定は手動紐付けではない（一致扱いしない）
   if (linkNamesEqual(linkedMaker, rec.makerName)) return true;
   return !linkedMakerExactInPeer(peerRows, rec.productCode, linkedMaker);
 }
@@ -127,6 +135,7 @@ function auditProductLinks(productLinks, matchRowsBySupplier) {
     for (const [code, linked] of Object.entries(codes || {})) {
       const linkedName = String(linked || '').trim();
       if (!linkedName) continue;
+      if (isExcludeLink(linkedName)) continue; // 「照合しない」除外指定は意図的＝監査対象外（orphan扱いしない）
       const hit = rows.filter((r) => codesEqual(r.productCode, code));
       const makers = [...new Set(hit.map((r) => r.makerName).filter(Boolean))];
       if (!hit.length) {
@@ -191,6 +200,8 @@ function selfTest() {
 if (require.main === module) selfTest();
 
 module.exports = {
+  EXCLUDE_MARK,
+  isExcludeLink,
   normLinkName,
   linkNamesEqual,
   padSelfCode,
