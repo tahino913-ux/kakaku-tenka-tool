@@ -271,7 +271,7 @@ ${SHOGO_LOCK_HTML}
 <div class="toolbar">
   <button class="go" id="toggleListBtn" style="background:#5b6b8b" title="左の得意先一覧を隠して、右の明細を広く使えます（もう一度押すと表示）">◀ 一覧を隠す</button>
   <button class="go" id="reloadBtn">🔄 最新の状態を読み込む</button>
-  <label style="font-size:12px;color:#5a6b7d;display:flex;align-items:center;gap:4px;white-space:nowrap" title="この期間に取引のある得意先だけ表示します（最終売上日で判定・DB直結時）。照合は全期間で拾うので、ここで何年ぶんを見るか決められます。"><span>表示期間</span>
+  <label style="font-size:12px;color:#5a6b7d;display:flex;align-items:center;gap:4px;white-space:nowrap" title="見積の対象にする得意先を、この期間に取引のある先だけに絞ります（最終売上日で判定）。照合は全期間で拾うので、ここで『見積に出す期間』を決められます。選んだ期間はこのPCに記憶されます。"><span>抽出期間</span>
     <select id="recentYears" style="padding:5px 8px;border:1px solid #c7d6e4;border-radius:8px;font-size:13px">
       <option value="1">過去1年（取引あり）</option>
       <option value="2">過去2年</option>
@@ -987,6 +987,7 @@ function effBadge(ef){
 function applyFilter(){
   const q=($('#search').value||'').trim();
   const years = parseInt(($('#recentYears') && $('#recentYears').value) || '1', 10);
+  try{ localStorage.setItem('recentYears', String(years)); }catch(e){} // 抽出期間の選択を記憶（change/全期間リンク/プログラム変更すべてを拾う単一経路）
   let list = DATA.slice();
   hiddenNoRecent = 0;
   if(years>0){ const before=list.length; list=list.filter(c=>withinYears(c,years)); hiddenNoRecent = before-list.length; }
@@ -1571,6 +1572,8 @@ function showResult(res){
 
 // 起動時：メインページと同じ既定値を settings.json から読んでカスタマイズ操作に反映
 async function initControls(){
+  // 見積の抽出期間（表示期間）は前回この PC で選んだ値を復元する（既定は過去1年）。loadSummary より前に設定。
+  try{ const rv=localStorage.getItem('recentYears'); if(rv!==null && $('#recentYears')) $('#recentYears').value=rv; }catch(e){}
   try{
     const r=await fetch('/api/settings').then(x=>x.json());
     const s=r&&r.settings?r.settings:{};

@@ -1066,10 +1066,38 @@ function invalidateCalcCaches() {
   _candRawCache = null;
   _calcAllResultCache = null;
 }
+// DBが実際に到達できるか（source=db/auto のときだけ意味を持つ）。閲覧モード判定の土台。短時間キャッシュ。
+//  source=file は「DBを使わない」設定なので常に true（DB可否は無関係）扱いにする。
+let _dbProbeCache = null; // { at, ok }
+function isDbReachable(force) {
+  const s = getSettings();
+  const mode = String((s.hanbai && s.hanbai.source) || 'file');
+  if (mode !== 'db' && mode !== 'auto') return true; // ファイル方式＝DB不要
+  // 成功は60秒（DBの一時断を早めに拾い直す）／失敗は5分（自宅PC等は当面DB不可＝重いprobe連発を避ける）。
+  const ttl = (_dbProbeCache && _dbProbeCache.ok) ? 60 * 1000 : 5 * 60 * 1000;
+  if (!force && _dbProbeCache && (Date.now() - _dbProbeCache.at) < ttl) return _dbProbeCache.ok;
+  let ok = false;
+  try { require('./db_hanbai').probeDbConnection((s.hanbai && s.hanbai.db) || {}); ok = true; }
+  catch (e) { ok = false; }
+  _dbProbeCache = { at: Date.now(), ok };
+  return ok;
+}
+// 閲覧モード＝販売実績の取得元がDB(db/auto)なのに、このPCからDBへ到達できない（＝自宅PC等）。
+//  input/ の照合結果CSVでの表示は可能だが、照合・DB抽出・自社品検索（DB必須）はできない。
+function isViewOnly() {
+  const s = getSettings();
+  const mode = String((s.hanbai && s.hanbai.source) || 'file');
+  if (mode !== 'db' && mode !== 'auto') return false;
+  return !isDbReachable();
+}
 function getHanbaiRecordsCached(force) {
   const TTL = 5 * 60 * 1000; // 5分（DB読取は約1.5秒・ファイルも数秒かかるため）
   if (!force && _hanbaiCache && (Date.now() - _hanbaiCache.at) < TTL) return _hanbaiCache.records;
-  const records = loadHanbaiRecords({ settings: getSettings() }).records; // ログは無音（UI用途）
+  // 閲覧モード（DB未到達）では自社品検索等は使えない。例外で画面を壊さず、空（or 直近キャッシュ）で続行する。
+  if (!isDbReachable()) return _hanbaiCache ? _hanbaiCache.records : [];
+  let records = [];
+  try { records = loadHanbaiRecords({ settings: getSettings() }).records; } // ログは無音（UI用途）
+  catch (e) { return _hanbaiCache ? _hanbaiCache.records : []; }
   _hanbaiCache = { at: Date.now(), records };
   return records;
 }
@@ -1254,7 +1282,7 @@ function buildCalendar() {
     if (resolved) hanbai = fileFreshness(resolved);
   } catch (e) { /* ignore */ }
   const pl = fileFreshness(path.join(ROOT, '損益.csv'));
-  return { ok: true, entries, suppliers, hanbai, hanbaiSource, pl };
+  return { ok: true, entries, suppliers, hanbai, hanbaiSource, pl, viewOnly: isViewOnly() };
 }
 
 // ---- 提出用見積書の出力（画面設定を反映して得意先ごとに1ファイル） --
@@ -3102,6 +3130,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url === '/api/shogo') {
       // メーカー見積 × 販売実績 を照合し input/ へ出力（中身は 照合.bat と同じ）
       try {
+        if (isViewOnly()) return sendJson(res, 200, { ok: false, error: '🔒 閲覧モード：このPCはDBに接続できないため照合できません。照合はDBのある会社PCで「↻ 照合」を実行してください（結果CSVはDrive同期で届きます）。' });
         const outFiles = runShogoGuarded(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
         invalidateCaches(); // 照合し直したので古いキャッシュ（自社品検索・照合結果）を破棄
         return sendJson(res, 200, { ok: true, files: (outFiles || []).map((f) => path.basename(f)) });
@@ -4969,8 +4998,16 @@ function renderReminder(){
   // 販売実績：DB直結(db/auto)なら「常に最新」＝ファイルの更新喚起は出さない（DBが本番ソース）。
   //  source='file' の時だけ従来どおりファイルの新しさを確認する。
   const src = (calData.hanbaiSource || 'file');
+  // 閲覧モード（このPCはDB未接続）：照合・DB抽出はできず表示専用。↻照合ボタンを無効化する。
+  const sb = $('#shogoBtn');
+  if (sb) {
+    if (calData.viewOnly) { sb.disabled = true; sb.style.opacity = '0.4'; sb.title = '🔒 閲覧モード：このPCはDBに接続できないため照合できません。照合はDBのある会社PCで。'; }
+    else { sb.disabled = false; sb.style.opacity = ''; }
+  }
   let a;
-  if (src === 'db' || src === 'auto') {
+  if (calData.viewOnly) {
+    a = { warn:true, html:'<span class="ritem"><span class="rtag w">🔒 閲覧モード</span><b>販売実績</b>：このPCはDBに接続できません。<b>表示専用</b>です（照合・DB抽出・自社品検索は会社PCで。結果はDrive同期で届きます）。</span>' };
+  } else if (src === 'db' || src === 'auto') {
     const note = src === 'auto'
       ? '販売大臣DBから直接取得（常に最新／手動更新は不要）。DBが無いPCのみ販売実績ファイルを使用します。'
       : '販売大臣DBから直接取得（常に最新／手動更新は不要）。';

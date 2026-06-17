@@ -274,10 +274,14 @@ function codeCandidates(makerCode) {
 //   ※ 92988 が「（朝日ピッキング）92988※50 13」のように区切られて埋まる前提。
 //   ※ 4桁純数字は誤一致が起きやすい（年号/サイズ/ロット数）ので未対応。
 function codeHit(cands, recNorm) {
+  // 英字コードは記号(ハイフン等)を跨いでも一致させる：メーカー品番側の候補は記号除去済み(例 L-2083→l2083)
+  //  だが、実績の埋め込みコードは "l-2083" のようにハイフンが残るため、記号除去版でも突き合わせる。
+  //  ※純数字(下の単語境界判定)は誤一致防止のため対象外＝従来どおり recNorm のまま判定する。
+  const recNoSym = recNorm.replace(/[^0-9a-z]/g, '');
   for (const c of cands) {
     const hasAlpha = /[a-z]/.test(c);
     if (hasAlpha) {
-      if (c.length >= 4 && recNorm.includes(c)) return true;
+      if (c.length >= 4 && (recNorm.includes(c) || recNoSym.includes(c))) return true;
       continue;
     }
     if (c.length < 5) continue;
