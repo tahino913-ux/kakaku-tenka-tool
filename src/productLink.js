@@ -2,12 +2,17 @@
 // 手動紐付け（productLinks）の共通ロジック。
 // 紐付け名とメーカー品名の表記ゆれ（全角/半角スペース等）を正規化して比較する。
 
-// 「このメーカーでは照合しない（除外）」の特別マーク。
-//  productLinks[仕入先][自社CD] にこの値を入れると、その自社品はその仕入先の照合候補から完全に外れる。
-//  ＝販売実績はあるが もうそのメーカーから仕入れない品が、似た名前の別メーカー品に誤紐付けされるのを根本から防ぐ。
-//  実在するメーカー品名と衝突しない内部値。解除は通常の📌解除（空保存で削除）でそのまま戻せる＝可逆。
+// 「このメーカーの照合から外す」特別マーク（2種）。productLinks[仕入先][自社CD] に入れると、
+//  その自社品はその仕入先の照合候補から完全に外れる（CD一致・名前一致・価格救済すべてに優先してスキップ）。
+//  動き(=スキップ)は両者同じ。意味と画面バッジだけ違う＝「外した理由」が後から分かる。可逆（📌解除/別品選択で戻る）。
+//   ・EXCLUDE（🚫 別物）＝似た名前の別メーカー品で、そもそも別物。誤紐付けの恒久除外。
+//   ・DORMANT（💤 休眠/保留）＝正しい品だが今は仕入れていない。一時的に外す。
+//  実在するメーカー品名と衝突しない内部値。
 const EXCLUDE_MARK = '__EXCLUDE__';
-function isExcludeLink(v) { return String(v == null ? '' : v).trim() === EXCLUDE_MARK; }
+const DORMANT_MARK = '__DORMANT__';
+function isExcludeLink(v) { const t = String(v == null ? '' : v).trim(); return t === EXCLUDE_MARK || t === DORMANT_MARK; }
+// 表示用の種別：'exclude'（🚫別物）/ 'dormant'（💤休眠）/ ''（通常の紐付け名）
+function linkMarkKind(v) { const t = String(v == null ? '' : v).trim(); return t === EXCLUDE_MARK ? 'exclude' : (t === DORMANT_MARK ? 'dormant' : ''); }
 
 function normLinkName(s) {
   return String(s || '').normalize('NFKC').replace(/\s+/g, '').toLowerCase();
@@ -201,7 +206,9 @@ if (require.main === module) selfTest();
 
 module.exports = {
   EXCLUDE_MARK,
+  DORMANT_MARK,
   isExcludeLink,
+  linkMarkKind,
   normLinkName,
   linkNamesEqual,
   padSelfCode,
