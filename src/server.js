@@ -22,7 +22,8 @@ const { SUPPLIERS_PAGE } = require('./suppliersPage');
 const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
 const { CDLINK_PAGE } = require('./cdlinkPage');
-const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, listSettingsBackups, restoreSettingsBackup } = require('./settings');
+const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, listSettingsBackups, restoreSettingsBackup, getCustomerEmails, setCustomerEmail, verifyAccessPassword, getCostOverrides } = require('./settings');
+const { mailQuotePdf } = require('./mailQuote'); // 見積書PDF化＋Outlook下書き（会社PCのExcel/Outlook COM）
 const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords, mergeMakerFiles, makerProdKey } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
 const { readXlsxBuffer } = require('./xlsxread');
@@ -438,7 +439,31 @@ function getRecs(file) {
   const hit = cache.get(file);
   if (hit && hit.mtime === mtime) return hit.recs;
   const { recs } = loadAndNormalize(full);
+  applyCostOverrides(recs); // 自社CD別の原価強制（身＋蓋セット等で照合が拾えない原価を固定）
   cache.set(file, { mtime, recs });
+  return recs;
+}
+
+// 自社CD別の「新仕入原価」上書きを記録へ反映（rec.newCost を置換）。
+//  キーは6桁ゼロ埋め／素の数字／先頭ゼロ無し のどれでも引けるようにする（productLink と同じ寛容さ）。
+//  原価だけを置換＝売価・粗利・値上額は下流の calcRow がこの newCost を起点に再計算する。
+function applyCostOverrides(recs) {
+  const ov = getCostOverrides();
+  if (!ov || !Object.keys(ov).length) return recs;
+  for (const rec of recs) {
+    const raw = String(rec.productCode == null ? '' : rec.productCode).trim();
+    if (!raw) continue;
+    let v = ov[raw];
+    if (v == null && /^\d+$/.test(raw)) { v = ov[raw.padStart(6, '0')]; if (v == null) v = ov[String(Number(raw))]; }
+    if (v == null) continue;
+    if (typeof v === 'object') {
+      // { newCost, currentCost }：身＋蓋セット等で 新原価・現原価の両方を合算値へ揃える。
+      if (Number.isFinite(Number(v.newCost))) rec.newCost = sen(Number(v.newCost));
+      if (Number.isFinite(Number(v.currentCost))) rec.currentCost = sen(Number(v.currentCost));
+    } else if (Number.isFinite(Number(v))) {
+      rec.newCost = sen(Number(v)); // 数値＝新原価のみ強制（後方互換）
+    }
+  }
   return recs;
 }
 
@@ -2047,12 +2072,13 @@ function buildCustomerCandidates(opts) {
         effRounding = { unit: eu, mode: em };
         roundDiffers = effRounding.unit !== rounding.unit || effRounding.mode !== rounding.mode;
       }
-      // 掛率（markupのとき）：行掛率 > 帯の掛率 > 全体factor。
+      // パラメータ（markup＝掛率／target_margin_rate＝目標粗利率%）：行値 > 帯の値 > 全体factor。
+      //  どちらのルールも rule.factor の枠に値を載せる（掛率＝倍率／目標粗利率＝%）。
       let effFactor = factor;
-      if (effRuleType === 'markup') {
+      if (effRuleType === 'markup' || effRuleType === 'target_margin_rate') {
         const rf = Number(rowFactor[rowKey]);
         if (Number.isFinite(rf) && rf > 0) effFactor = rf;
-        else if (band && band.rule === 'markup' && Number.isFinite(Number(band.factor)) && Number(band.factor) > 0) effFactor = Number(band.factor);
+        else if (band && band.rule === effRuleType && Number.isFinite(Number(band.factor)) && Number(band.factor) > 0) effFactor = Number(band.factor);
       }
       // ルール／まるめ／掛率 のいずれかが全体と違えば、その行だけ再計算（全体と同じ calcRow 経路＝ズレない）。
       const ruleDiffers = effRuleType !== ruleType;
@@ -2401,7 +2427,36 @@ function exportCustomerQuotes(opts, doIssue) {
     count: files.length, reviewCount: reviewAll.length, reviewFile, applied,
     scope: opts.scope || 'all', customer: opts.customer || null,
     issuedCustomers: issued.map((i) => i.customer), // 今回提出した得意先（クライアントが即バッジ表示）
+    issuedDetail: issued, // [{ customer, quoteNo, itemCount }]（メール送信が見積No.等を引くため）
   };
+}
+
+// 見積メールの件名・本文を 雛形(settings.quote.mailSubject/mailBody)＋会社情報 から組み立てる。
+//  差し込みタグ {customer}{quoteNo}{date}{count}{company} を置換し、末尾に差出人欄(会社情報)を付ける。
+//  新規送信(/api/mail-quote)と再送(/api/mail-quote-resend)で共用＝文面を一元化。
+function composeQuoteMail(customer, quoteNo, itemCount) {
+  const s = getSettings();
+  const q = s.quote || {};
+  const co = s.company || {};
+  const fill = (t) => String(t || '')
+    .replace(/\{customer\}/g, customer)
+    .replace(/\{quoteNo\}/g, quoteNo || '')
+    .replace(/\{date\}/g, jpDate())
+    .replace(/\{count\}/g, String(itemCount != null ? itemCount : ''))
+    .replace(/\{company\}/g, co.name || '');
+  const sig = ['', '──────────', co.name || '', [co.postal, co.address].filter(Boolean).join(' '), co.tel || '', co.fax || ''].filter((x) => x !== undefined).join('\n');
+  const subject = fill(q.mailSubject || 'お見積書の送付（{customer}様）');
+  const body = fill(q.mailBody || '{customer}　御中\n\n見積書を添付いたします。よろしくお願いいたします。') + '\n' + sig;
+  return { subject, body };
+}
+
+// クライアントへ返す設定から機微情報（アクセスパスワードのハッシュ）を伏せる。
+//  画面の設定フォームはパスワードを編集しない＝伏せても無影響。設定有無は hasAccessPassword で伝える。
+function settingsForClient(s) {
+  const out = Object.assign({}, s);
+  out.hasAccessPassword = !!out.accessPassword;
+  out.accessPassword = '';
+  return out;
 }
 
 // ---- 販売大臣 単価履歴CSV：発行済み×実施日到来分を集める（日野/販売大臣 専用の隔離機能） ----
@@ -2574,7 +2629,7 @@ const server = http.createServer(async (req, res) => {
     if (accessPw) {
       if (req.method === 'POST' && url === '/api/login') {
         const body = await readBody(req);
-        if (String((body && body.password) || '') === accessPw) {
+        if (verifyAccessPassword(String((body && body.password) || ''), accessPw)) {
           res.writeHead(200, {
             'Content-Type': 'application/json; charset=utf-8',
             'Set-Cookie': 'apw=' + pwToken(accessPw) + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400',
@@ -2628,14 +2683,14 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, loadPL());
     }
     if (req.method === 'GET' && url === '/api/settings') {
-      return sendJson(res, 200, { settings: getSettings(), configured: isConfigured() });
+      return sendJson(res, 200, { settings: settingsForClient(getSettings()), configured: isConfigured() });
     }
     if (req.method === 'POST' && url === '/api/settings') {
       const body = await readBody(req);
       try {
         const settings = saveSettings(body || {});
         invalidateCalcCaches(); // matchThreshold/既定ルール/端数/自社上乗せ等の変更を計算結果へ即反映
-        return sendJson(res, 200, { ok: true, settings });
+        return sendJson(res, 200, { ok: true, settings: settingsForClient(settings) });
       } catch (e) {
         // saveSettings は settings.json 破損時など保存中止で throw する＝成功扱いにしない
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
@@ -2698,6 +2753,74 @@ const server = http.createServer(async (req, res) => {
       const doIssue = body && body.action === 'issue';
       try { return sendJson(res, 200, exportCustomerQuotes(body || {}, doIssue)); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    // 得意先別メール送信先：一覧取得・1件保存（{ 得意先名: メールアドレス }）
+    if (req.method === 'GET' && url === '/api/customer-emails') {
+      return sendJson(res, 200, { ok: true, emails: getCustomerEmails() });
+    }
+    if (req.method === 'POST' && url === '/api/customer-email') {
+      const body = await readBody(req);
+      const customer = String((body && body.customer) || '').trim();
+      if (!customer) return sendJson(res, 200, { ok: false, error: '得意先が指定されていません' });
+      try { return sendJson(res, 200, { ok: true, emails: setCustomerEmail(customer, (body && body.email) || '') }); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    // 選択中の得意先1件を「発行＋PDF化＋Outlook下書き」まで一気に行う（送信ボタンは人が押す）。
+    if (req.method === 'POST' && url === '/api/mail-quote') {
+      const body = await readBody(req) || {};
+      const customer = String(body.customer || '').trim();
+      if (!customer) return sendJson(res, 200, { ok: false, error: '得意先が指定されていません' });
+      // ① 選択中得意先だけ発行（既存の発行ロジックを再利用＝画面と提出物が一致）。
+      //    ここで提出済み登録＋xlsx生成が確定する。② のPDF/Outlookが失敗してもこの発行は有効。
+      let ex;
+      try { ex = exportCustomerQuotes(Object.assign({}, body, { scope: 'one', customer }), true); }
+      catch (e) { return sendJson(res, 200, { ok: false, error: '発行に失敗: ' + String(e && e.message || e) }); }
+      if (!ex || ex.ok === false) return sendJson(res, 200, ex || { ok: false, error: '発行に失敗しました' });
+      if (!ex.files || !ex.files.length) return sendJson(res, 200, { ok: false, error: '発行できる対象がありません（すでに提出済み、または実施日未設定の可能性があります）。' });
+      const xlsxPath = path.join(ex.folder, ex.files[0]);
+      const det = (ex.issuedDetail && ex.issuedDetail[0]) || {};
+      // ② 件名・本文を雛形から組み立て（送信・再送で共用の composeQuoteMail）。
+      const { subject, body: mailBody } = composeQuoteMail(customer, det.quoteNo || '', det.itemCount);
+      const to = String(body.email || getCustomerEmails()[customer] || '').trim();
+      // ③ PDF化 → Outlook作成ウィンドウ（PDF添付済み）を開く。
+      //    COM失敗（Excel/Outlook未起動など）でも ① の発行は済んでいるので、その旨を正直に返す
+      //    （issued:true でクライアントが提出済み状態を反映＝アイテムが消えて混乱、を防ぐ）。
+      try {
+        const pdf = await mailQuotePdf({ xlsxPath, to, subject, body: mailBody });
+        return sendJson(res, 200, {
+          ok: true, customer, quoteNo: det.quoteNo || '', itemCount: det.itemCount || 0,
+          to, pdf: path.basename(pdf), folderName: ex.folderName,
+          issuedCustomers: ex.issuedCustomers || [customer],
+          noEmail: !to,
+        });
+      } catch (e) {
+        return sendJson(res, 200, {
+          ok: false, issued: true, customer, quoteNo: det.quoteNo || '', itemCount: det.itemCount || 0,
+          folderName: ex.folderName, issuedCustomers: ex.issuedCustomers || [customer],
+          error: '⚠ 見積書の発行（提出済み登録）は完了しましたが、PDF化またはOutlook起動に失敗しました。\n'
+            + String(e && e.message || e)
+            + '\n\n対処：Excel/Outlookが使える会社PCで実行しているか、対象xlsxを閉じているかをご確認ください。'
+            + '発行済みの見積書は「📄 提出済の見積書を開く」から開けます（フォルダ: ' + ex.folderName + '）。',
+        });
+      }
+    }
+    // 提出済みの得意先を「再送」：再発行はせず、既存の提出済みxlsxからPDF化→Outlook下書きを開く。
+    if (req.method === 'POST' && url === '/api/mail-quote-resend') {
+      const body = await readBody(req) || {};
+      const customer = String(body.customer || '').trim();
+      if (!customer) return sendJson(res, 200, { ok: false, error: '得意先が指定されていません' });
+      const ent = readIssueLog()[customer];
+      if (!ent || !ent.folder) return sendJson(res, 200, { ok: false, error: 'この得意先の提出履歴がありません（先に「📧 見積を作成してメール」で発行してください）。' });
+      const xlsxPath = findQuoteFile(path.join(OUTPUT_DIR, ent.folder), customer); // 様あり優先・旧名フォールバック
+      if (!xlsxPath) return sendJson(res, 200, { ok: false, error: '提出済みの見積書ファイルが見つかりません（移動／削除された可能性: ' + ent.folder + '）。' });
+      const { subject, body: mailBody } = composeQuoteMail(customer, ent.quoteNo || '', ent.itemCount);
+      const to = String(body.email || getCustomerEmails()[customer] || '').trim();
+      try {
+        const pdf = await mailQuotePdf({ xlsxPath, to, subject, body: mailBody });
+        return sendJson(res, 200, { ok: true, resend: true, customer, quoteNo: ent.quoteNo || '', to, pdf: path.basename(pdf), noEmail: !to });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: 'PDF化またはOutlook起動に失敗しました。\n' + String(e && e.message || e) + '\n\n対処：Excel/Outlookが使える会社PCで実行しているか、対象xlsxを閉じているかをご確認ください。' });
+      }
     }
     // 見積書の提出（発行）履歴：得意先ページで「提出済み」を表示する。
     if (req.method === 'GET' && url === '/api/issue-log') {
@@ -3650,6 +3773,11 @@ ${SHOGO_LOCK_HTML}
       <div class="frow"><div class="fcol" style="min-width:100%"><label>あいさつ文</label><textarea id="qGreeting"></textarea></div></div>
       <div class="frow"><div class="fcol" style="min-width:100%"><label>脚注（注意書き）</label><textarea id="qFooter"></textarea></div></div>
 
+      <div class="sec">見積書メールの文言（得意先別ページの「📧 見積を作成してメール」で使用）</div>
+      <div class="frow"><div class="fcol" style="min-width:100%"><label>メール件名</label><input id="qMailSubject" placeholder="【お見積書】価格改定のご案内（{customer}様）"></div></div>
+      <div class="frow"><div class="fcol" style="min-width:100%"><label>メール本文</label><textarea id="qMailBody" rows="6"></textarea>
+        <div class="hint">差し込みタグ：<b>{customer}</b>=得意先名 / <b>{quoteNo}</b>=見積No / <b>{date}</b>=発行日 / <b>{count}</b>=品目数 / <b>{company}</b>=自社名。本文末尾に会社情報の差出人欄が自動で付きます。</div></div></div>
+
       <div class="sec">計算の既定値（画面上部の初期値になります）</div>
       <div class="frow">
         <div class="fcol"><label>既定の転嫁ルール</label>
@@ -4152,7 +4280,7 @@ function buildMainRow(r, i, readOnly){
   let prodName = buildProdNameHtml(r); // 仕入先は商品名内の「🏢 仕入先」バッジで全ビュー共通に表示（buildProdNameHtml）
   if(readOnly) prodName += progressBadge(r.itemStatus);
   const nc = newCostCellHtml(r);
-  const linkCell = '<td class="c">'+linkCellHtml(r, i)+'</td>'; // 横断（読み取り）ビューでも紐付けは可能
+  const linkCell = '<td class="c" id="lk'+i+'">'+linkCellHtml(r, i)+'</td>'; // 横断（読み取り）ビューでも紐付けは可能（id付き＝保存直後にこのセルだけ再描画）
   tr.innerHTML =
     '<td class="c shogo-col"></td>'+
     custCellHtml(r)+
@@ -4177,6 +4305,8 @@ function sectionHeaderRow(text, bg, fg){
 //  ※並べ替えても buildMainRow には元のインデックス i を渡す（セルIDが updateView と対応＝値がズレない）。
 function renderMainRows(readOnly){
   const tb = $('#tbody'); tb.innerHTML='';
+  // 行は DocumentFragment（DOM外）に貯めて最後に1回だけ挿入する＝行ごとの再レイアウトを避ける（データ増に強い）。
+  const frag = document.createDocumentFragment();
   // 見積書を作成済み（提出済み）の行は通常表示では出さない（作業中の品だけに絞る）。
   //  ※実施日カレンダー横断ビューでは提出済／未提出を分けて表示する。
   let hiddenIssued=0;
@@ -4199,15 +4329,15 @@ function renderMainRows(readOnly){
     const holdN=todo.filter(i=>baseRows[i].itemStatus==='hold').length;
     const manualN=todo.filter(i=>baseRows[i].itemStatus==='manual').length;
     if(issued.length){
-      tb.appendChild(sectionHeaderRow('✅ 提出済み '+issued.length+'件（見積書を発行済み）', '#eaf6ee', '#1b6b3a'));
-      issued.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, true)));
+      frag.appendChild(sectionHeaderRow('✅ 提出済み '+issued.length+'件（見積書を発行済み）', '#eaf6ee', '#1b6b3a'));
+      issued.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, true)));
     }
     if(todo.length){
       let todoLbl='⬜ 未提出 '+todo.length+'件（見積書 未発行・要対応）';
       if(holdN) todoLbl+=' — うち検討中 '+holdN+'件';
       if(manualN) todoLbl+=' — うち手動修正 '+manualN+'件';
-      tb.appendChild(sectionHeaderRow(todoLbl, '#fff8ee', '#8a5a12'));
-      todo.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, true)));
+      frag.appendChild(sectionHeaderRow(todoLbl, '#fff8ee', '#8a5a12'));
+      todo.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, true)));
     }
   } else {
     sortMatchedIndices(matched);
@@ -4215,12 +4345,12 @@ function renderMainRows(readOnly){
       || col.compare(baseRows[a].makerName||'', baseRows[b].makerName||''));
     if(matched.length){
       const sortLbl = mainSortMode === 'matchDesc' ? '一致度 高い順' : (mainSortMode === 'matchAsc' ? '一致度 低い順' : '得意先別');
-      tb.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（'+sortLbl+'）', '#eaf6ee', '#1b6b3a'));
-      matched.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
+      frag.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（'+sortLbl+'）', '#eaf6ee', '#1b6b3a'));
+      matched.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, readOnly)));
     }
     if(dormant.length){
-      tb.appendChild(sectionHeaderRow('💤 休眠・未一致 '+dormant.length+'件（販売実績なし／商品名が一致せず＝見積対象外。紐付けで救済できます）', '#f1f1f1', '#7a7a7a'));
-      dormant.forEach(i=> tb.appendChild(buildMainRow(baseRows[i], i, readOnly)));
+      frag.appendChild(sectionHeaderRow('💤 休眠・未一致 '+dormant.length+'件（販売実績なし／商品名が一致せず＝見積対象外。紐付けで救済できます）', '#f1f1f1', '#7a7a7a'));
+      dormant.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, readOnly)));
     }
   }
   const note=$('#issuedHideNote');
@@ -4229,8 +4359,9 @@ function renderMainRows(readOnly){
     else { note.style.display='none'; note.textContent=''; }
   }
   // 価格編集（改定後仕入・行ルール）はメイン画面から撤去＝得意先別ページに集約したので配線しない。
-  // 紐付けボタンは読み取り（実施日フィルタ）ビューでも有効（openLinkModal が行の仕入先で処理）
-  tb.querySelectorAll('.linkBtn').forEach(el=> el.addEventListener('click', (e)=> openLinkModal(Number(e.currentTarget.dataset.i))));
+  // 全行をまとめて1回だけ挿入（行ごとの再レイアウトを避ける）。
+  tb.appendChild(frag);
+  // 紐付け✏ボタンのクリックは #tbody の委譲リスナ（initで1個だけ）が処理する＝行数ぶんの addEventListener を廃止。
 }
 // 「★全部」＝全仕入先まとめて1つの表に（取り込んでいる全件）。
 async function loadAll(){
@@ -4318,6 +4449,16 @@ function linkCellHtml(r, i){
       : '<span style="color:#c0392b;font-weight:700" title="この自社品は このメーカーでは別物として除外中です（誤紐付け防止）。「↻ 照合」で休眠になります。✏ から別のメーカー品を選ぶ／解除で戻せます。">🚫 除外中</span>';
     return _badge + ' <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
   }
+  // 未照合の手動紐付け（保存直後の即時フィードバック）：選んで保存したが ↻照合 はまだ＝橙バッジで「やった行」を示す。
+  //  確定（緑）より先に判定する＝既に📌確定の行を別品に変えても「未照合」が正しく出る。↻照合で baseRows が
+  //  作り直され _pendingLink は消える（＝確定済みは緑「📌 確定」へ）。
+  if (r._pendingLink) {
+    const pv = r._pendingLink.value;
+    const pb = pv
+      ? '<span style="color:#fff;background:#e08a00;font-weight:700;border-radius:3px;padding:0 5px" title="紐付けを保存しました（未照合）。表の左「↻ 照合」を押すと照合結果に反映され「📌 確定」になります。">📌 紐付け済み（未照合）</span>'
+      : '<span style="color:#fff;background:#8a94a6;font-weight:700;border-radius:3px;padding:0 5px" title="紐付けの解除を保存しました（未照合）。「↻ 照合」で自動マッチに戻ります。">🔄 解除予定（未照合）</span>';
+    return pb + ' <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
+  }
   // 確定済み判定：現在ファイルの紐付け辞書 or 行のステータスが「📌 手動紐付け」（横断ビューは辞書が空なので後者で判定）
   const linked = code && (linkEq(linkLookup(currentLinks, code), r.makerName) || /📌/.test(r.matchStatus||''));
   if (linked) {
@@ -4340,6 +4481,14 @@ function linkCellHtml(r, i){
     return '<span class="hint">—</span>';
   }
   return '<button class="linkBtn" data-i="'+i+'" style="font-size:11px;color:#6b7785">✏ 紐付け</button>';
+}
+
+// 紐付けセルだけを描き直す（保存直後の即時反映用）。↻照合を待たず「やった行」を可視化する。
+//  クリックは #tbody の委譲リスナが拾うので、新しい ✏ ボタンへ貼り直す必要はない（innerHTML 差し替えだけ）。
+function refreshLinkCell(idx){
+  const r = baseRows[idx]; if(!r) return;
+  const cell = document.getElementById('lk'+idx); if(!cell) return;
+  cell.innerHTML = linkCellHtml(r, idx);
 }
 
 // 紐付けモーダルの類似度判定（クライアント側で軽量に計算）
@@ -4589,6 +4738,11 @@ async function openLinkModal(idx, preselect){
         const pl = res.productLinks[supplier];
         if (pl && typeof pl === 'object') currentLinks = pl;
       }
+      // 保存できたことを表で即可視化：この行を「未照合の紐付け」にして橙バッジを出す（確定は↻照合後）。
+      r._pendingLink = { value: v };
+      refreshLinkCell(idx);
+      const pend = baseRows.filter((x)=> x && x._pendingLink).length;
+      if (pend) $('#msg').textContent += '（未照合の紐付け '+pend+' 件 → ↻照合で反映）';
       loadLinkCheck(); // 監査バナー・⚠マークを取り直す（直した分は消える）
     } catch (e) { alert('保存に失敗: '+e); }
   });
@@ -4602,6 +4756,8 @@ async function openLinkModal(idx, preselect){
       close();
       $('#msg').textContent=icon+' 「'+(r.productCode||'')+'」を '+supplier+' の照合対象から'+label+'しました。照合結果に反映するには 表の左「↻ 照合」を押してください。';
       if (res.productLinks && supplier){ const pl=res.productLinks[supplier]; if (pl && typeof pl==='object') currentLinks=pl; }
+      r._pendingLink = null; // 除外/休眠は currentLinks 由来の 🚫/💤 バッジで示す（橙の未照合バッジは消す）
+      refreshLinkCell(idx);  // 🚫除外中 / 💤休眠 を照合前に即表示
       loadLinkCheck();
     } catch (e) { alert('保存に失敗: '+e); }
   };
@@ -4797,6 +4953,8 @@ $('#file').addEventListener('change', ()=>{
   loadFile(); // ファイル切替は表示の切替だけ＝損益(全社)は不変
 });
 $('#shogoBtn').addEventListener('click', runShogo);
+// 紐付け✏ボタンはイベント委譲で処理（#tbody に1個だけ）。行を作り直しても貼り直し不要・行数に依存しない。
+$('#tbody').addEventListener('click', (e)=>{ const b=e.target.closest && e.target.closest('.linkBtn'); if(b) openLinkModal(Number(b.dataset.i)); });
 // 全体方針（転嫁ルール・端数・自社上乗せ%）はメイン画面から撤去し ⚙設定 に集約。
 //  設定で保存すると applyToBar が savedPolicy を更新し、表示・損益にも反映される（setSave 内で再計算）。
 // 見積書の作成はメイン画面では行わない（得意先別ページに集約）。#toCustomersBtn は /customers への通常リンク。
@@ -4821,6 +4979,7 @@ function fillSettings(s){
   setEl('cName').value=c.name||''; setEl('cPostal').value=c.postal||''; setEl('cAddr').value=c.address||'';
   setEl('cTel').value=c.tel||''; setEl('cFax').value=c.fax||'';
   setEl('qTitle').value=q.title||''; setEl('qGreeting').value=q.greeting||''; setEl('qFooter').value=q.footer||'';
+  setEl('qMailSubject').value=q.mailSubject||''; setEl('qMailBody').value=q.mailBody||'';
   setEl('sRule').value=df.type||'add_increase'; setEl('sFactor').value=df.factor||1.25;
   setEl('sUnit').value=String(rd.unit||0.01); setEl('sMode').value=rd.mode||'round';
   setEl('sUplift').value=Number(su.rate)||0;
@@ -4830,7 +4989,7 @@ function fillSettings(s){
 function collectSettings(){
   return {
     company:{ name:setEl('cName').value.trim(), postal:setEl('cPostal').value.trim(), address:setEl('cAddr').value.trim(), tel:setEl('cTel').value.trim(), fax:setEl('cFax').value.trim() },
-    quote:{ title:setEl('qTitle').value, greeting:setEl('qGreeting').value, footer:setEl('qFooter').value },
+    quote:{ title:setEl('qTitle').value, greeting:setEl('qGreeting').value, footer:setEl('qFooter').value, mailSubject:setEl('qMailSubject').value, mailBody:setEl('qMailBody').value },
     default:{ type:setEl('sRule').value, factor:parseFloat(setEl('sFactor').value)||1 },
     rounding:{ unit:parseFloat(setEl('sUnit').value)||0.01, mode:setEl('sMode').value },
     selfCostUplift:{ rate:parseFloat(setEl('sUplift').value)||0 },

@@ -52,6 +52,20 @@ function nCell(ref, style, value) {
   return `<c r="${ref}" s="${style}"/>`;
 }
 
+// 脚注（フッター）の行高を内容から概算する。固定だと長文・複数行で下が隠れるため。
+//  A:F 結合幅(125)から余白を引いた1行ぶんの収容幅で、各行の折り返し本数を見積もって合算する。
+//  全角=2・半角=1 で幅を数え、隠れるより少し高め（過大評価寄り）に出す。
+function footerHeight(text) {
+  const USABLE = 110;      // 1行に入る半角換算の目安（結合幅125 − 余白、安全側に小さめ）
+  const PT_PER_LINE = 15;  // メイリオ10pt 1行ぶんの高さ目安(pt)
+  let visual = 0;
+  String(text).split('\n').forEach((ln) => {
+    let w = 0; for (const ch of ln) w += (ch.codePointAt(0) > 0xFF ? 2 : 1);
+    visual += Math.max(1, Math.ceil(w / USABLE));
+  });
+  return Math.max(40, visual * PT_PER_LINE + 8);
+}
+
 // rows: [{ productCode, productName, currentSell, newSell, effectiveDate, note }]
 //  列：A 商品コード / B 商品名 / C 現行単価 / D 改定単価 / E 実施日 / F 備考（No列は廃止）
 function buildSheet(customer, rows, opt) {
@@ -98,8 +112,8 @@ function buildSheet(customer, rows, opt) {
   });
   // 品目数
   sd += `<row r="${countRow}">${tCell('A' + countRow, 13, '品目数：' + rows.length + ' 件')}${empties('A' + countRow, 'F' + countRow, 13)}</row>`;
-  // 脚注
-  if (q.footer) sd += `<row r="${footerRow}" ht="40" customHeight="1">${tCell('A' + footerRow, 12, q.footer)}${empties('A' + footerRow, 'F' + footerRow, 12)}</row>`;
+  // 脚注（内容に応じて行高を可変に＝長文・複数行でも下が隠れない）
+  if (q.footer) sd += `<row r="${footerRow}" ht="${footerHeight(q.footer)}" customHeight="1">${tCell('A' + footerRow, 12, q.footer)}${empties('A' + footerRow, 'F' + footerRow, 12)}</row>`;
   sd += '</sheetData>';
 
   let cols = '<cols>';

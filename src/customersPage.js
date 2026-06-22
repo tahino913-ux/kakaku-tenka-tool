@@ -222,6 +222,7 @@ const CUSTOMERS_PAGE = `<!doctype html>
   table.cust-compact .prodname{font-size:12px;line-height:1.45;word-break:break-word;overflow-wrap:anywhere;white-space:normal}
   table.cust-compact .prodname a{word-break:break-word;overflow-wrap:anywhere}
   table.cust-compact .subline{color:#6b7785;font-size:11px;margin-top:2px;line-height:1.35;word-break:break-all}
+  table.cust-compact .subline.lastsale{color:#41526b;font-weight:700;white-space:nowrap;word-break:keep-all}
   table.cust-compact .pcode{font-family:Consolas,'Courier New',monospace;font-size:10px;color:#6b7785}
   table.cust-compact .paren{color:#9aa6b2;font-size:11px;font-weight:400}
   table.cust-compact .main-num{font-weight:700;font-variant-numeric:tabular-nums}
@@ -294,12 +295,15 @@ ${SHOGO_LOCK_HTML}
         <select id="cRule">
           <option value="add_increase">値上げ分を上乗せ（利益額キープ）</option>
           <option value="keep_margin_rate">現在の粗利率を維持</option>
+          <option value="target_margin_rate">目標粗利率で逆算（新原価ベース）</option>
           <option value="markup">現売価 × 掛率</option>
           <option value="sell_cost_rate">現売価 × 仕入改定%（仕入と同率で値上げ＝粗利率維持と同結果）</option>
           <option value="keep_sell">据え置き（値上げしない）</option>
         </select></div>
       <div class="fld" id="cFactorBox" style="display:none"><label>掛率</label>
         <input id="cFactor" class="num" type="number" step="0.01" value="1.25"></div>
+      <div class="fld" id="cMarginBox" style="display:none"><label>目標粗利率% <span class="h">新売価=新原価÷(1−率)</span></label>
+        <input id="cMargin" class="num" type="number" step="0.1" value="30"></div>
       <div class="fld"><label>自社コスト上乗せ% <span class="h">労務費等</span></label>
         <input id="cUplift" class="num" type="number" step="0.1" value="0"></div>
     </div>
@@ -466,6 +470,7 @@ let filtered=[];  // 検索後
 let hiddenNoRecent=0; // 「取引のない先を隠す」で隠した件数（一覧上部に表示）
 let selName=null; // 選択中の得意先名
 let ISSUED={};    // 提出（発行）履歴 { 得意先名: {lastIssuedAt,count,quoteNo,itemCount,folder} }
+let CUST_EMAILS={}; // 得意先別 送信先メール { 得意先名: メールアドレス }（見積PDFのOutlook送信用）
 let rowRules={};  // 行ごと転嫁ルールの上書き { rowKey: ruleType }（空=全体ルール）
 let rowSell={};   // 行ごと 改定後売価 の手入力 { rowKey: 入力文字列 }
 let rowEff={};    // 行ごと 実施日 の手入力 { rowKey: 入力文字列 }
@@ -527,6 +532,13 @@ function passTransferBadge(costPct, sellPct){
   if(Math.abs(diff)<0.15&&Math.abs(costPct)>0.05) return '<span class="pass-ok">同率</span>';
   if(sellPct+0.05>=costPct) return '<span class="pass-ok">転嫁OK</span>';
   return '<span class="pass-warn">要確認</span>';
+}
+// 商品欄の最終売上日（この得意先へのこの商品の最終販売日）。DB直結時のみ値が入る。
+//  値が無い（ファイル方式/未再照合）ときは何も出さない。
+function lastSaleLine(p){
+  const d=p&&p.lastDate?String(p.lastDate):'';
+  if(!d) return '';
+  return '<div class="subline lastsale" title="この得意先へのこの商品の最終売上日（販売大臣DB）">🗓 最終 '+esc(d)+'</div>';
 }
 function compactCostCell(cur, nw){
   const c=numStr(cur), n=numStr(nw);
@@ -628,7 +640,7 @@ async function setItemState(rowKey, status, snap){
   }catch(e){ alert('変更に失敗: '+e); }
 }
 // 行ルールの選択肢（先頭＝全体ルールを継承）
-const ROW_RULE_OPTS=[['','（全体）'],['add_increase','上乗せ'],['keep_margin_rate','粗利維持'],['markup','掛率×'],['sell_cost_rate','売価×仕入率'],['keep_sell','据置']];
+const ROW_RULE_OPTS=[['','（全体）'],['add_increase','上乗せ'],['keep_margin_rate','粗利維持'],['target_margin_rate','粗利率%'],['markup','掛率×'],['sell_cost_rate','売価×仕入率'],['keep_sell','据置']];
 function rowRuleSelect(p){
   const cur = rowRules[p.rowKey]||'';
   const opts = ROW_RULE_OPTS.map(o=>'<option value="'+o[0]+'"'+(o[0]===cur?' selected':'')+'>'+o[1]+'</option>').join('');
@@ -652,12 +664,18 @@ function refreshRowFactorSlot(sel){
   const inp=slot.querySelector('input.rowfactor');
   if(inp) bindOneRowFactor(inp);
 }
-// 行ルールが「掛率×」のときだけ、その行の掛率入力欄を出す（未入力なら上の全体「掛率」を使う）。
+// 行ルールが「掛率×」または「粗利率%（目標粗利率）」のときだけ、その行のパラメータ入力欄を出す
+//  （未入力なら上の全体「掛率」/「目標粗利率%」を使う）。
 function rowFactorInput(p){
-  if((rowRules[p.rowKey]||'')!=='markup') return '';
-  const gf = parseFloat(($('#cFactor')||{}).value)||1.25; // 既定＝全体の掛率
+  const rr=(rowRules[p.rowKey]||'');
+  if(rr!=='markup' && rr!=='target_margin_rate') return '';
+  const isMargin=(rr==='target_margin_rate');
+  const gf = isMargin ? (parseFloat(($('#cMargin')||{}).value)||30) : (parseFloat(($('#cFactor')||{}).value)||1.25);
   const v = (rowFactor[p.rowKey]!=null && rowFactor[p.rowKey]!=='') ? rowFactor[p.rowKey] : gf;
-  return ' ×<input class="rowfactor" type="text" inputmode="decimal" data-key="'+esc(p.rowKey)+'" value="'+esc(v)+'" title="この行の掛率（現売価 × この値）。空欄なら上の全体「掛率」を使います" style="width:52px">';
+  const pre = isMargin ? ' 粗利' : ' ×';
+  const suf = isMargin ? '%' : '';
+  const ttl = isMargin ? 'この行の目標粗利率%（新原価÷(1−率)）。空欄なら上の全体「目標粗利率%」を使います' : 'この行の掛率（現売価 × この値）。空欄なら上の全体「掛率」を使います';
+  return pre+'<input class="rowfactor" type="text" inputmode="decimal" data-key="'+esc(p.rowKey)+'" value="'+esc(v)+'" title="'+ttl+'" style="width:52px">'+suf;
 }
 // 行ごと まるめ：1つのプルダウン（変更は即サーバへ送らず「再計算」で一括反映）
 const ROW_ROUND_SEL_OPTS=[
@@ -685,7 +703,7 @@ function rowRoundSelect(p){
 // 価格帯別ルール（現売価で転嫁ルールを変える）。最後の1件は max=null＝「それ以上」。
 let priceBands=[{max:null, rule:'add_increase', factor:1.25}];
 let bandRoundOn=false; // 帯ごとの「まるめ」を出すか（既定OFF＝上の全体まるめを使う。上級者だけ開く）
-const BAND_RULES=[['add_increase','上乗せ'],['keep_margin_rate','粗利維持'],['markup','掛率×'],['sell_cost_rate','売価×仕入率'],['keep_sell','据置']];
+const BAND_RULES=[['add_increase','上乗せ'],['keep_margin_rate','粗利維持'],['target_margin_rate','粗利率%'],['markup','掛率×'],['sell_cost_rate','売価×仕入率'],['keep_sell','据置']];
 function bandsEnabled(){ return !!($('#cBandOn')&&$('#cBandOn').checked); }
 function getRoundUnit(){
   const el=document.querySelector('input[name="cRoundUnit"]:checked');
@@ -699,9 +717,12 @@ function getRoundMode(){
   return (pol==='floor'||pol==='ceil')?pol:'round';
 }
 function calcOpts(){
+  const rt=$('#cRule').value;
+  // factor は「ルールのパラメータ」枠：掛率(markup)は倍率、目標粗利率(target_margin_rate)は%を載せる。
+  const param = (rt==='target_margin_rate') ? (parseFloat($('#cMargin').value)||0) : (parseFloat($('#cFactor').value)||1);
   return {
-    ruleType: $('#cRule').value,
-    factor: parseFloat($('#cFactor').value)||1,
+    ruleType: rt,
+    factor: param,
     roundingUnit: getRoundUnit(),
     roundingMode: getRoundMode(),
     selfUplift: parseFloat($('#cUplift').value)||0,
@@ -726,7 +747,9 @@ function renderBands(){
     const isLast=(b.max==null);
     const mx=isLast?'<b style="min-width:96px;display:inline-block">それ以上</b>'
       :'〜 <input class="band-max" data-i="'+i+'" type="text" inputmode="decimal" value="'+(b.max==null?'':b.max)+'" style="width:74px;text-align:right;'+inS+'"> 円まで';
-    const fac=(b.rule==='markup')?(' ×<input class="band-factor" data-i="'+i+'" type="text" inputmode="decimal" value="'+(b.factor||'')+'" style="width:56px;text-align:right;'+inS+'">'):'';
+    const fac=(b.rule==='markup')?(' ×<input class="band-factor" data-i="'+i+'" type="text" inputmode="decimal" value="'+(b.factor||'')+'" style="width:56px;text-align:right;'+inS+'">')
+      :(b.rule==='target_margin_rate')?(' 粗利<input class="band-factor" data-i="'+i+'" type="text" inputmode="decimal" value="'+(b.factor||'')+'" style="width:50px;text-align:right;'+inS+'">%')
+      :'';
     const del=isLast?'':'<button class="band-del" data-i="'+i+'" title="この帯を削除" style="border:none;background:#e4ebf2;color:#5a6b7a;border-radius:6px;width:24px;height:24px;cursor:pointer">×</button>';
     h+='<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">'+mx+' ： '+ruleSel(i,b.rule)+fac
       +(bandRoundOn?(' まるめ '+roundSel(i,b)):'')+' '+del+'</div>';
@@ -751,10 +774,14 @@ function renderBands(){
   box.querySelectorAll('.band-del').forEach(el=>el.addEventListener('click',()=>{ priceBands.splice(+el.dataset.i,1); renderBands(); markCalcPending(); }));
   const add=$('#bandAdd'); if(add) add.addEventListener('click',()=>{ priceBands.unshift({max:100,rule:'add_increase',factor:1.25}); renderBands(); markCalcPending(); });
 }
-const RULE_LABEL={add_increase:'上乗せ',keep_margin_rate:'粗利維持',markup:'掛率×',sell_cost_rate:'売価×仕入率',keep_sell:'据置'};
+const RULE_LABEL={add_increase:'上乗せ',keep_margin_rate:'粗利維持',target_margin_rate:'粗利率%',markup:'掛率×',sell_cost_rate:'売価×仕入率',keep_sell:'据置'};
 const MODE_LABEL={round:'四捨五入',ceil:'切上げ',floor:'切捨て'};
 const UNIT_LABEL={'1':'整数','0.1':'0.1','0.01':'0.01'};
-function toggleFactor(){ $('#cFactorBox').style.display = ($('#cRule').value==='markup')?'flex':'none'; }
+function toggleFactor(){
+  const rt=$('#cRule').value;
+  $('#cFactorBox').style.display = (rt==='markup')?'flex':'none';
+  const mb=$('#cMarginBox'); if(mb) mb.style.display = (rt==='target_margin_rate')?'flex':'none';
+}
 function showApplied(a){
   if(a) lastApplied=a;
   if(!a){ lastApplied=null; $('#appliedMsg').textContent=''; return; }
@@ -762,12 +789,12 @@ function showApplied(a){
   const bands=Array.isArray(a.priceBands)?a.priceBands:[];
   const ruleDisp = bands.length
     ? ('💴 価格帯別: '+bands.map(b=>{
-        let s=(b.max==null?'それ以上':('〜'+b.max))+'='+(RULE_LABEL[b.rule]||b.rule)+(b.rule==='markup'?('×'+(b.factor||'')):'');
+        let s=(b.max==null?'それ以上':('〜'+b.max))+'='+(RULE_LABEL[b.rule]||b.rule)+(b.rule==='markup'?('×'+(b.factor||'')):(b.rule==='target_margin_rate'?((b.factor||'')+'%'):''));
         const rv=bandRoundSelectVal(b);
         if(rv){ const o=BAND_ROUND_OPTS.find(x=>x[0]===rv); if(o) s+=' まるめ'+o[1]; }
         return s;
       }).join(' / '))
-    : ((RULE_LABEL[a.ruleType]||a.ruleType)+(a.ruleType==='markup'?(' '+a.factor):''));
+    : ((RULE_LABEL[a.ruleType]||a.ruleType)+(a.ruleType==='markup'?(' '+a.factor):(a.ruleType==='target_margin_rate'?(' '+a.factor+'%'):'')));
   const uLbl=UNIT_LABEL[String(a.roundingUnit)]||String(a.roundingUnit);
   const mSel=String(($('#cRoundMode')||{}).value||'');
   const mLbl=mSel?(MODE_LABEL[mSel]||mSel):('⚙'+(MODE_LABEL[a.roundingMode]||a.roundingMode));
@@ -999,6 +1026,11 @@ function applyFilter(){
 async function loadIssueLog(){
   try{ const r=await fetch('/api/issue-log').then(x=>x.json()); ISSUED=(r&&r.log)||{}; }
   catch(e){ ISSUED={}; }
+}
+// 得意先別メール送信先を読み込む（見積PDFのOutlook送信用）。失敗しても画面は壊さない。
+async function loadCustomerEmails(){
+  try{ const r=await fetch('/api/customer-emails').then(x=>x.json()); CUST_EMAILS=(r&&r.emails)||{}; }
+  catch(e){ CUST_EMAILS={}; }
 }
 // ISO日時 → "M/D" 表示
 function issuedShort(iso){
@@ -1264,10 +1296,19 @@ async function selectCust(name){
     html+='<div class="issuednote">✅ <b>提出済み</b>　最終提出 '+esc(issuedShort(iss.lastIssuedAt))
       +(iss.quoteNo?'（見積No. '+esc(iss.quoteNo)+'）':'')+(iss.itemCount?' '+iss.itemCount+'品':'')+(iss.count>1?'　／　提出 '+iss.count+' 回':'')
       +'<button class="openq" data-name="'+esc(c.name)+'" onclick="openIssued(this.getAttribute(\\'data-name\\'))">📄 提出済の見積書を開く</button>'
+      +'<button class="openq" data-name="'+esc(c.name)+'" onclick="mailResendFlow(this.getAttribute(\\'data-name\\'))" title="提出済みの見積書をPDF化してOutlookで開きます（再発行はしません）">📧 メールで再送</button>'
       +'<button class="un" data-name="'+esc(c.name)+'" onclick="unmarkIssued(this.getAttribute(\\'data-name\\'))">提出済みを取消</button></div>';
   } else {
     html+='<div class="notyet">未提出（この得意先はまだ見積書を発行していません）</div>';
   }
+  // 📧 見積PDFのメール送信：得意先別アドレスを登録し、Outlookの作成画面（PDF添付済み）を開く。
+  html+='<div class="mailbox" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0;padding:8px 10px;background:#f3f7fb;border:1px solid #d4e1ef;border-radius:8px">'
+    +'<span style="font-weight:700;color:#1f4e78">📧 送信先メール</span>'
+    +'<input id="custEmailInp" type="email" value="'+esc(CUST_EMAILS[c.name]||'')+'" placeholder="example@domain.co.jp" style="flex:1;min-width:200px;padding:5px 8px;border:1px solid #c7d6e4;border-radius:6px;font:inherit">'
+    +'<button id="custEmailSave" class="go" style="background:#5b6b8b;padding:6px 12px">💾 保存</button>'
+    +'<button id="mailQuoteBtn" class="go" style="background:#1f8a4c;padding:6px 14px;font-weight:700">📧 見積を作成してメール</button>'
+    +'<span class="muted" style="flex-basis:100%;font-size:11px">この得意先だけ発行→PDF化→Outlookの作成画面（PDF添付済み）を開きます。送信ボタンはあなたが押します（会社PCのExcel/Outlookが必要）。</span>'
+    +'</div>';
   if(c.reviewCount){
     html+='<div class="revnote">⚠ この得意先には「要確認」が '+c.reviewCount+' 件あります（価格異常・低一致で見積書から自動で外れる行）。'
       +'シミュレーション画面で内容を確認してください。</div>';
@@ -1318,7 +1359,8 @@ async function selectCust(name){
       +' <button class="hold-btn" data-key="'+esc(p.rowKey)+'" title="検討中へ（あとで考えたい品を見積から一時除外）">🤔</button>'
       +' <button class="manual-btn" data-key="'+esc(p.rowKey)+'" title="手動修正へ（照合できない品をツール外で直した記録）">✏</button></td>'
       +'<td class="prodcell col-prod"><div class="prodname">'+prodLink(c.name, p.supplier, p.productCode, p.productName)+'</div>'
-      +'<div class="subline"><span class="sup-badge">'+esc(p.supplier)+'</span> <span class="pcode">'+esc(p.productCode||'')+'</span></div></td>'
+      +'<div class="subline"><span class="sup-badge">'+esc(p.supplier)+'</span> <span class="pcode">'+esc(p.productCode||'')+'</span></div>'
+      +lastSaleLine(p)+'</td>'
       +compactCostCell(p.currentCost, p.newCost)
       +compactChgCell(costPct)
       +compactSellCell(p, curM, newM, lowCls)
@@ -1340,6 +1382,13 @@ async function selectCust(name){
   // 「○○だけ作成」ボタンを 一括バー（チェックして手動修正へ）の右端スロットへ差し込む。
   const __oneSlot=document.getElementById('exportOneSlot');
   if(oneBtn && __oneSlot) __oneSlot.appendChild(oneBtn);
+  // 📧 メール送信先の保存／「見積を作成してメール」の配線（この得意先＝c.name）。
+  const __emInp=document.getElementById('custEmailInp');
+  const __emSave=document.getElementById('custEmailSave');
+  if(__emSave && __emInp) __emSave.addEventListener('click', ()=>saveCustEmail(c.name, __emInp.value));
+  if(__emInp) __emInp.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); saveCustEmail(c.name, __emInp.value); } });
+  const __mailBtn=document.getElementById('mailQuoteBtn');
+  if(__mailBtn) __mailBtn.addEventListener('click', ()=>mailQuoteFlow(c.name));
   // 「🤔 検討中へ」「✏ 手動修正へ」「↩ 対象へ戻す」の配線（1件ずつ）
   $('#detailCol').querySelectorAll('button.hold-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'hold')));
   $('#detailCol').querySelectorAll('button.manual-btn').forEach(b=> b.addEventListener('click',()=>{
@@ -1419,6 +1468,11 @@ async function selectCust(name){
       const k=sel.getAttribute('data-key');
       if(sel.value) rowRules[k]=sel.value; else delete rowRules[k];
       sel.classList.toggle('ov', !!sel.value);
+      // 目標粗利率に切替えた行は、表示中の率（既定＝全体の目標粗利率%）を明示的に確定させる。
+      //  全体ルールが目標粗利率以外だと「全体factor」は掛率なので、シードしないと率が伝わらないため。
+      if(sel.value==='target_margin_rate' && (rowFactor[k]==null||rowFactor[k]==='')){
+        const gm=parseFloat(($('#cMargin')||{}).value); if(Number.isFinite(gm)&&gm>0) rowFactor[k]=gm;
+      }
       refreshRowFactorSlot(sel);
       markCalcPending();
       if(lastApplied) showApplied(lastApplied);
@@ -1538,6 +1592,77 @@ function openGate(res,opts){
   $('#gateOverlay').classList.add('show');
 }
 function closeGate(){ $('#gateOverlay').classList.remove('show'); }
+// PDF作成中の全画面ロック。照合中と同じオーバーレイ(#shogoLockOverlay)を、ポーリング無しで
+//  メール処理の間だけ表示する＝ページ移動・操作を防ぐ（Excel COMでサーバが同期ブロックするため）。
+//  off時は照合ロックの既定文言へ戻す（後で本物の照合ロックが正しく表示されるように）。
+function setMailBusy(on){
+  const ov=document.getElementById('shogoLockOverlay'); if(!ov) return;
+  const t=document.getElementById('shogoLockTitle'), m=document.getElementById('shogoLockMsg');
+  if(on){ if(t)t.textContent='📧 見積PDFを作成中'; if(m)m.textContent='PDF化してOutlookを起動しています…完了まで操作しないでください（ページを移動しないでください）'; }
+  else { if(t)t.textContent='↻ 照合を実行中'; if(m)m.textContent='完了まで操作できません（1〜2分かかることがあります）'; }
+  ov.classList.toggle('on',!!on);
+  document.body.classList.toggle('shogo-lock-busy',!!on);
+}
+// 得意先別 送信先メールを保存（空で削除）。
+function saveCustEmail(name, email){
+  const addr=String(email||'').trim();
+  fetch('/api/customer-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name,email:addr})})
+    .then(x=>x.json()).then(res=>{
+      if(!res.ok){ showExportMsg('メール保存に失敗: '+(res.error||''),true); return; }
+      CUST_EMAILS=res.emails||CUST_EMAILS;
+      showExportMsg(addr?('📧 送信先メールを保存しました（'+name+'）'):('📧 送信先メールを削除しました（'+name+'）'));
+    }).catch(e=>showExportMsg('通信失敗: '+(e&&e.message||e),true));
+}
+// 選択中の得意先1件を「発行→PDF化→Outlook作成画面」まで一気に行う（送信は人が押す）。
+function mailQuoteFlow(name){
+  if(!name){ showExportMsg('得意先が選択されていません',true); return; }
+  const inp=document.getElementById('custEmailInp');
+  const email=inp?String(inp.value||'').trim():String(CUST_EMAILS[name]||'').trim();
+  const warn=email?'':'\\n\\n※ 送信先メール未登録です（Outlookの宛先は空で開きます。あとで手入力できます）。';
+  if(!confirm('「'+name+'」の見積を発行し、PDF化してOutlookの作成画面を開きます。\\n（送信ボタンはあなたが押します）'+warn+'\\n\\nよろしいですか？')) return;
+  if(email && CUST_EMAILS[name]!==email) saveCustEmail(name, email); // 入力中のアドレスは保存もしておく
+  const opts=Object.assign(calcOpts(),{customer:name, email});
+  setExpBusy(true); setMailBusy(true); showExportMsg('PDF化してOutlookを起動中…');
+  fetch('/api/mail-quote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(opts)})
+    .then(x=>x.json()).then(res=>{
+      setExpBusy(false); setMailBusy(false);
+      if(!res.ok){
+        if(res.reason==='missing_eff'){ showExportMsg(res.message||'実施日が未設定の商品があります。',true); if(selName) load(); return; }
+        // 発行は成功・PDF/Outlookだけ失敗（res.issued）：提出済み状態を正しく反映してから失敗を知らせる。
+        if(res.issued && res.issuedCustomers && res.issuedCustomers.length){
+          const now=new Date().toISOString();
+          for(const nm of res.issuedCustomers){ const prev=ISSUED[nm]||{}; ISSUED[nm]={lastIssuedAt:now,count:(prev.count||0)+1,quoteNo:res.quoteNo||prev.quoteNo||'',itemCount:res.itemCount||prev.itemCount||0,folder:res.folderName||''}; }
+          loadIssueLog().then(()=>load());
+        }
+        showExportMsg(res.error||res.message||'メール作成に失敗しました',true); return;
+      }
+      // 発行済みになったので提出履歴を更新（doIssue と同様）。別枠移動は load() の再取得で反映。
+      if(res.issuedCustomers && res.issuedCustomers.length){
+        const now=new Date().toISOString();
+        for(const nm of res.issuedCustomers){ const prev=ISSUED[nm]||{}; ISSUED[nm]={lastIssuedAt:now,count:(prev.count||0)+1,quoteNo:res.quoteNo||prev.quoteNo||'',itemCount:res.itemCount||prev.itemCount||0,folder:res.folderName||''}; }
+      }
+      const toMsg=res.to?('宛先 '+res.to):'宛先は空（Outlookで入力してください）';
+      showExportMsg('📧 Outlookの作成画面を開きました（'+name+'：'+toMsg+'／PDF '+(res.pdf||'')+'）。内容を確認して送信してください。');
+      loadIssueLog().then(()=>load());
+    }).catch(e=>{ setExpBusy(false); setMailBusy(false); showExportMsg('通信失敗: '+(e&&e.message||e),true); });
+}
+// 提出済みの得意先を「再送」：再発行せず、提出済みxlsxからPDF化→Outlookを開く。
+function mailResendFlow(name){
+  if(!name){ showExportMsg('得意先が選択されていません',true); return; }
+  const inp=document.getElementById('custEmailInp');
+  const email=inp?String(inp.value||'').trim():String(CUST_EMAILS[name]||'').trim();
+  const warn=email?'':'\\n\\n※ 送信先メール未登録です（Outlookの宛先は空で開きます。あとで手入力できます）。';
+  if(!confirm('「'+name+'」の提出済み見積書をPDF化してOutlookで開きます（再発行はしません）。'+warn+'\\n\\nよろしいですか？')) return;
+  if(email && CUST_EMAILS[name]!==email) saveCustEmail(name, email);
+  setExpBusy(true); setMailBusy(true); showExportMsg('PDF化してOutlookを起動中…');
+  fetch('/api/mail-quote-resend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name, email})})
+    .then(x=>x.json()).then(res=>{
+      setExpBusy(false); setMailBusy(false);
+      if(!res.ok){ showExportMsg(res.error||'再送に失敗しました',true); return; }
+      const toMsg=res.to?('宛先 '+res.to):'宛先は空（Outlookで入力してください）';
+      showExportMsg('📧 Outlookの作成画面を開きました（再送 '+name+'：'+toMsg+'／PDF '+(res.pdf||'')+'）。内容を確認して送信してください。');
+    }).catch(e=>{ setExpBusy(false); setMailBusy(false); showExportMsg('通信失敗: '+(e&&e.message||e),true); });
+}
 function doIssue(opts){
   setExpBusy(true);
   fetch('/api/customers-export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:'issue'},opts))})
@@ -1579,7 +1704,8 @@ async function initControls(){
     const s=r&&r.settings?r.settings:{};
     const df=s.default||{}; const rd=s.rounding||{}; const up=s.selfCostUplift||{};
     if(df.type) $('#cRule').value=df.type;
-    if(df.factor!=null) $('#cFactor').value=df.factor;
+    // factor は枠の共有：目標粗利率(target_margin_rate)なら%として #cMargin、それ以外は掛率として #cFactor へ。
+    if(df.factor!=null){ if(df.type==='target_margin_rate') $('#cMargin').value=df.factor; else $('#cFactor').value=df.factor; }
     // まるめ：桁＝ラジオ、処理＝ドロップダウン（「全体」＝⚙設定の端数処理）
     const u=String((rd.unit!=null)?rd.unit:0.01);
     const md=(rd.mode==='floor'||rd.mode==='ceil')?rd.mode:'round';
@@ -1628,7 +1754,7 @@ $('#cBandOn').addEventListener('change',()=>{
   }
   // 価格帯別ONなら 単体の「転嫁ルール／掛率」は隠す（指定場所を帯に一本化＝効いていないのに見える混乱を防ぐ）
   $('#cRuleFld').style.display = on?'none':'';
-  if(on) $('#cFactorBox').style.display='none'; else toggleFactor();
+  if(on){ $('#cFactorBox').style.display='none'; if($('#cMarginBox')) $('#cMarginBox').style.display='none'; } else toggleFactor();
   $('#cBandFld').querySelector('label').style.color = on?'#1f6fb2':'';
   if(on) renderBands();
   load(true);
@@ -1667,14 +1793,14 @@ document.addEventListener('keydown',e=>{
 $('#cRule').addEventListener('change',()=>{ toggleFactor(); load(true); });
 document.querySelectorAll('input[name="cRoundUnit"]').forEach(r=> r.addEventListener('change',markCalcPending));
 $('#cRoundMode').addEventListener('change',markCalcPending);
-['#cFactor','#cUplift','#cEff'].forEach(sel=>{
+['#cFactor','#cMargin','#cUplift','#cEff'].forEach(sel=>{
   const el=$(sel);
   el.addEventListener('change',markCalcPending);
   el.addEventListener('keydown',e=>{ if(e.key==='Enter') markCalcPending(); });
 });
 (async()=>{
   await initShogoLockWatch();
-  await Promise.all([initControls(), loadIssueLog()]);
+  await Promise.all([initControls(), loadIssueLog(), loadCustomerEmails()]);
   await loadSummary();
   // メイン表の得意先リンク（/customers?customer=...）で来たら、その得意先を選択して表示。
   try{

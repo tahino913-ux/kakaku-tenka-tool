@@ -6,7 +6,25 @@
 // =====================================================================
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const base = require('../config');
+
+// アクセスパスワードのハッシュ化（settings.json に平文を保存しない）。
+//  形式 "sha256$<hex>"。空文字＝パスワード無し。既にハッシュ形式ならそのまま返す（再ハッシュ防止）。
+function hashAccessPassword(pw) {
+  const p = String(pw == null ? '' : pw);
+  if (!p) return '';
+  if (/^sha256\$/.test(p)) return p; // 既にハッシュ済み
+  return 'sha256$' + crypto.createHash('sha256').update('apwhash|' + p).digest('hex');
+}
+// 入力パスワードが保存値に一致するか。保存値がハッシュ形式ならハッシュ比較、
+//  旧データ（平文）なら平文比較（＝既存 settings.json でもログインできる後方互換）。
+function verifyAccessPassword(input, stored) {
+  const s = String(stored == null ? '' : stored);
+  if (!s) return false; // パスワード未設定時は呼ばない想定（呼ばれたら不一致扱い）
+  if (/^sha256\$/.test(s)) return hashAccessPassword(input) === s;
+  return String(input == null ? '' : input) === s; // 旧平文との後方互換
+}
 
 const ROOT = path.join(__dirname, '..');
 const SETTINGS_PATH = path.join(ROOT, 'settings.json');
@@ -149,6 +167,13 @@ function getSettings() {
     //  すでに取引が無いのに照合に出てくる先を、画面・損益・得意先別・見積書から除外（非表示）する。
     //  いつでも「復活」で戻せる（記録を消すだけ）。
     excludedCustomers: (u.excludedCustomers && typeof u.excludedCustomers === 'object') ? u.excludedCustomers : {},
+    // 得意先別のメール送信先：{ 得意先名: "メールアドレス" }
+    //  見積書PDFをOutlookで送るときの宛先。空＝未登録（送信時に手入力できる）。
+    customerEmails: (u.customerEmails && typeof u.customerEmails === 'object') ? u.customerEmails : {},
+    // 自社CD別の「新仕入原価」強制上書き：{ "001397": 14.03, ... }
+    //  照合が拾えない事情（身＋蓋セットなど）で正しい原価にならない品を、自社CD単位で固定する。
+    //  指定があれば getRecs が照合結果の newCost を この値へ置換（売価はルールで再計算される）。
+    costOverrides: (u.costOverrides && typeof u.costOverrides === 'object') ? u.costOverrides : {},
   };
 }
 
@@ -178,7 +203,9 @@ function saveSettings(patch) {
     productLinks:   patch.productLinks !== undefined ? patch.productLinks : (cur.productLinks || {}),
     suppliers:      patch.suppliers !== undefined ? patch.suppliers : (cur.suppliers || {}),
     selfProfile:    patch.selfProfile !== undefined ? patch.selfProfile : (cur.selfProfile || null),
-    accessPassword: patch.accessPassword !== undefined ? patch.accessPassword : (cur.accessPassword || ''),
+    // パスワードはハッシュで保存（平文を残さない）。新規入力も既存値もハッシュ化＝
+    //  旧 settings.json の平文も、次回保存時に自動でハッシュへ移行される。
+    accessPassword: hashAccessPassword(patch.accessPassword !== undefined ? patch.accessPassword : (cur.accessPassword || '')),
     selfManufacture: patch.selfManufacture !== undefined ? patch.selfManufacture : cur.selfManufacture,
     // AI設定はマージで保持（UI保存で消えないように）。部分patchでも既存を残す。
     ai:             patch.ai !== undefined ? Object.assign({}, cur.ai, patch.ai) : cur.ai,
@@ -186,6 +213,10 @@ function saveSettings(patch) {
     cdReview:       patch.cdReview !== undefined ? patch.cdReview : (cur.cdReview || { confirmed: {}, rejected: {} }),
     // 得意先 除外設定（UI保存で消えないように保持）。
     excludedCustomers: patch.excludedCustomers !== undefined ? patch.excludedCustomers : (cur.excludedCustomers || {}),
+    // 得意先別メール送信先（UI保存で消えないように保持）。
+    customerEmails: patch.customerEmails !== undefined ? patch.customerEmails : (cur.customerEmails || {}),
+    // 自社CD別 原価上書き（UI保存で消えないように保持）。
+    costOverrides: patch.costOverrides !== undefined ? patch.costOverrides : (cur.costOverrides || {}),
     _savedAt:       new Date().toISOString(),
   };
   backupCurrentSettings(); // 上書き直前の現行 settings.json を世代退避（失敗しても保存は続行）
@@ -361,4 +392,49 @@ function setExcludedCustomersBulk(names, exclude) {
   return getExcludedCustomers();
 }
 
-module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, backupCurrentSettings, listSettingsBackups, restoreSettingsBackup, BACKUP_DIR, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk };
+// 得意先別メール送信先を読む（{ 得意先名: メールアドレス }）。
+function getCustomerEmails() {
+  const u = readUser() || {};
+  return (u.customerEmails && typeof u.customerEmails === 'object') ? u.customerEmails : {};
+}
+// 1得意先のメール送信先を保存／削除（空文字で削除）。他設定は保持。
+function setCustomerEmail(customer, email) {
+  const name = String(customer || '').trim();
+  if (!name) return getCustomerEmails();
+  const cur = readUser() || {};
+  cur.customerEmails = (cur.customerEmails && typeof cur.customerEmails === 'object') ? cur.customerEmails : {};
+  const addr = String(email || '').trim();
+  if (addr) cur.customerEmails[name] = addr;
+  else delete cur.customerEmails[name];
+  saveSettings({ customerEmails: cur.customerEmails });
+  return getCustomerEmails();
+}
+
+// 自社CD別 原価上書きを読む（{ "001397": 14.03, ... }）。
+function getCostOverrides() {
+  const u = readUser() || {};
+  return (u.costOverrides && typeof u.costOverrides === 'object') ? u.costOverrides : {};
+}
+// 1件の原価上書きを保存／削除。数字コードは6桁ゼロ埋めキーで保存。他設定は保持。
+//  値の形：
+//   ・newCost のみ → 数値で保存（新仕入原価だけ強制。後方互換）
+//   ・newCost＋currentCost → { newCost, currentCost } で保存（身＋蓋セット等で現原価も合算値に揃える）
+//  newCost が空/非数なら そのコードの上書きを削除。
+function setCostOverride(selfCode, newCost, currentCost) {
+  const code = String(selfCode || '').trim();
+  if (!code) return getCostOverrides();
+  const cur = readUser() || {};
+  cur.costOverrides = (cur.costOverrides && typeof cur.costOverrides === 'object') ? cur.costOverrides : {};
+  const key = /^\d+$/.test(code) ? code.padStart(6, '0') : code;
+  const nv = Number(newCost);
+  if (newCost === '' || newCost == null || !Number.isFinite(nv)) { delete cur.costOverrides[key]; }
+  else if (currentCost != null && currentCost !== '' && Number.isFinite(Number(currentCost))) {
+    cur.costOverrides[key] = { newCost: nv, currentCost: Number(currentCost) };
+  } else {
+    cur.costOverrides[key] = nv;
+  }
+  saveSettings({ costOverrides: cur.costOverrides });
+  return getCostOverrides();
+}
+
+module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, backupCurrentSettings, listSettingsBackups, restoreSettingsBackup, BACKUP_DIR, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, getCustomerEmails, setCustomerEmail, hashAccessPassword, verifyAccessPassword, getCostOverrides, setCostOverride };

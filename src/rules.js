@@ -76,6 +76,16 @@ function computeNewSell(rec, rule) {
       if (denom <= 0) return currentSell + (newCost - currentCost);
       return newCost / denom;
     }
+    case 'target_margin_rate': {
+      // 目標粗利率（%）から新売価を逆算：newSell = newCost ÷ (1 − 率/100)。
+      //  例: 新原価7円・目標粗利率30% → 7 ÷ 0.7 = 10円。率は rule.factor（掛率と同じ枠）に載る。
+      //  率が不正（0未満/100以上）や新原価が無い/0なら、値上げ分の上乗せにフォールバック（安全側）。
+      const rate = Number(rule.factor);
+      if (Number.isFinite(rate) && rate >= 0 && rate < 100 && Number.isFinite(newCost) && newCost > 0) {
+        return newCost / (1 - rate / 100);
+      }
+      return currentSell + (newCost - currentCost);
+    }
     case 'add_increase':
     default:
       return currentSell + (newCost - currentCost);
