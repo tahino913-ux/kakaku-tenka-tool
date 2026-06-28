@@ -18,6 +18,17 @@ function priceRowAnomaly(currentSell, newSell, ruleType, selfMade, currentCost, 
   // selfMade（自社製造＝メーカーコード9000）は原価0で値上げは利用者が決める（掛率/手入力）。
   //  メーカー見積の食い違いという概念が無いので ② は判定しない（同額でも要確認に落とさない）。①は検知。
   if (ruleType === 'keep_sell' || ruleType === 'manual' || selfMade) return '';
+  // ③ 現仕入(currentCost)が「0/マイナス」なのに、現仕入を基準に値上げするルールで新仕入>0 ＝ 値上げ幅の根拠が無い。
+  //   add_increase/sell_cost_rate/keep_margin_rate は現仕入を差し引き・割り戻しに使うため、現仕入0だと
+  //   「現売価 ＋ 新仕入を丸ごと」上乗せした過大な売価になり、しかも nw>cur なので②をすり抜ける。
+  //   markup/keep_sell/target_margin_rate は現仕入を使わないので対象外。現仕入NaN(欠落)は newSell が NaN になり①で捕捉済み。
+  const costBasedRule = (ruleType == null || ruleType === '' || ruleType === 'add_increase' || ruleType === 'sell_cost_rate' || ruleType === 'keep_margin_rate');
+  if (costBasedRule) {
+    const cc0 = Number(currentCost), nc0 = Number(newCost);
+    if (Number.isFinite(cc0) && cc0 <= 0 && Number.isFinite(nc0) && nc0 > 0) {
+      return '現仕入単価が0で値上げ根拠が不明（新仕入を丸ごと上乗せの恐れ＝要確認）';
+    }
+  }
   if (nw <= cur) {
     // ② は「メーカーが仕入を値上げしたのに改定後売価が同額/値下げ」を疑うもの。前提＝“仕入が実際に上がった”。
     //  仕入が据置/値下げ(=値上げでない)なら売価据置は正常（現売価×仕入改定%=sell_cost_rate・掛率×1 等で起こる）。
