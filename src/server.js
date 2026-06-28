@@ -22,7 +22,7 @@ const { SUPPLIERS_PAGE } = require('./suppliersPage');
 const { SELF_PAGE } = require('./selfPage');
 const { CUSTOMERS_PAGE } = require('./customersPage');
 const { CDLINK_PAGE } = require('./cdlinkPage');
-const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, listSettingsBackups, restoreSettingsBackup, getCustomerEmails, setCustomerEmail, verifyAccessPassword, getCostOverrides } = require('./settings');
+const { getSettings, saveSettings, isConfigured, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getProductLinkMarkedAt, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, listSettingsBackups, restoreSettingsBackup, getCustomerEmails, setCustomerEmail, verifyAccessPassword, getCostOverrides } = require('./settings');
 const { mailQuotePdf } = require('./mailQuote'); // 見積書PDF化＋Outlook下書き（会社PCのExcel/Outlook COM）
 const { run: runShogo, resolveHanbaiSource, loadHanbaiRecords, mergeMakerFiles, makerProdKey } = require('./shogo');
 const ai = require('./ai'); // AI取り込みアシスト（任意・既定OFF。外部API送信はこのモジュールに隔離）
@@ -33,6 +33,7 @@ const { xlsToCsv } = require('./xls2csv');
 const { priceRowAnomaly } = require('./anomaly');
 const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode, EXCLUDE_MARK, DORMANT_MARK, isExcludeLink, linkMarkKind } = require('./productLink');
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
+const { auditDormantRevival } = require('./dormantRevival');
 const { buildHanbaiCsv } = require('./hanbai_export');
 const { describeNoiseRow, isNoiseRow } = require('./noiserow');
 const { getImportSkips, importSkipMap, lookupImportSkip, updateImportSkips, removeImportSkip } = require('./importSkip');
@@ -138,6 +139,44 @@ function buildIssuedQuotesList() {
   const totalItems = items.reduce((s, x) => s + (x.itemCount || 0), 0);
   return { items, count: items.length, folders, totalItems };
 }
+// 「この商品を他の得意先にいくらで提出したか」を 品目ステータス.json の発行済み(issued)から横断収集。
+//  rowKey = 得意先仕入先商品キー。先頭の得意先を外した suffix(=仕入先商品キー) が一致＝同じ商品。
+//  表示専用（価格・照合には一切無影響）。excludeCustomer はその得意先自身を一覧から除く（「他の」得意先のため）。
+function buildCrossCustomerQuotes(rowKey, excludeCustomer) {
+  const key = String(rowKey || '');
+  const sep = key.indexOf('');
+  if (sep < 0) return { items: [], stats: null };
+  const suffix = key.slice(sep + 1); // 仕入先商品キー（得意先をまたいで同じなら同一商品）
+  const map = readItemStatus();
+  const items = [];
+  for (const [customer, ent] of Object.entries(map)) {
+    if (!ent) continue;
+    if (excludeCustomer && customer === excludeCustomer) continue;
+    for (const [rk, st] of Object.entries(ent)) {
+      if (!st || st.s !== 'issued') continue; // 発行（提出）済みの確定単価だけが対象
+      const s = rk.indexOf('');
+      if (s < 0 || rk.slice(s + 1) !== suffix) continue;
+      items.push({
+        customer,
+        sell: (st.sell != null && Number.isFinite(Number(st.sell))) ? Number(st.sell) : null,
+        eff: String(st.eff || ''),
+        at: String(st.at || ''),
+        quoteNo: String(st.quoteNo || ''),
+      });
+    }
+  }
+  // 売価のある行で統計（最安/最高/平均）。並びは実施日（無ければ発行日時）の新しい順。
+  const sells = items.map((x) => x.sell).filter((v) => Number.isFinite(v));
+  const stats = sells.length
+    ? {
+        count: items.length, priced: sells.length,
+        min: Math.min(...sells), max: Math.max(...sells),
+        avg: Math.round((sells.reduce((a, b) => a + b, 0) / sells.length) * 100) / 100,
+      }
+    : { count: items.length, priced: 0, min: null, max: null, avg: null };
+  items.sort((a, b) => String(b.eff || b.at).localeCompare(String(a.eff || a.at)));
+  return { items, stats };
+}
 // 手動修正一覧（照合できずツール外で直した品の記録）。品目ステータス.json の s=manual を集める。
 function buildManualCorrectionsList() {
   const map = readItemStatus();
@@ -187,6 +226,8 @@ function buildManualCorrectionsCsv() {
 // ---- 得意先別アイテムの状態（検討中／手動修正／提出済み）-------------------
 //  { 得意先名: { rowKey: { s:'hold'|'manual'|'issued', at?, quoteNo?, sell?, cost?, eff?, note?, ... } } }
 //  s='hold'（検討中）＝見積作成時にあとで考えたい品。見積から除外するが一覧に残す（一時待機場所）。
+//  s='dormant'（休眠）＝この得意先では今は仕入れていない品。見積から除外。検討中と同じ挙動だが意味（バッジ）が違う＝
+//    「あとで考える(hold)」ではなく「今は出さない(dormant)」。再照合しても rowKey で残る＝毎回チェックを外す手間が消える。
 //  s='manual'（手動修正）＝照合できない品をツール外で直した記録。見積から除外し一覧で把握・CSV出力。
 //  s='issued'（提出済み）＝発行済みで別枠へ。
 //  価格・照合には無影響＝見積書に「載せる/載せない」と表示の振り分けだけ。output/=Drive同期で両PC共有。
@@ -257,12 +298,13 @@ function setItemStatus(customer, rowKey, status, snap) {
   if (!customer || !rowKey) return map;
   if (status === 'manual') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = manualStatusEntry(snap); }
   else if (status === 'hold') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = { s: 'hold', at: new Date().toISOString() }; }
+  else if (status === 'dormant') { if (!map[customer]) map[customer] = {}; map[customer][rowKey] = { s: 'dormant', at: new Date().toISOString() }; }
   else if (map[customer]) { delete map[customer][rowKey]; if (!Object.keys(map[customer]).length) delete map[customer]; }
   return writeItemStatus(map); // 保存成否(boolean)を返す＝APIが ok を判定できる
 }
-// 複数アイテムをまとめて変更（hold=検討中／manual=手動修正／''=対象へ戻す）。
-//  status='' のときは hold・manual・issued のどちらでも対象へ戻す。
-//  items=[{rowKey,snapshot}] を渡すと手動修正時に単価等を保存（hold は rowKeys のみで可）。
+// 複数アイテムをまとめて変更（hold=検討中／dormant=休眠／manual=手動修正／''=対象へ戻す）。
+//  status='' のときは hold・dormant・manual・issued のどれでも対象へ戻す。
+//  items=[{rowKey,snapshot}] を渡すと手動修正時に単価等を保存（hold/dormant は rowKeys のみで可）。
 function setItemStatusBulk(customer, rowKeys, status, items) {
   const map = readItemStatus();
   const list = Array.isArray(items) && items.length
@@ -280,6 +322,10 @@ function setItemStatusBulk(customer, rowKeys, status, items) {
     } else if (status === 'hold') {
       if (!map[customer]) map[customer] = {};
       map[customer][rowKey] = { s: 'hold', at: new Date().toISOString() };
+      changed++;
+    } else if (status === 'dormant') {
+      if (!map[customer]) map[customer] = {};
+      map[customer][rowKey] = { s: 'dormant', at: new Date().toISOString() };
       changed++;
     } else if (map[customer] && map[customer][rowKey]) { delete map[customer][rowKey]; changed++; }
   }
@@ -1056,7 +1102,11 @@ function buildProductLinkCheck() {
   try { hanbai = getHanbaiRecordsCached(); } catch (e) { /* DB/ファイル不可でも続行 */ }
   const better = auditBetterManualLinks(productLinks, makerItems, hanbai);
   const suspect = auditSuspectManualLinks(productLinks, makerItems, hanbai);
-  const issues = [...base.issues, ...better.issues, ...suspect.issues].sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja')
+  // 💤休眠にした自社品に、その後 新しい売上が立った（取引再開＝復帰検討）を検知。
+  //  販売実績(hanbai)の最終売上日 と 休眠にした日(markedAt) を突き合わせる。DB不可(閲覧モード)では hanbai が空＝0件で素通り。
+  const today = (() => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); })();
+  const revival = auditDormantRevival(productLinks, getProductLinkMarkedAt(), hanbai, { today, fallbackDays: 120 });
+  const issues = [...base.issues, ...better.issues, ...suspect.issues, ...revival.issues].sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja')
     || String(a.code).localeCompare(String(b.code)));
   return {
     issues,
@@ -1067,6 +1117,7 @@ function buildProductLinkCheck() {
     betterCdCount: better.betterCdCount,
     betterNameCount: better.betterNameCount,
     suspectCount: suspect.count,
+    revivalCount: revival.count,
   };
 }
 
@@ -1222,6 +1273,7 @@ function calcByDate(body) {
       const prodKey = (r.productCode != null && String(r.productCode).trim() !== '') ? normName(String(r.productCode)) : ('名:' + normName(r.productName));
       const rowKey = r.customerName + '\u0001' + sup + '\u0001' + prodKey;
       const stEntry = (itemStatusMap[r.customerName] && itemStatusMap[r.customerName][rowKey]) || null;
+      if (stEntry && stEntry.s === 'dormant') continue; // 休眠＝改定予定なし＝日付横断ビューにも出さない（カレンダーと整合）
       // 提出済みは発行時の実施日を優先（自社製造＝切替日なしでも、その日付で絞り込める）。
       const issuedEff = (stEntry && stEntry.s === 'issued' && stEntry.eff) ? stEntry.eff : '';
       const eff = normDateInput(issuedEff || r.effectiveDate || r.switchDate || '');
@@ -1287,6 +1339,8 @@ function buildCalendar() {
       const prodKey = (r.productCode != null && String(r.productCode).trim() !== '') ? normName(String(r.productCode)) : ('名:' + normName(r.productName));
       const rowKey = r.customerName + '' + sup + '' + prodKey;
       const st = (itemStatus[r.customerName] && itemStatus[r.customerName][rowKey]) || null;
+      // 休眠＝「今は出さない（改定予定なし）」＝実施日カレンダーに並べない（未提出オレンジに混ざって要対応に見える誤解を防ぐ）。
+      if (st && st.s === 'dormant') continue;
       const issuedEff = (st && st.s === 'issued' && st.eff) ? st.eff : '';
       entries.push({
         date: issuedEff || r.effectiveDate || r.switchDate || '',
@@ -2131,8 +2185,8 @@ function buildCustomerCandidates(opts) {
         keep.push(item); // 提出済み＝発行済みの確定行。価格異常・低一致のゲートを通さずそのまま採用する。
         continue;
       }
-      if (item.status === 'hold') {
-        keep.push(item); // 検討中＝見積から除外。あとで対象に戻して検討・発行できる。
+      if (item.status === 'hold' || item.status === 'dormant') {
+        keep.push(item); // 検討中・休眠＝見積から除外（activeOf の !p.status で外れる）。あとで対象に戻して発行できる。
         continue;
       }
       if (item.status === 'manual') {
@@ -2172,6 +2226,7 @@ function customerRecordFromSplit(name, split, masterMap) {
   if (!keep.length && !review.length) return null;
   const active = keep.filter((p) => !p.status).sort(bySupNameCust);
   const holdProducts = keep.filter((p) => p.status === 'hold').sort(bySupNameCust);
+  const dormantProducts = keep.filter((p) => p.status === 'dormant').sort(bySupNameCust);
   const manualProducts = keep.filter((p) => p.status === 'manual').sort(bySupNameCust);
   const issuedProducts = keep.filter((p) => p.status === 'issued').sort(bySupNameCust);
   const suppliers = [...new Set(active.map((p) => p.supplier))].sort((a, b) => String(a).localeCompare(String(b), 'ja'));
@@ -2185,8 +2240,9 @@ function customerRecordFromSplit(name, split, masterMap) {
     name, code, kana, hasRecent, lastDate,
     productCount: active.length, supplierCount: suppliers.length,
     suppliers, reviewCount: review.length, products: active,
-    holdProducts, manualProducts, issuedProducts,
-    holdCount: holdProducts.length, manualCount: manualProducts.length, issuedCount: issuedProducts.length,
+    holdProducts, dormantProducts, manualProducts, issuedProducts,
+    holdCount: holdProducts.length, dormantCount: dormantProducts.length,
+    manualCount: manualProducts.length, issuedCount: issuedProducts.length,
   };
 }
 // /customers 画面の表示用。keep だけを「該当商品」に集め、要確認は件数のみ返す（従来互換）。
@@ -2234,7 +2290,7 @@ function aggregateCustomersSummary() {
         byName.set(cust, {
           keys: new Set(), suppliers: new Set(),
           customerCode: '', lastDate: '', hasRecent: false, earliestEff: '',
-          holdCount: 0, manualCount: 0, issuedCount: 0,
+          holdCount: 0, dormantCount: 0, manualCount: 0, issuedCount: 0,
         });
       }
       const c = byName.get(cust);
@@ -2253,14 +2309,16 @@ function aggregateCustomersSummary() {
   // 品目ステータス（検討中/手動修正/提出済み）の件数だけ先に付与（価格計算は不要）。
   for (const [name, ent] of Object.entries(itemStatusMap)) {
     if (!byName.has(name)) continue;
-    let hold = 0, manual = 0, issued = 0;
+    let hold = 0, manual = 0, issued = 0, dormant = 0;
     for (const rk of Object.keys(ent)) {
       if (ent[rk].s === 'hold') hold++;
+      else if (ent[rk].s === 'dormant') dormant++;
       else if (ent[rk].s === 'manual') manual++;
       else if (ent[rk].s === 'issued') issued++;
     }
     const c = byName.get(name);
     c.holdCount = hold;
+    c.dormantCount = dormant;
     c.manualCount = manual;
     c.issuedCount = issued;
   }
@@ -2273,9 +2331,9 @@ function aggregateCustomersSummary() {
     customers.push({
       name, code, kana, hasRecent: !!c.hasRecent, lastDate: c.lastDate || '',
       productCount: c.keys.size, supplierCount: suppliers.length, suppliers,
-      reviewCount: 0, holdCount: c.holdCount, manualCount: c.manualCount, issuedCount: c.issuedCount,
+      reviewCount: 0, holdCount: c.holdCount, dormantCount: c.dormantCount, manualCount: c.manualCount, issuedCount: c.issuedCount,
       products: c.earliestEff ? [{ effectiveDate: c.earliestEff }] : [],
-      holdProducts: null, manualProducts: null, issuedProducts: null,
+      holdProducts: null, dormantProducts: null, manualProducts: null, issuedProducts: null,
       _lazy: true,
     });
   }
@@ -2332,7 +2390,11 @@ function exportCustomerQuotes(opts, doIssue) {
   const reviewAll = [];
   for (const [name, d] of entries) for (const rv of d.review) reviewAll.push(Object.assign({ customer: name }, rv));
   // 見積書に載るのは「対象」のみ＝検討中(hold)・手動修正(manual)・提出済み(issued)は除外。
-  const activeOf = (d) => d.keep.filter((p) => !p.status);
+  // onlyRowKeys（得意先1件の発行で、画面でチェックした商品だけを見積にする）が来ていれば、その rowKey に絞る。
+  //  プレビュー・件数・実施日チェック・発行ループの全てがこの activeOf を通る＝1か所で整合。
+  const onlyKeys = (opts.scope === 'one' && Array.isArray(opts.onlyRowKeys) && opts.onlyRowKeys.length)
+    ? new Set(opts.onlyRowKeys.map((k) => String(k))) : null;
+  const activeOf = (d) => d.keep.filter((p) => !p.status && (!onlyKeys || onlyKeys.has(p.rowKey)));
   const issuable = entries.filter(([, d]) => activeOf(d).length > 0);
   const issuableRowCount = issuable.reduce((s, [, d]) => s + activeOf(d).length, 0);
   // 実施日が未設定（必須）の対象アイテムを集める。発行ゲートで件数を示し、発行をブロックする。
@@ -2471,7 +2533,7 @@ function collectHanbaiExportLines(cutoffIso, issuedOnly) {
       // issuedOnly（既定・推奨）＝「発行した見積のみ」＝アイテム単位で提出済み(issued)の品だけ。
       //  発行時に確定した単価(newSell/newCost)が保存済み＝CSVが見積書と完全一致。未発行は載せない。
       if (issuedOnly) { if (it.status !== 'issued') continue; }
-      else if (it.status === 'hold' || it.status === 'manual') continue; // 検討中・手動修正は基幹更新に載せない
+      else if (it.status === 'hold' || it.status === 'manual' || it.status === 'dormant') continue; // 検討中・手動修正・休眠は基幹更新に載せない
       const eff = String(it.effectiveDate || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;         // 実施日がISOで取れない行は対象外
       if (cutoff && eff > cutoff) continue;                    // まだ実施日が来ていない行は除外
@@ -2518,7 +2580,7 @@ function collectCostUpdateLines(cutoffIso) {
   const byProduct = new Map(); // 商品コード -> line（実施日が新しい方）
   for (const [, sp] of byCustomer) {
     for (const it of sp.keep) {
-      if (it.status === 'hold' || it.status === 'manual') continue; // 検討中・手動修正は基幹更新にも載せない
+      if (it.status === 'hold' || it.status === 'manual' || it.status === 'dormant') continue; // 検討中・手動修正・休眠は基幹更新にも載せない
       const eff = String(it.effectiveDate || '');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(eff)) continue;     // 実施日がISOで取れない行は対象外
       if (cutoff && eff > cutoff) continue;                // まだ実施日が来ていない行は除外
@@ -2832,6 +2894,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url === '/api/manual-corrections-list') {
       return sendJson(res, 200, { ok: true, ...buildManualCorrectionsList() });
     }
+    if (req.method === 'POST' && url === '/api/cross-customer-quotes') {
+      // この商品を「他の得意先」にいくらで提出（発行）したかを横断収集。表示専用・価格/照合に無影響。
+      const body = await readBody(req);
+      const rowKey = String((body && body.rowKey) || '').trim();
+      if (!rowKey) return sendJson(res, 200, { ok: false, error: 'rowKey は必須です' });
+      const excl = String((body && body.customer) || '').trim();   // この得意先自身は除く
+      const productName = String((body && body.productName) || ''); // モーダル見出し用（クライアントから受領）
+      return sendJson(res, 200, { ok: true, productName, ...buildCrossCustomerQuotes(rowKey, excl) });
+    }
     if (req.method === 'GET' && url === '/api/manual-corrections.csv') {
       const buf = Buffer.from(buildManualCorrectionsCsv(), 'utf8');
       res.writeHead(200, {
@@ -2853,12 +2924,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, log: readIssueLog() });
     }
     if (req.method === 'POST' && url === '/api/item-status') {
-      // 得意先別アイテムの状態：'hold'=検討中 / 'manual'=手動修正 / ''=対象に戻す。
+      // 得意先別アイテムの状態：'hold'=検討中 / 'dormant'=休眠 / 'manual'=手動修正 / ''=対象に戻す。
       const body = await readBody(req);
       const customer = String((body && body.customer) || '').trim();
       const rowKey = String((body && body.rowKey) || '').trim();
       const st = body && body.status;
-      const status = (st === 'manual' || st === 'hold') ? st : '';
+      const status = (st === 'manual' || st === 'hold' || st === 'dormant') ? st : '';
       if (!customer || !rowKey) return sendJson(res, 200, { ok: false, error: 'customer と rowKey は必須です' });
       const snap = (body && body.snapshot) || body || {};
       const ok = setItemStatus(customer, rowKey, status, snap);
@@ -2867,11 +2938,11 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === 'POST' && url === '/api/item-status-bulk') {
-      // 複数アイテムをまとめて 検討中('hold') / 手動修正('manual') / 対象('') へ。
+      // 複数アイテムをまとめて 検討中('hold') / 休眠('dormant') / 手動修正('manual') / 対象('') へ。
       const body = await readBody(req);
       const customer = String((body && body.customer) || '').trim();
       const st = body && body.status;
-      const status = (st === 'manual' || st === 'hold') ? st : '';
+      const status = (st === 'manual' || st === 'hold' || st === 'dormant') ? st : '';
       const items = Array.isArray(body && body.items) ? body.items : [];
       const rowKeys = Array.isArray(body && body.rowKeys) ? body.rowKeys : [];
       if (!customer || (!items.length && !rowKeys.length)) return sendJson(res, 200, { ok: false, error: 'customer と rowKeys/items は必須です' });
@@ -3308,6 +3379,7 @@ const server = http.createServer(async (req, res) => {
           ok: true, issues: r.issues.slice(0, 80), count: r.count,
           mismatchCount: r.mismatchCount, orphanCount: r.orphanCount,
           betterCount: r.betterCount || 0, betterCdCount: r.betterCdCount || 0, betterNameCount: r.betterNameCount || 0,
+          revivalCount: r.revivalCount || 0,
         });
       } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), issues: [], count: 0 }); }
     }
@@ -3966,11 +4038,28 @@ function matchPctNum(r){
   const m = st.match(/(\\d+)\\s*%/);
   return m ? Number(m[1]) : 0;
 }
+// 得意先別ページの状態 → 並び順の優先度（小さいほど上）。⬜未提出＝要対応を最上位に。
+//  ※通常ビューでは提出済み(issued)は非表示なので実質 未提出/検討中/手動修正/休眠 の順になる。
+function statusRank(r){
+  switch (r && r.itemStatus) {
+    case '':
+    case undefined:
+    case null:       return 0; // ⬜ 未提出（要対応）＝上
+    case 'hold':     return 1; // 🤔 検討中
+    case 'manual':   return 2; // ✏ 手動修正
+    case 'dormant':  return 3; // 💤 休眠（得意先）
+    case 'issued':   return 4; // ✅ 提出済み（通常は非表示）
+    default:         return 5;
+  }
+}
 function sortMatchedIndices(indices){
   const col = new Intl.Collator('ja');
+  // どの並びでも「未提出を上に」＝状態の優先度を第1キーにする（既存の並びは同一状態内の第2キー以降）。
   if (mainSortMode === 'matchDesc' || mainSortMode === 'matchAsc') {
     const dir = mainSortMode === 'matchDesc' ? -1 : 1;
     indices.sort((a,b)=>{
+      const sr = statusRank(baseRows[a]) - statusRank(baseRows[b]);
+      if (sr !== 0) return sr;
       const pa = matchPctNum(baseRows[a]), pb = matchPctNum(baseRows[b]);
       if (pa !== pb) return (pa - pb) * dir;
       return col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
@@ -3979,7 +4068,8 @@ function sortMatchedIndices(indices){
     });
     return;
   }
-  indices.sort((a,b)=> col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
+  indices.sort((a,b)=> (statusRank(baseRows[a]) - statusRank(baseRows[b]))
+    || col.compare(baseRows[a].customerName||'', baseRows[b].customerName||'')
     || col.compare(baseRows[a].supplier||'', baseRows[b].supplier||'')
     || col.compare(baseRows[a].productName||'', baseRows[b].productName||''));
 }
@@ -4239,6 +4329,7 @@ async function runShogo(){
 function progressBadge(st){
   if(st==='issued') return '<div style="font-size:10px;font-weight:700;color:#1f6b35;margin-top:1px">✅ 提出済み</div>';
   if(st==='hold')   return '<div style="font-size:10px;font-weight:700;color:#8a5a12;margin-top:1px">🤔 検討中</div>';
+  if(st==='dormant')return '<div style="font-size:10px;font-weight:700;color:#3a6ea5;margin-top:1px">💤 休眠</div>';
   if(st==='manual') return '<div style="font-size:10px;font-weight:700;color:#5a4a8a;margin-top:1px">✏ 手動修正</div>';
   return '<div style="font-size:10px;font-weight:700;color:#b1432f;margin-top:1px">⬜ 未提出</div>';
 }
@@ -4345,7 +4436,9 @@ function renderMainRows(readOnly){
       || col.compare(baseRows[a].makerName||'', baseRows[b].makerName||''));
     if(matched.length){
       const sortLbl = mainSortMode === 'matchDesc' ? '一致度 高い順' : (mainSortMode === 'matchAsc' ? '一致度 低い順' : '得意先別');
-      frag.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（'+sortLbl+'）', '#eaf6ee', '#1b6b3a'));
+      const todoN = matched.filter(i=> statusRank(baseRows[i])===0).length;
+      const todoLbl = todoN ? '・⬜未提出 '+todoN+'件を上に' : '';
+      frag.appendChild(sectionHeaderRow('✓ 一致品 '+matched.length+'件（'+sortLbl+todoLbl+'）', '#eaf6ee', '#1b6b3a'));
       matched.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, readOnly)));
     }
     if(dormant.length){
@@ -5432,8 +5525,17 @@ async function loadLinkCheck(){
     const mism=issues.filter(i=>i.kind==='name_mismatch');
     const better=issues.filter(i=>i.kind==='better_cd'||i.kind==='better_name');
     const suspect=issues.filter(i=>i.kind==='suspect');
-    if(!mism.length && !better.length && !suspect.length){ box.style.display='none'; box.innerHTML=''; return; }
+    const revival=issues.filter(i=>i.kind==='dormant_revival');
+    if(!mism.length && !better.length && !suspect.length && !revival.length){ box.style.display='none'; box.innerHTML=''; return; }
     let html='';
+    if(revival.length){
+      const rs=revival.slice(0,8).map(i=>{
+        const since=i.since?('／休眠 '+esc(i.since)+' 以降'):'';
+        return '<div style="padding:2px 0">　・'+esc(i.supplier)+' '+esc(i.code)+'：自社「'+esc(i.selfName||'')+'」 <b>最終売上 '+esc(i.lastDate||'')+'</b>'+since+linkRowBtns(i)+'</div>';
+      }).join('');
+      html+='💤→🔼 <b>休眠なのに最近 売上あり '+revival.length+'件</b>：休眠（保留）にした自社品に、その後 新しい売上が立っています（取引再開の可能性）。'
+        +'見積に戻すなら「🔄 復帰（解除）」→ <b>会社PCで「↻ 照合」</b>。違うなら放置でOK（休眠のまま）。<br>'+rs+(revival.length>8?'<br>　…ほか '+(revival.length-8)+' 件':'')+'<br>';
+    }
     if(suspect.length){
       const reasonLabel=function(rs){
         return (rs||[]).map(function(x){
@@ -5462,8 +5564,10 @@ async function loadLinkCheck(){
         +'「✏ 紐付け」で<b>候補リストから選び直す</b>と安全です。<br>'+ms+(mism.length>5?'<br>　…ほか '+(mism.length-5)+' 件':'');
     }
     const totalN = suspect.length+better.length+mism.length;
-    html = '<div style="margin-bottom:8px"><button id="linkReviewOpen" style="font-size:12px;font-weight:700;padding:4px 12px;background:#1976d2;color:#fff;border:none;border-radius:5px;cursor:pointer">📋 まとめて見直す（'+totalN+'件）</button>'
-      +' <span style="font-size:11px;color:#8a6d1a">各行の「✅切替／解除／✏直す／🔍確認」でもその場で直せます。反映は会社PCで「↻ 照合」。</span></div>' + html;
+    if(totalN>0){
+      html = '<div style="margin-bottom:8px"><button id="linkReviewOpen" style="font-size:12px;font-weight:700;padding:4px 12px;background:#1976d2;color:#fff;border:none;border-radius:5px;cursor:pointer">📋 まとめて見直す（'+totalN+'件）</button>'
+        +' <span style="font-size:11px;color:#8a6d1a">各行の「✅切替／解除／✏直す／🔍確認」でもその場で直せます。反映は会社PCで「↻ 照合」。</span></div>' + html;
+    }
     box.style.display='block';
     box.innerHTML=html;
     // バナー各行のボタンを配線（ジャンプ／一括切替／解除／編集）
@@ -5471,6 +5575,7 @@ async function loadLinkCheck(){
     box.querySelectorAll('.linkSwitch').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; switchLinkTo(t.dataset.sup,t.dataset.code,t.dataset.better);}));
     box.querySelectorAll('.linkUnlink').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; switchLinkTo(t.dataset.sup,t.dataset.code,'');}));
     box.querySelectorAll('.linkEdit').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; editLinkRow(t.dataset.sup,t.dataset.code,t.dataset.better||'');}));
+    box.querySelectorAll('.linkRevive').forEach(el=>el.addEventListener('click',e=>{const t=e.currentTarget; reviveDormant(t.dataset.sup,t.dataset.code);}));
     const ro=$('#linkReviewOpen'); if(ro) ro.addEventListener('click', openLinkReviewPanel);
     // 表の 📌 セルに ⚠ を付け直す（すでに描画済みのとき）
     if(baseRows.length && !dateFilter) renderMainRows(!!dateFilter);
@@ -5488,8 +5593,27 @@ function linkRowBtns(i){
   if(i.kind==='suspect'){
     h+='<button class="linkUnlink" data-sup="'+sup+'" data-code="'+code+'" style="'+bs+';color:#b71c1c;border-color:#ef9a9a;font-weight:700">解除</button>';
   }
+  if(i.kind==='dormant_revival'){
+    // 休眠の復帰＝休眠マークを解除（=次の照合で自動マッチに戻る）。違えば放置でOK。
+    h+='<button class="linkRevive" data-sup="'+sup+'" data-code="'+code+'" style="'+bs+';color:#1565c0;border-color:#90caf9;font-weight:700">🔄 復帰（解除）</button>';
+    return h; // 復帰は「確認」＋「復帰」だけ（✏直すは出さない＝紐付け修正とは用途が違う）
+  }
   h+='<button class="linkEdit" data-sup="'+sup+'" data-code="'+code+'" data-better="'+pre+'" style="'+bs+'">✏ 直す</button>';
   return h;
+}
+// バナーから「🔄 復帰（解除）」＝休眠（保留）マークを外す。次の照合で自動マッチに戻る（＝見積に復帰）。
+async function reviveDormant(supplier, code){
+  const msg='「'+escConfirm(supplier)+'  '+escConfirm(code)+'」の💤休眠（保留）を解除します。\\n（次の照合で自動マッチに戻り、見積の対象に復帰します）\\n\\nよろしいですか？\\n\\n※照合結果への反映には 会社PC(DBあり) で「↻ 照合」が必要です。';
+  if(!confirm(msg)) return;
+  try{
+    const res=await fetch('/api/product-link',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ supplier:supplier, productCode:code, makerName:'' })}).then(x=>x.json());
+    if(!res.ok){ alert('保存に失敗: '+(res.error||'')); return; }
+    $('#msg').style.color='#1f6b35';
+    $('#msg').textContent='💤→🔼 休眠を解除しました（'+supplier+' '+code+'）。反映は会社PCで「↻ 照合」を押してください。';
+    await loadLinkCheck();                                  // 監査を取り直す（戻した分は一覧から消える）
+    if(allView) await loadAll(); else if(!dateFilter) await loadFile(); // 表の 💤 表示を更新
+  }catch(e){ alert('保存に失敗: '+e); }
 }
 // reasons 配列 → 日本語ラベル（別枠パネル用）。loadLinkCheck 内の reasonLabel と同等。
 function reasonLabelText(rs){

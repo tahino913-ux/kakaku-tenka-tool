@@ -201,6 +201,8 @@ function saveSettings(patch) {
     makers:         Object.assign({}, cur.makers, patch.makers), // 既存プロファイルを保持
     makerChannel:   patch.makerChannel !== undefined ? patch.makerChannel : (cur.makerChannel || {}), // メーカー→問屋の寄せ替えを保持
     productLinks:   patch.productLinks !== undefined ? patch.productLinks : (cur.productLinks || {}),
+    // 休眠/除外にした日（復帰検知用）。UI保存で消えないように保持。
+    productLinkMarkedAt: patch.productLinkMarkedAt !== undefined ? patch.productLinkMarkedAt : (cur.productLinkMarkedAt || {}),
     suppliers:      patch.suppliers !== undefined ? patch.suppliers : (cur.suppliers || {}),
     selfProfile:    patch.selfProfile !== undefined ? patch.selfProfile : (cur.selfProfile || null),
     // パスワードはハッシュで保存（平文を残さない）。新規入力も既存値もハッシュ化＝
@@ -255,24 +257,73 @@ function getProductLinks() {
   return u.productLinks || {};
 }
 
+// 休眠（保留）・除外マークの値（productLink.js と同値・循環参照を避けるためここで判定）。
+function isSkipMarkValue(v) {
+  const t = String(v == null ? '' : v).trim();
+  return t === '__EXCLUDE__' || t === '__DORMANT__';
+}
+// ローカル日付の 'YYYY-MM-DD'（休眠にした日の記録用）。
+function todayIso() {
+  const d = new Date();
+  return '' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+// 自社CDのゼロ詰め正規化（productLink.js padSelfCode と同規則・循環参照を避けここに複製）。
+//  productLinks / productLinkMarkedAt のキーを常にこの正規形で持つ＝「62」と「000062」の二重保存を防ぐ。
+function normSelfCode(c) {
+  const t = String(c == null ? '' : c).trim();
+  if (!t) return '';
+  return /^\d+$/.test(t) ? t.padStart(6, '0') : t.toLowerCase();
+}
+// map（{コード:値}）から、指定コードと同一商品を指す既存キー（正規形ゆれ＝62/000062 等）を全削除し、
+//  消した値のうち最古（マーク日の引き継ぎ用）を返す。これで保存経路ごとのキー桁ゆれによる重複を解消する。
+function purgeEquivCodeKeys(map, code) {
+  if (!map) return { had: false, oldest: '' };
+  const canon = normSelfCode(code) || String(code || '').trim();
+  let had = false, oldest = '';
+  for (const k of Object.keys(map)) {
+    if ((normSelfCode(k) || k) !== canon) continue;
+    const v = String(map[k] == null ? '' : map[k]);
+    if (v && (!oldest || v < oldest)) oldest = v;
+    delete map[k];
+    had = true;
+  }
+  return { had, oldest };
+}
+
 // 1件分の紐付けを保存（自社商品コード ⇔ メーカー商品名）。
 // makerName が空文字/null/undefined ならその紐付けを削除する。
 function saveProductLink(supplier, productCode, makerName) {
   const sup = String(supplier || '').trim();
   const code = String(productCode || '').trim();
   if (!sup || !code) return getProductLinks();
+  const canon = normSelfCode(code) || code; // キーは常にゼロ詰め正規形（62/000062 の二重保存・解除漏れを防ぐ）
   const cur = readUser() || {};
   cur.productLinks = cur.productLinks || {};
   cur.productLinks[sup] = cur.productLinks[sup] || {};
+  // 休眠/除外マークを付けた日を別表に記録＝「休眠にした後に売れた」を後で正確に判定するため。
+  //  ・マーク化：既存の記録があれば残す（最初に付けた日を保つ）。無ければ今日を記録。
+  //  ・通常名/解除：記録を消す（休眠が解けたら復帰判定の対象外に）。
+  cur.productLinkMarkedAt = cur.productLinkMarkedAt || {};
+  cur.productLinkMarkedAt[sup] = cur.productLinkMarkedAt[sup] || {};
+  // まず同一商品を指す旧フォーマットの重複キー（生・桁ゆれ）を両表から掃除＝この1か所でキーを正規化・移行する。
+  //  マーク日は重複キーに散らばっていても「最古」を引き継ぐ。
+  purgeEquivCodeKeys(cur.productLinks[sup], code);
+  const prevMark = purgeEquivCodeKeys(cur.productLinkMarkedAt[sup], code).oldest;
   const name = (makerName == null) ? '' : String(makerName).trim();
-  if (!name) {
-    delete cur.productLinks[sup][code];
-    if (!Object.keys(cur.productLinks[sup]).length) delete cur.productLinks[sup];
-  } else {
-    cur.productLinks[sup][code] = name;
+  if (name) {
+    cur.productLinks[sup][canon] = name;
+    if (isSkipMarkValue(name)) cur.productLinkMarkedAt[sup][canon] = prevMark || todayIso();
   }
-  saveSettings({ productLinks: cur.productLinks });
+  if (!Object.keys(cur.productLinks[sup]).length) delete cur.productLinks[sup];
+  if (!Object.keys(cur.productLinkMarkedAt[sup]).length) delete cur.productLinkMarkedAt[sup];
+  saveSettings({ productLinks: cur.productLinks, productLinkMarkedAt: cur.productLinkMarkedAt });
   return getProductLinks();
+}
+
+// 休眠/除外にした日の記録 { 仕入先: { 自社CD: 'YYYY-MM-DD' } } を読む。
+function getProductLinkMarkedAt() {
+  const u = readUser() || {};
+  return u.productLinkMarkedAt || {};
 }
 
 // 仕入先マスタを読む（{ 仕入先コード: { name, address, phone, ... } }）
@@ -317,7 +368,8 @@ function confirmCdLink(supplier, selfCode, makerCode, makerName) {
   const cur = readUser() || {};
   cur.productLinks = cur.productLinks || {};
   cur.productLinks[sup] = cur.productLinks[sup] || {};
-  if (mName) cur.productLinks[sup][code] = mName; // 紐付けはメーカー商品名（既存仕様）で保存
+  // 紐付けはメーカー商品名（既存仕様）で保存。キーは6桁正規形に統一し、旧フォーマットの重複は掃除。
+  if (mName) { purgeEquivCodeKeys(cur.productLinks[sup], code); cur.productLinks[sup][normSelfCode(code) || code] = mName; }
   cur.cdReview = (cur.cdReview && typeof cur.cdReview === 'object') ? cur.cdReview : {};
   cur.cdReview.confirmed = cur.cdReview.confirmed || {};
   cur.cdReview.rejected = cur.cdReview.rejected || {};
@@ -349,7 +401,7 @@ function unconfirmCdLink(supplier, selfCode) {
   if (!sup || !code) return getCdReview();
   const cur = readUser() || {};
   if (cur.productLinks && cur.productLinks[sup]) {
-    delete cur.productLinks[sup][code];
+    purgeEquivCodeKeys(cur.productLinks[sup], code); // 旧フォーマットの重複キー（生・桁ゆれ）も含め全削除＝解除漏れを防ぐ
     if (!Object.keys(cur.productLinks[sup]).length) delete cur.productLinks[sup];
   }
   if (cur.cdReview && cur.cdReview.confirmed && cur.cdReview.confirmed[sup]) {
@@ -437,4 +489,4 @@ function setCostOverride(selfCode, newCost, currentCost) {
   return getCostOverrides();
 }
 
-module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, backupCurrentSettings, listSettingsBackups, restoreSettingsBackup, BACKUP_DIR, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, getCustomerEmails, setCustomerEmail, hashAccessPassword, verifyAccessPassword, getCostOverrides, setCostOverride };
+module.exports = { getSettings, saveSettings, isConfigured, SETTINGS_PATH, backupCurrentSettings, listSettingsBackups, restoreSettingsBackup, BACKUP_DIR, getMakers, saveMakerProfile, getProductLinks, saveProductLink, getProductLinkMarkedAt, getSuppliers, saveSuppliers, getSelfProfile, saveSelfProfile, getCdReview, confirmCdLink, rejectCdLink, unconfirmCdLink, getExcludedCustomers, setExcludedCustomer, setExcludedCustomersBulk, getCustomerEmails, setCustomerEmail, hashAccessPassword, verifyAccessPassword, getCostOverrides, setCostOverride };

@@ -145,6 +145,7 @@ const CUSTOMERS_PAGE = `<!doctype html>
   .notyet{margin:8px 16px;padding:6px 12px;border-radius:8px;background:#f4f6f9;border:1px solid #e2e6ec;color:#6b7785;font-size:12px}
   /* 手動修正タグ（得意先一覧）／検討中タグ／アイテム状態ボタン／別枠セクション */
   .cust .holdm{color:#8a5a12;font-size:11px;font-weight:700;margin-left:6px}
+  .cust .dormantm{color:#3a6ea5;font-size:11px;font-weight:700;margin-left:6px}
   .cust .manualm{color:#5a4a8a;font-size:11px;font-weight:700;margin-left:6px}
   td.actcell{white-space:nowrap}
   /* チェックボックス一括移動バー */
@@ -154,12 +155,14 @@ const CUSTOMERS_PAGE = `<!doctype html>
   .bulkbtn:disabled{opacity:.45;cursor:default}
   .bulkbtn.hold{background:#f5e6c8;color:#6b4a0a}
   .bulkbtn.hold:not(:disabled):hover{background:#edd9b0}
+  .bulkbtn.dormant{background:#cfe0f3;color:#1f4e78}
+  .bulkbtn.dormant:not(:disabled):hover{background:#bcd4ec}
   .bulkbtn.manual{background:#d4c8f0;color:#3d2f66}
   .bulkbtn.manual:not(:disabled):hover{background:#c4b4e8}
   .bulkbtn.back{background:#1f6b35;color:#fff}
   .bulkbtn.back:not(:disabled):hover{background:#175a2b}
   label.selall{font-size:11px;color:#6b7785;font-weight:400;white-space:nowrap;cursor:pointer}
-  input.selchk-target,input.selchk-hold,input.selchk-manual,input.selchk-issued{cursor:pointer;vertical-align:middle}
+  input.selchk-target,input.selchk-hold,input.selchk-dormant,input.selchk-manual,input.selchk-issued{cursor:pointer;vertical-align:middle}
   /* 行ルール（ラジオボタン） */
   td.rrcell{min-width:190px}
   .rrradios{display:flex;flex-wrap:wrap;gap:1px 8px;align-items:center}
@@ -176,6 +179,8 @@ const CUSTOMERS_PAGE = `<!doctype html>
   input.rowfactor{vertical-align:middle}
   button.hold-btn{background:#fff;border:1px solid #d4a84a;color:#8a5a12;border-radius:6px;padding:2px 7px;font-size:11px;cursor:pointer}
   button.hold-btn:hover{background:#fff8eb}
+  button.dormant-btn{background:#fff;border:1px solid #8fb4dd;color:#1f4e78;border-radius:6px;padding:2px 7px;font-size:11px;cursor:pointer}
+  button.dormant-btn:hover{background:#eef5fc}
   button.manual-btn{background:#fff;border:1px solid #b8a8d8;color:#5a4a8a;border-radius:6px;padding:2px 7px;font-size:11px;cursor:pointer}
   button.manual-btn:hover{background:#f3effa}
   button.back-btn{background:#fff;border:1px solid #9fcbab;color:#1f6b35;border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer}
@@ -184,6 +189,8 @@ const CUSTOMERS_PAGE = `<!doctype html>
   details.itemsec>summary{cursor:pointer;padding:8px 12px;font-size:13px;font-weight:700;user-select:none}
   details.sec-hold{border-color:#e8d4a8}
   details.sec-hold>summary{background:#fff8eb;color:#8a5a12}
+  details.sec-dormant{border-color:#bcd4ec}
+  details.sec-dormant>summary{background:#eef5fc;color:#1f4e78}
   details.sec-manual{border-color:#d4c8f0}
   details.sec-manual>summary{background:#f3effa;color:#5a4a8a}
   details.sec-issued{border-color:#bfe0c4}
@@ -222,6 +229,16 @@ const CUSTOMERS_PAGE = `<!doctype html>
   table.cust-compact .prodname{font-size:12px;line-height:1.45;word-break:break-word;overflow-wrap:anywhere;white-space:normal}
   table.cust-compact .prodname a{word-break:break-word;overflow-wrap:anywhere}
   table.cust-compact .subline{color:#6b7785;font-size:11px;margin-top:2px;line-height:1.35;word-break:break-all}
+  .xquote-btn{display:inline-block;margin-top:3px;padding:1px 6px;font-size:10px;line-height:1.5;color:#345;background:#eef3fb;border:1px solid #c7d6ea;border-radius:10px;cursor:pointer;white-space:nowrap}
+  .xquote-btn:hover{background:#dbe7f8;border-color:#9fb9dd}
+  .xq-gate{max-width:560px;width:96%}
+  .xq-stats{display:flex;gap:14px;flex-wrap:wrap;margin:2px 0 10px;font-size:13px;color:#33414f}
+  .xq-stats b{font-size:15px;color:#1f6feb}
+  table.xq-table{width:100%;border-collapse:collapse;font-size:13px}
+  table.xq-table th,table.xq-table td{border-bottom:1px solid #e6ebf1;padding:6px 8px;text-align:left}
+  table.xq-table td.num,table.xq-table th.num{text-align:right;font-variant-numeric:tabular-nums}
+  table.xq-table tbody tr:hover{background:#f6f9fe}
+  .xq-empty{padding:16px;text-align:center;color:#6b7785}
   table.cust-compact .subline.lastsale{color:#41526b;font-weight:700;white-space:nowrap;word-break:keep-all}
   table.cust-compact .pcode{font-family:Consolas,'Courier New',monospace;font-size:10px;color:#6b7785}
   table.cust-compact .paren{color:#9aa6b2;font-size:11px;font-weight:400}
@@ -421,6 +438,22 @@ ${SHOGO_LOCK_HTML}
   </div>
 </div>
 
+<div class="gate-overlay" id="xqOverlay">
+  <div class="gate xq-gate">
+    <div class="gate-head">
+      <h2 id="xqTitle">📋 他の得意先への見積価格</h2>
+      <button class="gate-x" id="xqClose" title="閉じる">×</button>
+    </div>
+    <p class="muted" style="margin:2px 0 8px">この商品を <b>他の得意先</b> に提出（発行）済みの確定単価です。発行した見積だけが対象です。</p>
+    <div id="xqStats" class="xq-stats"></div>
+    <div class="gate-table-wrap" id="xqBody"></div>
+    <div class="gate-foot">
+      <span style="flex:1"></span>
+      <button class="ghost" id="xqClose2">閉じる</button>
+    </div>
+  </div>
+</div>
+
 <div class="wrap">
   <div class="col-list">
     <div class="listsearchbar"><input id="search" type="text" placeholder="得意先を検索（名前・コード・カナ）…"></div>
@@ -566,19 +599,24 @@ function compactSellChgCell(costPct, sellPct){
   return '<td class="num col-schg"><div class="schg-block"><span class="'+ch.cls+'">'+ch.txt+'</span><span class="paren">%</span>'
     +(badge?'<div class="schg-badge">'+badge+'</div>':'')+'</div></td>';
 }
-// 別枠セクション（検討中／手動修正／提出済み）の表。kind: 'hold'|'manual'|'issued'
+// 別枠セクション（検討中／休眠／手動修正／提出済み）の表。kind: 'hold'|'dormant'|'manual'|'issued'
 function sectionHtml(title, items, kind){
   if(!items || !items.length) return '';
-  const open = (kind==='hold' || kind==='manual') ? ' open' : ''; // 検討中・手動修正は開く／提出済みは畳む
+  const open = (kind==='hold' || kind==='manual') ? ' open' : ''; // 検討中・手動修正は開く／休眠・提出済みは畳む
   const issuedTh = kind==='issued' ? '<th>提出</th>' : '';
   const noteTh = kind==='manual' ? '<th>備考</th>' : '';
-  const hasChk = (kind==='hold' || kind==='manual' || kind==='issued');
+  const hasChk = (kind==='hold' || kind==='dormant' || kind==='manual' || kind==='issued');
   const chkCls = 'selchk-'+kind;
   const chkTh = hasChk ? '<th><label class="selall"><input type="checkbox" id="selAll-'+kind+'"> 全</label></th>' : '';
+  // 検討中⇄休眠 は対象に戻さず直接付け替えできる。per-row は既存の hold-btn/dormant-btn 配線をそのまま流用。
+  const cross = kind==='hold'    ? { btnCls:'dormant-btn', label:'💤 休眠へ',   bulkId:'bulkCross-hold',    bulkCls:'dormant', bulkLabel:'💤 選択を休眠へ',   word:'休眠' }
+              : kind==='dormant' ? { btnCls:'hold-btn',    label:'🤔 検討中へ', bulkId:'bulkCross-dormant', bulkCls:'hold',    bulkLabel:'🤔 選択を検討中へ', word:'検討中' }
+              : null;
   let rows='';
   for(const p of items){
     const info = kind==='issued' ? (issuedShort(p.issuedAt)+(p.issuedQuoteNo?'（'+esc(p.issuedQuoteNo)+'）':'')) : '';
     const chkTd = hasChk ? '<td><input type="checkbox" class="'+chkCls+'" data-key="'+esc(p.rowKey)+'" title="まとめて移動するチェック"></td>' : '';
+    const crossBtn = cross ? '<button class="'+cross.btnCls+'" data-key="'+esc(p.rowKey)+'" title="この商品を'+cross.word+'へ付け替えます（対象には戻しません）">'+cross.label+'</button> ' : '';
     rows+='<tr>'
       + chkTd
       +'<td class="prodcell col-prod"><div class="prodname">'+esc(p.productName)+'</div>'
@@ -587,13 +625,15 @@ function sectionHtml(title, items, kind){
       +'<td>'+esc(p.effectiveDate||'')+'</td>'
       +(kind==='manual'?'<td class="muted">'+esc(p.note||'')+'</td>':'')
       +(kind==='issued'?'<td class="muted">'+info+'</td>':'')
-      +'<td><button class="back-btn" data-key="'+esc(p.rowKey)+'" title="この商品を見積の「対象」に戻します">↩ 対象へ戻す</button></td>'
+      +'<td>'+crossBtn+'<button class="back-btn" data-key="'+esc(p.rowKey)+'" title="この商品を見積の「対象」に戻します">↩ 対象へ戻す</button></td>'
       +'</tr>';
   }
+  const crossBulkBtn = cross ? '<button class="bulkbtn '+cross.bulkCls+'" id="'+cross.bulkId+'" disabled>'+cross.bulkLabel+'</button>' : '';
   const bulkBar = hasChk
     ? ('<div class="bulkbar"><span class="bulkinfo">☑ 選択 <b id="cnt-'+kind+'">0</b> 件</span>'
        +'<button class="bulkbtn back" id="bulkBack-'+kind+'" disabled>↩ 選択をまとめて対象へ戻す</button>'
-       +'<span class="muted">チェックした商品を見積の「対象」に戻します。</span></div>')
+       + crossBulkBtn
+       +'<span class="muted">チェックした商品を「対象」へ戻す'+(cross?('／'+cross.word+'へ付け替え'):'')+'。</span></div>')
     : '';
   return '<details class="itemsec sec-'+kind+'"'+open+'><summary>'+title+' <b>'+items.length+'</b> 件</summary>'
     +'<div class="table-pad">'+bulkBar+'<table class="cust-compact cust-smart"><thead><tr>'+chkTh+'<th class="col-prod">商品</th><th class="col-sell">新売価<span class="paren">（現）</span></th><th>実施日</th>'+noteTh+issuedTh+'<th>操作</th></tr></thead><tbody>'
@@ -602,7 +642,7 @@ function sectionHtml(title, items, kind){
 // 得意先内の商品を rowKey で探す（対象・検討中・手動修正・提出済みの全セクション）。
 function findProductInCust(c, rowKey){
   if(!c||!rowKey) return null;
-  const all=[].concat(c.products||[], c.holdProducts||[], c.manualProducts||[], c.issuedProducts||[]);
+  const all=[].concat(c.products||[], c.holdProducts||[], c.dormantProducts||[], c.manualProducts||[], c.issuedProducts||[]);
   return all.find(p=>p.rowKey===rowKey)||null;
 }
 // 手動修正登録時に保存する単価スナップショット。
@@ -1118,6 +1158,41 @@ async function openIssuedList(){
   $('#issuedListOverlay').classList.add('show');
 }
 function closeIssuedList(){ $('#issuedListOverlay').classList.remove('show'); }
+// 📋 他社価格：この商品を他の得意先にいくらで提出（発行）したかの一覧モーダル。
+function closeCrossQuotes(){ $('#xqOverlay').classList.remove('show'); }
+async function openCrossQuotes(rowKey, cust, name){
+  if(!rowKey) return;
+  const title=$('#xqTitle'), stats=$('#xqStats'), bodyEl=$('#xqBody');
+  title.textContent='📋 '+(name||'この商品')+' — 他の得意先への見積価格';
+  stats.innerHTML='';
+  bodyEl.innerHTML='<div class="xq-empty">読み込み中…</div>';
+  $('#xqOverlay').classList.add('show');
+  let data={ok:false,items:[],stats:null};
+  try{
+    data=await fetch('/api/cross-customer-quotes',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rowKey,customer:cust||'',productName:name||''})}).then(x=>x.json());
+  }catch(e){ data={ok:false}; }
+  if(!data||!data.ok){ bodyEl.innerHTML='<div class="xq-empty">読み込みに失敗しました。</div>'; return; }
+  const items=data.items||[];
+  if(!items.length){
+    stats.innerHTML='';
+    bodyEl.innerHTML='<div class="xq-empty">他の得意先への発行（提出）実績はまだありません。<br>見積を発行すると、ここに横断で価格が並びます。</div>';
+    return;
+  }
+  const s=data.stats||{};
+  stats.innerHTML='<span>提出先 <b>'+items.length+'</b> 先</span>'
+    +(s.priced?'<span>最安 <b>'+yen(s.min)+'</b></span><span>最高 <b>'+yen(s.max)+'</b></span><span>平均 <b>'+yen(s.avg)+'</b></span>':'');
+  let html='<table class="xq-table"><thead><tr><th>得意先</th><th class="num">提出単価</th><th>実施日</th><th>発行日</th><th>見積No</th></tr></thead><tbody>';
+  for(const it of items){
+    html+='<tr><td>'+esc(it.customer)+'</td>'
+      +'<td class="num">'+(it.sell!=null?yen(it.sell):'—')+'</td>'
+      +'<td>'+esc(it.eff||'')+'</td>'
+      +'<td>'+esc(it.at?String(it.at).slice(0,10):'')+'</td>'
+      +'<td>'+esc(it.quoteNo||'')+'</td></tr>';
+  }
+  html+='</tbody></table>';
+  bodyEl.innerHTML=html;
+}
 let MANUAL_LIST_DATA=null;
 function renderManualList(data, query){
   const items=(data&&data.items)||[];
@@ -1231,6 +1306,7 @@ function renderList(){
     const lowN = lowMarginCount(c);
     const low = lowN ? '<span class="lowm">薄利'+lowN+'</span>' : '';
     const hold = c.holdCount ? '<span class="holdm">検討中'+c.holdCount+'</span>' : '';
+    const dormant = c.dormantCount ? '<span class="dormantm">💤休眠'+c.dormantCount+'</span>' : '';
     const manual = c.manualCount ? '<span class="manualm">手動修正'+c.manualCount+'</span>' : '';
     const nrec = c.hasRecent ? '' : (c.lastDate ? '<span class="nrec" title="最終売上 '+esc(c.lastDate)+'">最終 '+esc(c.lastDate.slice(0,7))+'</span>' : '<span class="nrec" title="直近約1年に取引がありません（過去の得意先）">取引なし</span>');
     const code = c.code ? '<span class="ccode" title="得意先コード">'+esc(c.code)+'</span>' : '';
@@ -1239,7 +1315,7 @@ function renderList(){
     const effb = effBadge(ef); // 実施日バッジ（超過=赤/控え=青）
     html+='<div class="cust'+sel+(iss?' done':'')+'" data-name="'+esc(c.name)+'" onclick="selectCust(this.getAttribute(\\'data-name\\'))">'
       +'<div style="min-width:0"><div class="nm">'+esc(c.name)+'</div>'
-      +'<div class="meta">'+code+'仕入先 '+c.supplierCount+' 社'+effb+rev+low+hold+manual+nrec+issBadge+'</div></div>'
+      +'<div class="meta">'+code+'仕入先 '+c.supplierCount+' 社'+effb+rev+low+hold+dormant+manual+nrec+issBadge+'</div></div>'
       +'<span class="cnt">'+c.productCount+'</span>'
       +'</div>';
   }
@@ -1328,10 +1404,11 @@ async function selectCust(name){
   html+='<div class="bulkbar" id="bulkTargetBar">'
     +'<span class="bulkinfo">☑ 選択 <b id="cntTarget">0</b> 件</span>'
     +'<button class="bulkbtn hold" id="bulkHoldBtn" disabled>🤔 選択をまとめて検討中へ</button>'
+    +'<button class="bulkbtn dormant" id="bulkDormantBtn" disabled>💤 選択をまとめて休眠へ</button>'
     +'<button class="bulkbtn manual" id="bulkManualBtn" disabled>✏ 選択をまとめて手動修正へ</button>'
     +'<select id="bulkRoundSel" style="padding:4px 6px;border:1px solid #c7d6e4;border-radius:6px;font-size:12px" title="選択行に適用するまるめ">'+bulkRoundOpts+'</select>'
     +'<button class="bulkbtn" id="bulkRoundBtn" disabled>まるめを選択行に適用</button>'
-    +'<span class="muted">チェックした商品を検討中／手動修正へ／まるめ一括（反映は「再計算」）</span>'
+    +'<span class="muted">チェックした商品を検討中／手動修正へ／まるめ一括（反映は「再計算」）。右の発行ボタンは<b>チェックした品だけ</b>を見積にできます（無選択＝全対象）。</span>'
     +'<span id="exportOneSlot" style="margin-left:auto"></span>'
     +'</div>';
   html+='<div class="table-pad cust-main-pad"><table class="cust-compact cust-smart" id="custMainTbl"><thead><tr>'
@@ -1357,9 +1434,11 @@ async function selectCust(name){
     html+='<tr>'
       +'<td class="actcell col-act"><input type="checkbox" class="selchk-target" data-key="'+esc(p.rowKey)+'" title="まとめて移動">'
       +' <button class="hold-btn" data-key="'+esc(p.rowKey)+'" title="検討中へ（あとで考えたい品を見積から一時除外）">🤔</button>'
+      +' <button class="dormant-btn" data-key="'+esc(p.rowKey)+'" title="休眠へ（今は仕入れていない品を見積から除外。再照合しても残る）">💤</button>'
       +' <button class="manual-btn" data-key="'+esc(p.rowKey)+'" title="手動修正へ（照合できない品をツール外で直した記録）">✏</button></td>'
       +'<td class="prodcell col-prod"><div class="prodname">'+prodLink(c.name, p.supplier, p.productCode, p.productName)+'</div>'
       +'<div class="subline"><span class="sup-badge">'+esc(p.supplier)+'</span> <span class="pcode">'+esc(p.productCode||'')+'</span></div>'
+      +'<div><button class="xquote-btn" data-key="'+esc(p.rowKey)+'" data-cust="'+esc(c.name)+'" data-name="'+esc(p.productName||'')+'" title="この商品を他の得意先にいくらで提出したか（発行済み）を一覧">📋 他社価格</button></div>'
       +lastSaleLine(p)+'</td>'
       +compactCostCell(p.currentCost, p.newCost)
       +compactChgCell(costPct)
@@ -1373,6 +1452,7 @@ async function selectCust(name){
   html+='</tbody></table></div>';
   // 別枠：🤔 検討中／✏ 手動修正／✅ 提出済み
   html+=sectionHtml('🤔 検討中（あとで考えたい品・見積から一時除外）', c.holdProducts, 'hold');
+  html+=sectionHtml('💤 休眠（今は仕入れていない品・見積から除外。再照合しても残る）', c.dormantProducts, 'dormant');
   html+=sectionHtml('✏ 手動修正（照合できずツール外で直す品）', c.manualProducts, 'manual');
   html+=sectionHtml('✅ 提出済み（発行したアイテム）', c.issuedProducts, 'issued');
   $('#detailCol').innerHTML=html;
@@ -1391,27 +1471,37 @@ async function selectCust(name){
   if(__mailBtn) __mailBtn.addEventListener('click', ()=>mailQuoteFlow(c.name));
   // 「🤔 検討中へ」「✏ 手動修正へ」「↩ 対象へ戻す」の配線（1件ずつ）
   $('#detailCol').querySelectorAll('button.hold-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'hold')));
+  $('#detailCol').querySelectorAll('button.dormant-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'dormant')));
   $('#detailCol').querySelectorAll('button.manual-btn').forEach(b=> b.addEventListener('click',()=>{
     const c=DATA.find(x=>x.name===selName);
     const p=findProductInCust(c,b.getAttribute('data-key'));
     setItemState(b.getAttribute('data-key'),'manual',p?productSnapshot(p):{});
   }));
   $('#detailCol').querySelectorAll('button.back-btn').forEach(b=> b.addEventListener('click',()=> setItemState(b.getAttribute('data-key'),'')));
+  $('#detailCol').querySelectorAll('button.xquote-btn').forEach(b=> b.addEventListener('click',()=> openCrossQuotes(b.getAttribute('data-key'), b.getAttribute('data-cust'), b.getAttribute('data-name'))));
   // チェックボックスでまとめて移動（対象→検討中／対象→手動修正 ／ 各別枠→対象）の配線
   const bulkRoot = $('#detailCol');
   const BULK_GROUPS = [
-    { cls:'selchk-hold',   cnt:'#cnt-hold',     btn:'#bulkBack-hold',     all:'#selAll-hold',   status:'' },
-    { cls:'selchk-manual', cnt:'#cnt-manual',   btn:'#bulkBack-manual',   all:'#selAll-manual', status:'' },
-    { cls:'selchk-issued', cnt:'#cnt-issued',   btn:'#bulkBack-issued',   all:'#selAll-issued', status:'' },
+    { cls:'selchk-hold',    cnt:'#cnt-hold',     btn:'#bulkBack-hold',     all:'#selAll-hold',    status:'', cross:'#bulkCross-hold',    crossStatus:'dormant' },
+    { cls:'selchk-dormant', cnt:'#cnt-dormant',  btn:'#bulkBack-dormant',  all:'#selAll-dormant', status:'', cross:'#bulkCross-dormant', crossStatus:'hold' },
+    { cls:'selchk-manual',  cnt:'#cnt-manual',   btn:'#bulkBack-manual',   all:'#selAll-manual',  status:'' },
+    { cls:'selchk-issued',  cnt:'#cnt-issued',   btn:'#bulkBack-issued',   all:'#selAll-issued',  status:'' },
   ];
   function bulkUpdate(){
     const targetAll = bulkRoot.querySelectorAll('input.selchk-target');
     const targetN = bulkRoot.querySelectorAll('input.selchk-target:checked').length;
     const cntT=$('#cntTarget');
     if(cntT) cntT.textContent=targetN;
-    const hb=$('#bulkHoldBtn'), mb=$('#bulkManualBtn');
+    // 「○○だけ作成」ボタンの表示を選択状況に合わせる（チェックがあれば『選択N品だけ見積』＝挙動を見える化）。
+    const oneBtn=document.getElementById('exportOneBtn');
+    if(oneBtn && selName){
+      const nm = selName.length>12?selName.slice(0,12)+'…':selName;
+      oneBtn.textContent = targetN>0 ? ('📄 選択 '+targetN+' 品だけ見積') : ('📄 「'+nm+'」だけ作成');
+    }
+    const hb=$('#bulkHoldBtn'), mb=$('#bulkManualBtn'), db=$('#bulkDormantBtn');
     if(hb) hb.disabled=!targetN;
     if(mb) mb.disabled=!targetN;
+    if(db) db.disabled=!targetN;
     const saT=$('#selAllTarget');
     if(saT) saT.checked=targetAll.length>0 && targetN===targetAll.length;
     for(const g of BULK_GROUPS){
@@ -1420,6 +1510,7 @@ async function selectCust(name){
       const cnt=$(g.cnt), btn=$(g.btn), sa=$(g.all);
       if(cnt) cnt.textContent=n;
       if(btn) btn.disabled=!n;
+      const cb=g.cross&&$(g.cross); if(cb) cb.disabled=!n; // 検討中⇄休眠 の付け替えボタンも選択数で活性
       if(sa) sa.checked = all.length>0 && n===all.length;
     }
     const tn=bulkRoot.querySelectorAll('input.selchk-target:checked').length;
@@ -1437,18 +1528,22 @@ async function selectCust(name){
     });
     markCalcPending();
   });
-  bulkRoot.querySelectorAll('input.selchk-target, input.selchk-hold, input.selchk-manual, input.selchk-issued').forEach(c=> c.addEventListener('change', bulkUpdate));
+  bulkRoot.querySelectorAll('input.selchk-target, input.selchk-hold, input.selchk-dormant, input.selchk-manual, input.selchk-issued').forEach(c=> c.addEventListener('change', bulkUpdate));
   const saTarget=$('#selAllTarget');
   if(saTarget) saTarget.addEventListener('change',()=>{ bulkRoot.querySelectorAll('input.selchk-target').forEach(c=>{c.checked=saTarget.checked;}); bulkUpdate(); });
   const hb=$('#bulkHoldBtn');
   if(hb) hb.addEventListener('click',()=> bulkMove('selchk-target','hold'));
   const mb=$('#bulkManualBtn');
   if(mb) mb.addEventListener('click',()=> bulkMove('selchk-target','manual'));
+  const db=$('#bulkDormantBtn');
+  if(db) db.addEventListener('click',()=> bulkMove('selchk-target','dormant'));
   for(const g of BULK_GROUPS){
     const sa=$(g.all);
     if(sa) sa.addEventListener('change',()=>{ bulkRoot.querySelectorAll('input.'+g.cls).forEach(c=>{c.checked=sa.checked;}); bulkUpdate(); });
     const btn=$(g.btn);
     if(btn) btn.addEventListener('click',()=> bulkMove(g.cls, g.status));
+    const cb=g.cross&&$(g.cross);
+    if(cb) cb.addEventListener('click',()=> bulkMove(g.cls, g.crossStatus)); // 検討中→休眠 / 休眠→検討中 の一括付け替え
   }
   // 行まるめ：変更はローカルに保持し、再計算ボタンで一括反映（毎回 load しない＝軽い）
   $('#detailCol').querySelectorAll('select.rowround-sel').forEach(sel=>{
@@ -1517,9 +1612,15 @@ async function selectCust(name){
 let gateOpts=null;
 function setExpBusy(b){ $('#exportAllBtn').disabled=b; $('#exportOneBtn').disabled = b || !selName; if(b) showExportMsg('処理中…'); }
 function showExportMsg(t,isErr){ const m=$('#exportMsg'); m.textContent=t||''; m.style.color=isErr?'#c0392b':'#1f6b35'; }
+// 対象表でチェックされた商品の rowKey 一覧（『選択した商品だけ見積』用）。0件＝全対象を見積（従来どおり）。
+function selectedTargetKeys(){
+  return Array.from(document.querySelectorAll('#detailCol input.selchk-target:checked')).map(c=>c.getAttribute('data-key')).filter(Boolean);
+}
 function exportFlow(scope){
   if(scope==='one' && !selName){ showExportMsg('先に左の一覧で得意先を選んでください',true); return; }
   const opts=Object.assign(calcOpts(),{scope, customer: scope==='one'?selName:null});
+  // 得意先1件の発行で、対象表のチェックがあれば「その商品だけ」を見積にする（0件＝全対象＝従来どおり）。
+  if(scope==='one'){ const keys=selectedTargetKeys(); if(keys.length) opts.onlyRowKeys=keys; }
   setExpBusy(true);
   fetch('/api/customers-export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:'check'},opts))})
     .then(x=>x.json()).then(res=>{
@@ -1618,10 +1719,13 @@ function mailQuoteFlow(name){
   if(!name){ showExportMsg('得意先が選択されていません',true); return; }
   const inp=document.getElementById('custEmailInp');
   const email=inp?String(inp.value||'').trim():String(CUST_EMAILS[name]||'').trim();
+  const selKeys=selectedTargetKeys(); // チェックがあればその商品だけを見積にする（メール発行も同じ挙動に揃える）
   const warn=email?'':'\\n\\n※ 送信先メール未登録です（Outlookの宛先は空で開きます。あとで手入力できます）。';
-  if(!confirm('「'+name+'」の見積を発行し、PDF化してOutlookの作成画面を開きます。\\n（送信ボタンはあなたが押します）'+warn+'\\n\\nよろしいですか？')) return;
+  const pick=selKeys.length?('\\n\\n（チェックした '+selKeys.length+' 品だけを見積にします）'):'';
+  if(!confirm('「'+name+'」の見積を発行し、PDF化してOutlookの作成画面を開きます。\\n（送信ボタンはあなたが押します）'+pick+warn+'\\n\\nよろしいですか？')) return;
   if(email && CUST_EMAILS[name]!==email) saveCustEmail(name, email); // 入力中のアドレスは保存もしておく
   const opts=Object.assign(calcOpts(),{customer:name, email});
+  if(selKeys.length) opts.onlyRowKeys=selKeys;
   setExpBusy(true); setMailBusy(true); showExportMsg('PDF化してOutlookを起動中…');
   fetch('/api/mail-quote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(opts)})
     .then(x=>x.json()).then(res=>{
@@ -1773,6 +1877,9 @@ $('#manualListSearch').addEventListener('input',()=>{
 $('#issuedListClose').addEventListener('click',closeIssuedList);
 $('#issuedListClose2').addEventListener('click',closeIssuedList);
 $('#issuedListOverlay').addEventListener('click',e=>{ if(e.target===$('#issuedListOverlay')) closeIssuedList(); });
+$('#xqClose').addEventListener('click',closeCrossQuotes);
+$('#xqClose2').addEventListener('click',closeCrossQuotes);
+$('#xqOverlay').addEventListener('click',e=>{ if(e.target===$('#xqOverlay')) closeCrossQuotes(); });
 $('#issuedListSearch').addEventListener('input',()=>{
   if(ISSUED_LIST_DATA) renderIssuedList(ISSUED_LIST_DATA, $('#issuedListSearch').value);
 });
@@ -1785,7 +1892,8 @@ $('#gateIssue').addEventListener('click',()=>{ if(gateOpts) doIssue(gateOpts); }
 $('#gateOverlay').addEventListener('click',e=>{ if(e.target===$('#gateOverlay')) closeGate(); });
 document.addEventListener('keydown',e=>{
   if(e.key!=='Escape') return;
-  if($('#manualListOverlay').classList.contains('show')) closeManualList();
+  if($('#xqOverlay').classList.contains('show')) closeCrossQuotes();
+  else if($('#manualListOverlay').classList.contains('show')) closeManualList();
   else if($('#issuedListOverlay').classList.contains('show')) closeIssuedList();
   else if($('#gateOverlay').classList.contains('show')) closeGate();
 });

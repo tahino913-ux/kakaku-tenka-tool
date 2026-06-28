@@ -2,7 +2,7 @@
 // 手動紐付けより自動照合の方が確実な候補があるかを検出（match.js 依存・productLink とは分離して循環参照を避ける）。
 
 const { codeCandidates, codeHit, nameScoreInfo, padSelfCode, sizeMismatch, colorMismatch } = require('./match');
-const { linkNamesEqual, findLinkTargetsInQuote } = require('./productLink');
+const { linkNamesEqual, findLinkTargetsInQuote, isExcludeLink } = require('./productLink');
 
 function scoreMakerAgainstRec(maker, rec) {
   const codeNorm = String(rec.codeNorm || rec.norm || '').toLowerCase();
@@ -63,6 +63,7 @@ function auditBetterManualLinks(productLinks, makerItems, hanbaiRecords) {
     for (const [rawCode, linked] of Object.entries(codes || {})) {
       const linkedName = String(linked || '').trim();
       if (!linkedName) continue;
+      if (isExcludeLink(linkedName)) continue; // 🚫除外/💤休眠＝意図的に照合から外した品＝「より確実な候補」提案の対象外
       const code = padSelfCode(rawCode);
       const pool = hanbaiByCode.get(code);
       if (!pool || !pool.length) continue;
@@ -197,6 +198,7 @@ function auditSuspectManualLinks(productLinks, makerItems, hanbaiRecords, opts) 
     for (const [rawCode, linked] of Object.entries(codes || {})) {
       const linkedName = String(linked || '').trim();
       if (!linkedName) continue;
+      if (isExcludeLink(linkedName)) continue; // 🚫除外/💤休眠＝意図的に外した品＝「勘違いの疑い」判定の対象外
       const pool = hanbaiByCode.get(padSelfCode(rawCode));
       if (!pool || !pool.length) continue; // 自社品が販売実績に無い＝orphan は別audit が扱う
       // 自社品の代表（マスタ名優先・無ければ販売実績名）。名前スコアは coreNorm（正規化済）で計算。
