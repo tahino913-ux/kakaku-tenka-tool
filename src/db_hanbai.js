@@ -337,4 +337,4 @@ function probeDbConnection(dbCfg) {
   return true;
 }
 
-module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax, loadSelfProductsFromDb, loadCustomerMaster, probeDbConnection };
+module.exports = { loadHanbaiFromDb, buildSql, csvToRecords, defaultRange, lookupShohinTax, loadSelfProductsFromDb, loadCustomerMaster, probeDbConnection, runQueryToCsv };
