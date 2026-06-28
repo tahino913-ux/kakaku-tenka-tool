@@ -2520,6 +2520,9 @@ function settingsForClient(s) {
   const out = Object.assign({}, s);
   out.hasAccessPassword = !!out.accessPassword;
   out.accessPassword = '';
+  // AIキーはブラウザへ返さない。設計上は環境変数 ANTHROPIC_API_KEY のみ使用（settings.json に置いても効かない）が、
+  //  万一 ai.apiKey が書かれていても平文を出さないよう防御的にマスクする。ネストは元設定を壊さないよう複製してから消す。
+  if (out.ai && typeof out.ai === 'object') { out.ai = Object.assign({}, out.ai); if ('apiKey' in out.ai) out.ai.apiKey = ''; }
   return out;
 }
 

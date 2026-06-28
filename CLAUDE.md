@@ -42,6 +42,17 @@ Claude Code / Cursor が起動時に読み込むファイルです。
 - [x] **パスワード（`accessPassword`）のハッシュ化、リクエスト本文サイズ上限（DoS対策）（2026-06-28 確認・実装済）**：①ハッシュ化＝`settings.js` の `hashAccessPassword`（`sha256$<hex>`・固定ペッパー `apwhash|`）。`saveSettings` が保存時にハッシュ化、`getSettings` は出力で平文を空にし `hasAccessPassword` 真偽のみ返す。`/api/login` が `verifyAccessPassword` でハッシュ比較（旧平文とも後方互換）。②本文上限＝`server.js` の `MAX_BODY_BYTES=20MB`、`readBody` が `req.on('data')` 累積で超過時 reject＝全POSTが経由（巨大POSTのOOM/DoS対策）。
 - [ ] 日付正規化／`normLinkName` の統合整理。
 
+**2026-06-28 アラ探し（コードレビュー）：自宅で直した分＋会社PCへの引き継ぎ**
+
+> 4領域の並行レビュー＋現物裏取りで洗い出し。致命バグは無し（よく作り込まれている）。以下は確認済みの本物のみ。
+
+- [x] **自宅で修正済み（DB不要・検証済・※要 sim 再起動）**：
+  - **① `rules.js` `sell_cost_rate` の0円ガード**：新原価0のとき `現売価×0=0円` を出していた（`target_margin_rate`/`keep_margin_rate` は対応済みなのに非対称）。`currentCost>0 && newCost>0` に修正＝0なら絶対額上乗せにフォールバック（90等）。単体検証3/3。**照合エンジン非改変＝matchaudit不変のはず。**
+  - **② `customersPage.js` 行ルールの factor 持ち越し**：行を「掛率×1.25」→「粗利率%」へ変えると 1.25 が 1.25% と誤解釈された。種別変更時に `delete rowFactor[k]`（全体既定から出し直し）。配信クライアントJS構文0エラー確認。
+  - **③ AIキーの案内矛盾＋マスク**：CLAUDE.md は「`settings.json` の `ai.apiKey`」可と案内していたが `ai.js` は環境変数のみ読む（書いても無効）。文書を実装に合わせ修正＋`server.js` `settingsForClient` で `ai.apiKey` も防御的にマスク（元設定を壊さないよう複製してから）。単体検証4/4。
+- [ ] **【DB必須・会社PCで】⑥ `match.js` 集約キーの区切り文字追加（照合エンジン＝要 matchaudit 検証）**：`match.js:462`（`matchOne`）と `match.js:325`（`matchSelf`）の `const key = (r.customerCode||'') + '' + (r.productCode||'')` は区切り無し連結のため、**可変長コードのファイル/SaaS運用**で「得意先123×商品4567」と「1234×567」が同一キー衝突し明細が黙って消える。**現状のDB運用は固定6桁ゼロ詰めで衝突せず実害なし＝潜在バグ**。修正は区切り追加（例 `+ '' +`）の2箇所。エンジン変更なので **会社PCで `node src/matchaudit.js` 前後比較（dup0・日野自社製造一致・recall・要確認0が不変なこと）→ sim再起動** が必須。DB固定桁では結果不変のはず。
+- [~] **④⑤ 外部データ取込の堅牢化（保留＝効果が見える品が出てから）**：④`csv.js:35` フィールド途中の裸の `"`（例 `5"`）で行崩れ＝外部の非整形CSV取込時のみ（自前生成CSVは安全）。⑤`xlsxread.js:90` `r=`属性無しセルを無視＝Excel以外で生成の.xlsx取込時のみ（純正Excelは安全）。いずれも実害が出るファイルを実際に踏んでから対応（#3/#4と同方針）。
+
 > 改良に着手する前に **`node src/matchaudit.js` の数字（一致/休眠/要確認の件数）を控える**と、変更の影響を前後比較で安全に判断できる。
 
 ---
@@ -71,7 +82,7 @@ Claude Code / Cursor が起動時に読み込むファイルです。
 ## セキュリティ
 
 - **APIキーやパスワードをコードに直接書かない**。  
-  - AI: `settings.json` の `ai.apiKey` または環境変数 `ANTHROPIC_API_KEY`（`src/ai.js`）  
+  - AI: 環境変数 `ANTHROPIC_API_KEY` のみ（`src/ai.js`）。**`settings.json` の `ai.apiKey` には保存しない**（`ai.js` は環境変数しか読まない＝書いても無効。なお `settingsForClient` で出力時にマスク済み）  
   - 画面ロック: `settings.json` の `accessPassword`（ハッシュのみ保存）  
   - DB接続: `config.js` / `settings.json` の `hanbai.db`（gitignore 対象の `settings.json` で上書き）
 - **販売大臣DBは読み取り専用（SELECTのみ）**。INSERT/UPDATE/DELETE/DDL は絶対禁止。

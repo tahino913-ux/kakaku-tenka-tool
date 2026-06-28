@@ -1591,8 +1591,12 @@ async function selectCust(name){
   $('#detailCol').querySelectorAll('select.rowrule:not(.rowround-mode)').forEach(sel=>{
     sel.addEventListener('change',()=>{
       const k=sel.getAttribute('data-key');
+      const prev=rowRules[k]||'';
       if(sel.value) rowRules[k]=sel.value; else delete rowRules[k];
       sel.classList.toggle('ov', !!sel.value);
+      // 種別が変わったら 行ごとパラメータ(掛率/粗利率%)の持ち越しをクリア。
+      //  掛率1.25のまま「粗利率%」へ変えると 1.25% と誤解釈されるため、下の全体既定から出し直す。
+      if(sel.value!==prev) delete rowFactor[k];
       // 目標粗利率に切替えた行は、表示中の率（既定＝全体の目標粗利率%）を明示的に確定させる。
       //  全体ルールが目標粗利率以外だと「全体factor」は掛率なので、シードしないと率が伝わらないため。
       if(sel.value==='target_margin_rate' && (rowFactor[k]==null||rowFactor[k]==='')){

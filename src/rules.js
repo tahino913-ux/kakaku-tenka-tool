@@ -66,8 +66,9 @@ function computeNewSell(rec, rule) {
     case 'markup':
       return currentSell * (rule.factor || 1); // 現売価 × 掛率
     case 'sell_cost_rate': // 現売価 × 仕入改定%（仕入の値上げ率をそのまま売価に乗せる）
-      // newSell = currentSell × (newCost / currentCost)。現仕入が無い/0なら率が出せないので絶対額の上乗せにフォールバック。
-      if (currentCost > 0 && Number.isFinite(currentSell) && Number.isFinite(newCost)) return currentSell * (newCost / currentCost);
+      // newSell = currentSell × (newCost / currentCost)。現仕入が無い/0、または新仕入が無い/0なら
+      //  率が出せない（0なら売価0円になる）ので絶対額の上乗せにフォールバック（target_margin_rate と同作法）。
+      if (currentCost > 0 && newCost > 0 && Number.isFinite(currentSell)) return currentSell * (newCost / currentCost);
       return currentSell + (newCost - currentCost);
     case 'keep_margin_rate': {
       if (!(currentSell > 0)) return currentSell + (newCost - currentCost);
