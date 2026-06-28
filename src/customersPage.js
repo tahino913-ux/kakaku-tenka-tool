@@ -600,9 +600,36 @@ function compactSellChgCell(costPct, sellPct){
     +(badge?'<div class="schg-badge">'+badge+'</div>':'')+'</div></td>';
 }
 // 別枠セクション（検討中／休眠／手動修正／提出済み）の表。kind: 'hold'|'dormant'|'manual'|'issued'
+// 🔁 再見積もり候補（提出済みで原価が変わった品）。rowKey -> {severity,oldCost,newCost,marginPct}。
+//  メイン画面と同じ /api/requote-check を読み、提出済みセクションの該当行に印を付ける（誤操作防止）。
+let requoteMap={};
+async function loadRequoteMap(){
+  try{
+    const r=await fetch('/api/requote-check').then(x=>x.json());
+    const m={}; (r&&r.items||[]).forEach(i=>{ m[i.rowKey]={severity:i.severity,oldCost:i.oldCost,newCost:i.newCost,marginPct:i.marginPct}; });
+    requoteMap=m;
+  }catch(e){ requoteMap={}; }
+}
+// severity → 表示ラベルと色（🔁バッジ用）。
+const RQ_STYLE={
+  gyaku:{label:'逆ザヤ',color:'#b71c1c',bg:'#fdecec'},
+  thin:{label:'値上利薄',color:'#b8860b',bg:'#fbf5e3'},
+  up:{label:'値上がり',color:'#c46210',bg:'#fbeede'},
+  down:{label:'値下がり',color:'#1f6b35',bg:'#e9f6ec'},
+};
+function rqBadgeHtml(rq){
+  if(!rq) return '';
+  const s=RQ_STYLE[rq.severity]||{label:'原価変動',color:'#555',bg:'#eee'};
+  const oc=(rq.oldCost!=null?rq.oldCost:'?');
+  return ' <span class="rq-badge" style="display:inline-block;background:'+s.bg+';color:'+s.color+';border:1px solid '+s.color
+    +';border-radius:999px;font-size:10px;font-weight:700;padding:0 7px;margin-left:4px" title="提出後に仕入原価が変わりました。再見積もりを検討してください。">🔁 '+s.label
+    +' 原価'+esc(oc)+'→'+esc(rq.newCost)+'（新利率'+esc(rq.marginPct)+'%）</span>';
+}
 function sectionHtml(title, items, kind){
   if(!items || !items.length) return '';
-  const open = (kind==='hold' || kind==='manual') ? ' open' : ''; // 検討中・手動修正は開く／休眠・提出済みは畳む
+  // 提出済みのうち再見積もり候補（原価が変わった品）の件数。あれば提出済みも自動で開く（見落とし防止）。
+  const rqN = kind==='issued' ? items.filter(p=>requoteMap[p.rowKey]).length : 0;
+  const open = (kind==='hold' || kind==='manual' || rqN>0) ? ' open' : ''; // 検討中・手動修正・再見積もり候補ありは開く
   const issuedTh = kind==='issued' ? '<th>提出</th>' : '';
   const noteTh = kind==='manual' ? '<th>備考</th>' : '';
   const hasChk = (kind==='hold' || kind==='dormant' || kind==='manual' || kind==='issued');
@@ -617,9 +644,11 @@ function sectionHtml(title, items, kind){
     const info = kind==='issued' ? (issuedShort(p.issuedAt)+(p.issuedQuoteNo?'（'+esc(p.issuedQuoteNo)+'）':'')) : '';
     const chkTd = hasChk ? '<td><input type="checkbox" class="'+chkCls+'" data-key="'+esc(p.rowKey)+'" title="まとめて移動するチェック"></td>' : '';
     const crossBtn = cross ? '<button class="'+cross.btnCls+'" data-key="'+esc(p.rowKey)+'" title="この商品を'+cross.word+'へ付け替えます（対象には戻しません）">'+cross.label+'</button> ' : '';
-    rows+='<tr>'
+    const rq = kind==='issued' ? requoteMap[p.rowKey] : null; // 再見積もり候補なら印を付ける
+    const trAttr = rq ? ' class="rq-row" style="background:'+((RQ_STYLE[rq.severity]||{}).bg||'#fff7e6')+'"' : '';
+    rows+='<tr'+trAttr+'>'
       + chkTd
-      +'<td class="prodcell col-prod"><div class="prodname">'+esc(p.productName)+'</div>'
+      +'<td class="prodcell col-prod"><div class="prodname">'+esc(p.productName)+rqBadgeHtml(rq)+'</div>'
       +'<div class="subline"><span class="sup-badge">'+esc(p.supplier)+'</span> <span class="pcode">'+esc(p.productCode||'')+'</span></div></td>'
       +'<td class="num col-sell"><span class="main-num">'+numStr(p.newSell)+'</span><span class="paren">（'+numStr(p.currentSell)+'）</span></td>'
       +'<td>'+esc(p.effectiveDate||'')+'</td>'
@@ -635,7 +664,8 @@ function sectionHtml(title, items, kind){
        + crossBulkBtn
        +'<span class="muted">チェックした商品を「対象」へ戻す'+(cross?('／'+cross.word+'へ付け替え'):'')+'。</span></div>')
     : '';
-  return '<details class="itemsec sec-'+kind+'"'+open+'><summary>'+title+' <b>'+items.length+'</b> 件</summary>'
+  const rqSum = rqN>0 ? ' <span style="background:#fdecec;color:#b71c1c;border:1px solid #b71c1c;border-radius:999px;font-size:11px;font-weight:700;padding:0 8px">🔁 再見積もり要 '+rqN+'</span>' : '';
+  return '<details class="itemsec sec-'+kind+'"'+open+'><summary>'+title+' <b>'+items.length+'</b> 件'+rqSum+'</summary>'
     +'<div class="table-pad">'+bulkBar+'<table class="cust-compact cust-smart"><thead><tr>'+chkTh+'<th class="col-prod">商品</th><th class="col-sell">新売価<span class="paren">（現）</span></th><th>実施日</th>'+noteTh+issuedTh+'<th>操作</th></tr></thead><tbody>'
     +rows+'</tbody></table></div></details>';
 }
@@ -1908,7 +1938,7 @@ $('#cRoundMode').addEventListener('change',markCalcPending);
 });
 (async()=>{
   await initShogoLockWatch();
-  await Promise.all([initControls(), loadIssueLog(), loadCustomerEmails()]);
+  await Promise.all([initControls(), loadIssueLog(), loadCustomerEmails(), loadRequoteMap()]);
   await loadSummary();
   // メイン表の得意先リンク（/customers?customer=...）で来たら、その得意先を選択して表示。
   try{
@@ -1917,6 +1947,8 @@ $('#cRoundMode').addEventListener('change',markCalcPending);
       if(DATA.find(x=>x.name===want)){
         await selectCust(want);
         const sel=$('#listCol .cust.sel'); if(sel) sel.scrollIntoView({block:'center'});
+        // 再見積もり候補があれば、その行へスクロール＝どれを直すか一目で分かる（誤操作防止）。
+        const rq=$('#detailCol .rq-row'); if(rq) rq.scrollIntoView({block:'center'});
       } else {
         $('#msg').textContent='「'+want+'」は現在の改定対象に見つかりませんでした（実施日・照合の結果に含まれていない可能性）。';
       }
