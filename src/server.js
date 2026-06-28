@@ -5575,7 +5575,8 @@ async function loadRequoteCheck(){
       const oc=(i.oldCost!=null?i.oldCost:'?');
       return '<div style="padding:2px 0">　・'+tag+' '+esc(i.customer)+'　'+esc(i.supplier)+' '+esc(i.code)
         +'：提出 <b>'+esc(i.sell)+'円</b>／原価 '+esc(oc)+'→<b>'+esc(i.newCost)+'円</b>（新利益率 <b>'+esc(i.marginPct)+'%</b>）'
-        +' <button class="rqRevert" data-idx="'+idx+'" style="font-size:11px;padding:2px 8px;border:1px solid #b71c1c;color:#b71c1c;background:#fff;border-radius:5px;cursor:pointer;font-weight:700">🔁 対象に戻す</button></div>';
+        +' <button class="rqRevert" data-idx="'+idx+'" style="font-size:11px;padding:2px 8px;border:1px solid #b71c1c;color:#b71c1c;background:#fff;border-radius:5px;cursor:pointer;font-weight:700">🔁 対象に戻して見積へ</button>'
+        +' <a class="rqGo" href="/customers?customer='+encodeURIComponent(i.customer)+'" target="_blank" style="font-size:11px;color:#1976d2;margin-left:4px">📝 見積ページ</a></div>';
     }).join('');
     box.style.display='block';
     box.innerHTML='🔁 <b>再見積もり要 '+r.count+'件</b>（🔴逆ザヤ '+r.gyaku+' / 🟡利幅薄 '+r.thin+'）：'
@@ -5588,13 +5589,14 @@ async function loadRequoteCheck(){
 // 「🔁 対象に戻す」＝提出済みを解除し対象へ戻す（得意先別で再見積もり可能に）。自動では単価を変えない。
 async function requoteRevert(idx){
   const it=requoteItems[idx]; if(!it) return;
-  if(!confirm('「'+it.customer+'　'+it.supplier+' '+it.code+'」の提出済みを解除し、見積の対象に戻します。\\n（得意先別ページで新原価 '+it.newCost+'円 を反映して再見積もり→出し直してください）\\n\\nよろしいですか？')) return;
+  if(!confirm('「'+it.customer+'　'+it.supplier+' '+it.code+'」の提出済みを解除し、見積の対象に戻します。\\n解除後、この得意先の見積ページを新しいタブで開きます。\\n（新原価 '+it.newCost+'円 を反映して再見積もり→出し直してください）\\n\\nよろしいですか？')) return;
   try{
     const res=await fetch('/api/item-status',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({ customer:it.customer, rowKey:it.rowKey, status:'' })}).then(x=>x.json());
     if(!res.ok){ alert('解除に失敗: '+(res.error||'')); return; }
     $('#msg').style.color='#1f6b35';
-    $('#msg').textContent='🔁 提出を解除しました（'+it.customer+' '+it.supplier+' '+it.code+'）。得意先別ページで再見積もりしてください。';
+    $('#msg').textContent='🔁 提出を解除しました（'+it.customer+' '+it.supplier+' '+it.code+'）。開いた見積ページで再見積もりしてください。';
+    window.open('/customers?customer='+encodeURIComponent(it.customer),'_blank'); // 見積ページ（その得意先）へ
     await loadRequoteCheck();                                 // 一覧を取り直す（戻した分は消える）
     if(allView) await loadAll(); else if(!dateFilter) await loadFile(); // メイン表示も更新（提出解除で表に復帰）
   }catch(e){ alert('解除に失敗: '+e); }
