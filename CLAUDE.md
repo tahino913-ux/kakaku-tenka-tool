@@ -39,7 +39,7 @@ Claude Code / Cursor が起動時に読み込むファイルです。
 **SaaS化の前に（会社PCでなくても可）：**
 
 - [x] **settings.json の世代バックアップ（2026-06-16 実装）**：保存（全UI操作が通る `settings.js` の `saveSettings` 単一経路）の**上書き直前に現物を `settings_backup/settings_YYYYMMDD_HHMMSS_mmm.json` へ退避**。直近50世代を保持し古い物のみ剪定（`BACKUP_KEEP`）。バックアップ失敗は保存を止めない（例外を飲み込む）。`settings_backup/` は gitignore。原子的書込みでは救えない「誤った内容で正しく上書き」事故を、Drive版履歴に頼らずツール内の1ファイルで復元可能に。復元は **`/self` の「💾 設定のバックアップと復元」からワンクリック**（一覧→選んで復元。復元前に現状も自動退避＝戻したあと元へも可）。API＝`GET /api/settings-backups`・`POST /api/settings-restore`（`settings.js` の `listSettingsBackups`/`restoreSettingsBackup`、ファイル名検証でトラバーサル防止）。
-- [ ] パスワード（`accessPassword`）のハッシュ化、リクエスト本文サイズ上限（DoS対策）。
+- [x] **パスワード（`accessPassword`）のハッシュ化、リクエスト本文サイズ上限（DoS対策）（2026-06-28 確認・実装済）**：①ハッシュ化＝`settings.js` の `hashAccessPassword`（`sha256$<hex>`・固定ペッパー `apwhash|`）。`saveSettings` が保存時にハッシュ化、`getSettings` は出力で平文を空にし `hasAccessPassword` 真偽のみ返す。`/api/login` が `verifyAccessPassword` でハッシュ比較（旧平文とも後方互換）。②本文上限＝`server.js` の `MAX_BODY_BYTES=20MB`、`readBody` が `req.on('data')` 累積で超過時 reject＝全POSTが経由（巨大POSTのOOM/DoS対策）。
 - [ ] 日付正規化／`normLinkName` の統合整理。
 
 > 改良に着手する前に **`node src/matchaudit.js` の数字（一致/休眠/要確認の件数）を控える**と、変更の影響を前後比較で安全に判断できる。
