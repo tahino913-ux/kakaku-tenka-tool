@@ -3410,7 +3410,7 @@ const server = http.createServer(async (req, res) => {
           }
         }
         const r = auditRequote(readItemStatus(), costByKey, { marginPct: 10 });
-        return sendJson(res, 200, { ok: true, count: r.count, gyaku: r.gyaku, thin: r.thin, items: r.issues.slice(0, 200) });
+        return sendJson(res, 200, { ok: true, count: r.count, gyaku: r.gyaku, thin: r.thin, up: r.up, down: r.down, items: r.issues.slice(0, 200) });
       } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), count: 0 }); }
     }
     // 仕入原価の異常チェック（商品マスタCSVを直下/input に置けばライブ監査）。DB不要・read only。
@@ -5570,8 +5570,9 @@ async function loadRequoteCheck(){
     const r=await fetch('/api/requote-check').then(x=>x.json());
     const items=(r&&r.items)||[]; requoteItems=items;
     if(!items.length){ box.style.display='none'; box.innerHTML=''; return; }
+    const TAG={gyaku:'<b style="color:#b71c1c">🔴逆ザヤ</b>',thin:'<b style="color:#b8860b">🟡値上利薄</b>',up:'<b style="color:#c46210">🔼値上がり</b>',down:'<b style="color:#1f6b35">🔽値下がり</b>'};
     const rows=items.map((i,idx)=>{
-      const tag=i.severity==='gyaku'?'<b style="color:#b71c1c">🔴逆ザヤ</b>':'<b style="color:#b8860b">🟡利幅薄</b>';
+      const tag=TAG[i.severity]||'';
       const oc=(i.oldCost!=null?i.oldCost:'?');
       return '<div style="padding:2px 0">　・'+tag+' '+esc(i.customer)+'　'+esc(i.supplier)+' '+esc(i.code)
         +'：提出 <b>'+esc(i.sell)+'円</b>／原価 '+esc(oc)+'→<b>'+esc(i.newCost)+'円</b>（新利益率 <b>'+esc(i.marginPct)+'%</b>）'
@@ -5579,10 +5580,10 @@ async function loadRequoteCheck(){
         +' <a class="rqGo" href="/customers?customer='+encodeURIComponent(i.customer)+'" target="_blank" style="font-size:11px;color:#1976d2;margin-left:4px">📝 見積ページ</a></div>';
     }).join('');
     box.style.display='block';
-    box.innerHTML='🔁 <b>再見積もり要 '+r.count+'件</b>（🔴逆ザヤ '+r.gyaku+' / 🟡利幅薄 '+r.thin+'）：'
-      +'<b>提出済み</b>の単価が、その後のメーカー値上げで <b>原価を下回る/利幅が痩せた</b>品です。'
-      +'「🔁 対象に戻す」で提出を解除→ <b>得意先別ページで再見積もり</b>して出し直してください。<br>'+rows
-      +'<div style="font-size:11px;color:#8a6d1a;margin-top:4px">※ 提出後に原価が上がった品だけを表示（原価据置や単位ズレは出しません）。利益率の閾値は10%。</div>';
+    box.innerHTML='🔁 <b>再見積もり要 '+r.count+'件</b>（🔴逆ザヤ '+r.gyaku+' / 🟡値上利薄 '+r.thin+' / 🔼値上がり '+r.up+' / 🔽値下がり '+r.down+'）：'
+      +'<b>提出済み</b>の単価が、提出後に <b>仕入原価が変わった</b>品です（上がった/下がった両方）。'
+      +'「🔁 対象に戻して見積へ」で提出を解除→ <b>得意先別ページで再見積もり</b>して出し直してください。<br>'+rows
+      +'<div style="font-size:11px;color:#8a6d1a;margin-top:4px">※ 提出時の原価から1円でも変われば表示（原価据置は出しません）。🟡は値上がりで新利益率10%未満。</div>';
     box.querySelectorAll('.rqRevert').forEach(b=> b.addEventListener('click',()=> requoteRevert(Number(b.getAttribute('data-idx')))));
   }catch(e){ box.style.display='none'; }
 }
