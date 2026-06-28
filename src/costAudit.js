@@ -47,7 +47,10 @@ function num(v) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-function audit(file, opts) {
+// ファイルを監査して構造化結果を返す（console出力・ファイル書き出しは一切しない＝API/CLI共通の中核）。
+//  戻り値: { ok, codeCol, costCol, sellCol, nameCol, rows:[{code,name,cost,sell,flags,isYear,isGyaku,isBig}],
+//           count, year, gyaku, big }／列判定に失敗したら { ok:false, headers }。
+function auditRows(file, opts) {
   opts = opts || {};
   const bigThreshold = Number.isFinite(opts.big) ? opts.big : 2000;
   const { records, headers } = loadCsv(file);
@@ -56,13 +59,7 @@ function audit(file, opts) {
   const costCol = pickCol(headers, [/仕入原価/, /原単価/, /仕入単価/, /原価/, /仕入価格/]);
   const sellCol = pickCol(headers, [/売価/, /販売単価/, /^単価$/, /バラ単価/, /上代/]);
 
-  if (!codeCol || !costCol) {
-    console.log('列の自動判定に失敗しました。ヘッダ一覧:');
-    console.log('  ' + headers.join(' | '));
-    console.log('→ 商品コード列・仕入原価列の名前を教えてください（手で指定して再実行します）。');
-    return null;
-  }
-  console.log('判定に使う列: コード=「' + codeCol + '」 原価=「' + costCol + '」 売価=「' + (sellCol || '(なし)') + '」 名前=「' + (nameCol || '(なし)') + '」\n');
+  if (!codeCol || !costCol) return { ok: false, headers };
 
   const rows = [];
   for (const r of records) {
@@ -74,13 +71,43 @@ function audit(file, opts) {
     const name = nameCol ? String(r[nameCol] || '').trim() : '';
     const flags = [];
     const isYear = Number.isInteger(cost) && cost >= 1990 && cost <= 2031;
+    const isGyaku = Number.isFinite(sell) && sell > 0 && cost > sell;
+    const isBig = cost > bigThreshold;
     if (isYear) flags.push('年に見える(列ズレ濃厚)');
-    if (Number.isFinite(sell) && sell > 0 && cost > sell) flags.push('原価>売価');
-    if (cost > bigThreshold) flags.push('原価が大(>' + bigThreshold + ')');
-    if (flags.length) rows.push({ code, name, cost, sell, flags: flags.join(' / '), isYear });
+    if (isGyaku) flags.push('原価>売価');
+    if (isBig) flags.push('原価が大(>' + bigThreshold + ')');
+    if (flags.length) rows.push({ code, name, cost, sell, flags: flags.join(' / '), isYear, isGyaku, isBig });
   }
   // 年に見える品を最優先で上に
   rows.sort((a, b) => (b.isYear - a.isYear) || (b.cost - a.cost));
+
+  return {
+    ok: true, codeCol, costCol, sellCol, nameCol, rows,
+    count: rows.length,
+    year: rows.filter((r) => r.isYear).length,
+    gyaku: rows.filter((r) => r.isGyaku).length,
+    big: rows.filter((r) => r.isBig).length,
+  };
+}
+
+// 監査結果の行配列を CSV（UTF-8 BOM・Excel可）文字列にする。
+function toCsv(rows) {
+  const esc = (s) => { const t = String(s == null ? '' : s); return /[",\r\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+  const lines = ['商品コード,商品名,仕入原価,売価,理由'];
+  for (const r of (rows || [])) lines.push([r.code, r.name, r.cost, Number.isFinite(r.sell) ? r.sell : '', r.flags].map(esc).join(','));
+  return '﻿' + lines.join('\r\n');
+}
+
+function audit(file, opts) {
+  const res = auditRows(file, opts);
+  if (!res.ok) {
+    console.log('列の自動判定に失敗しました。ヘッダ一覧:');
+    console.log('  ' + res.headers.join(' | '));
+    console.log('→ 商品コード列・仕入原価列の名前を教えてください（手で指定して再実行します）。');
+    return null;
+  }
+  const { codeCol, costCol, sellCol, nameCol, rows } = res;
+  console.log('判定に使う列: コード=「' + codeCol + '」 原価=「' + costCol + '」 売価=「' + (sellCol || '(なし)') + '」 名前=「' + (nameCol || '(なし)') + '」\n');
 
   console.log('=== 異常候補 ' + rows.length + ' 件 ===');
   console.log('商品コード | 仕入原価 | 売価 | 商品名 | 理由');
@@ -95,10 +122,7 @@ function audit(file, opts) {
     const outDir = path.join(ROOT, 'output');
     fs.mkdirSync(outDir, { recursive: true });
     const out = path.join(outDir, '原価異常_一覧.csv');
-    const esc = (s) => { const t = String(s == null ? '' : s); return /[",\r\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
-    const lines = ['商品コード,商品名,仕入原価,売価,理由'];
-    for (const r of rows) lines.push([r.code, r.name, r.cost, Number.isFinite(r.sell) ? r.sell : '', r.flags].map(esc).join(','));
-    fs.writeFileSync(out, '﻿' + lines.join('\r\n'), 'utf8');
+    fs.writeFileSync(out, toCsv(rows), 'utf8');
     console.log('\n一覧を書き出しました: output/原価異常_一覧.csv');
   } catch (e) { console.log('（一覧の書き出しに失敗: ' + (e && e.message || e) + '）'); }
   return rows;
@@ -117,4 +141,4 @@ if (require.main === module) {
   audit(file);
 }
 
-module.exports = { audit };
+module.exports = { audit, auditRows, toCsv, findDefault, ROOT };

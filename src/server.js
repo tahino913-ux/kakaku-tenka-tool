@@ -34,6 +34,7 @@ const { priceRowAnomaly } = require('./anomaly');
 const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode, EXCLUDE_MARK, DORMANT_MARK, isExcludeLink, linkMarkKind } = require('./productLink');
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { auditDormantRevival } = require('./dormantRevival');
+const { auditRows: costAuditRows, toCsv: costAuditCsv, findDefault: findMasterCsv } = require('./costAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
 const { describeNoiseRow, isNoiseRow } = require('./noiserow');
 const { getImportSkips, importSkipMap, lookupImportSkip, updateImportSkips, removeImportSkip } = require('./importSkip');
@@ -3392,6 +3393,38 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url === '/api/cd-candidates') {
       try { const r = buildCdCandidates(); return sendJson(res, 200, { ok: true, count: r.count, dormantWithCode: r.dormantWithCode, items: r.items.slice(0, 300) }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), count: 0 }); }
+    }
+    // 仕入原価の異常チェック（商品マスタCSVを直下/input に置けばライブ監査）。DB不要・read only。
+    //  costAudit.js を再利用：A)原価が年(列ズレ破損) B)逆ザヤ(原価>売価) C)高額。
+    if (req.method === 'GET' && url === '/api/cost-audit') {
+      try {
+        const file = findMasterCsv();
+        if (!file) return sendJson(res, 200, { ok: true, placed: false });
+        const r = costAuditRows(file);
+        if (!r.ok) return sendJson(res, 200, { ok: true, placed: true, colError: true, file: path.basename(file), headers: r.headers });
+        return sendJson(res, 200, {
+          ok: true, placed: true, file: path.basename(file),
+          count: r.count, year: r.year, gyaku: r.gyaku, big: r.big,
+          cols: { code: r.codeCol, cost: r.costCol, sell: r.sellCol || '', name: r.nameCol || '' },
+          rows: r.rows.slice(0, 300),
+        });
+      } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e) }); }
+    }
+    if (req.method === 'GET' && url === '/api/cost-audit.csv') {
+      try {
+        const file = findMasterCsv();
+        const r = file ? costAuditRows(file) : { ok: false };
+        const buf = Buffer.from(costAuditCsv(r.ok ? r.rows : []), 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="cost_audit.csv"; filename*=UTF-8\'\'' + encodeURIComponent('仕入原価_異常候補.csv'),
+          'Content-Length': buf.length,
+        });
+        return res.end(buf);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('export error: ' + String(e && e.message || e));
+      }
     }
     if (req.method === 'GET' && url === '/api/multimatch.csv') {
       try {

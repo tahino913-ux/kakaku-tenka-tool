@@ -78,6 +78,22 @@ ${SHOGO_LOCK_HTML}
   <div id="backupList" class="muted">読込中…</div>
 </div>
 
+<div class="card" id="costAuditCard" style="border-left:4px solid #b71c1c">
+  <h3 style="margin:0 0 6px">🔎 仕入原価の異常チェック（CSV列ズレ・逆ザヤ）</h3>
+  <div class="hint" style="margin-bottom:8px;line-height:1.8">
+    販売大臣のCSV受入で列を取り違えると、仕入原価欄に「年(2006/2007)」や桁違いの値が紛れ込みます。<br>
+    <b>商品マスタCSVを プロジェクト直下 か <code>input/</code> に置く</b>と（ファイル名に「商品マスタ／商品／master」を含むもの）、ここで最新状態を監査できます。<br>
+    判定：<b style="color:#b71c1c">A 原価が「年」に見える</b>（列ズレ確定的）／<b>B 逆ザヤ</b>（原価＞売価）／<b>C 高額</b>（原価＞2000円）。<br>
+    ※ 見積の現仕入はメーカー見積取込が源で、この商品マスタ原価は使いません。これは<b>マスタ自体の汚れ</b>を販売大臣で直すための一覧です。
+  </div>
+  <div class="toolbar">
+    <button class="go" id="costAuditBtn">🔄 チェックする</button>
+    <a class="go" id="costAuditDl" href="/api/cost-audit.csv" download style="display:none;text-decoration:none">📥 一覧CSV</a>
+    <span id="costAuditMsg" class="muted"></span>
+  </div>
+  <div id="costAuditResult" style="margin-top:8px"></div>
+</div>
+
 <details class="prevwrap" style="border:1px solid #e2e6ec;border-radius:8px;padding:8px 14px;margin-bottom:14px;background:#fff">
 <summary style="cursor:pointer;font-weight:700;font-size:14px;color:#33415a;padding:4px 0">🔍 別ファイルをプレビュー（取込ルールの確認用）　<span class="hint" style="font-weight:normal">※DB直結時は予備（ファイル方式・DBなしPC用）— クリックで開く</span></summary>
 <div style="padding-top:6px">
@@ -431,7 +447,51 @@ async function loadBackups(){
     });
   } catch(e){ box.innerHTML = '<span class="err">読込失敗: '+esc(String(e))+'</span>'; }
 }
+// 仕入原価の異常チェック（商品マスタCSVをライブ監査）
+async function loadCostAudit(){
+  const box = $('#costAuditResult'); const msg = $('#costAuditMsg'); const dl = $('#costAuditDl');
+  const btn = $('#costAuditBtn');
+  if (dl) dl.style.display='none';
+  if (btn) btn.disabled = true;
+  msg.style.color='#6b7785'; msg.textContent='チェック中…'; box.innerHTML='';
+  try {
+    const r = await fetch('/api/cost-audit').then(x=>x.json());
+    if (!r.ok) { msg.style.color='#c0392b'; msg.textContent='失敗: '+(r.error||''); return; }
+    if (!r.placed) {
+      msg.textContent='';
+      box.innerHTML = '<div class="info-box">商品マスタCSVが見つかりません。ファイル名に「商品マスタ／商品／master」を含むCSVを <b>プロジェクト直下</b> か <code>input/</code> に置いてから「🔄 チェックする」を押してください。</div>';
+      return;
+    }
+    if (r.colError) {
+      msg.textContent='';
+      box.innerHTML = '<div class="info-box">「'+esc(r.file)+'」の列を自動判定できませんでした（商品コード列・仕入原価列が見つからない）。<br>ヘッダ: '+esc((r.headers||[]).join(' | '))+'</div>';
+      return;
+    }
+    msg.style.color = r.count ? '#b71c1c' : '#1f6b35';
+    msg.textContent = '対象「'+r.file+'」（原価='+r.cols.cost+'・売価='+(r.cols.sell||'なし')+'）';
+    if (dl && r.count) dl.style.display='';
+    let html = '<div style="font-size:13px;margin-bottom:6px">'
+      + (r.count ? ('⚠ 異常候補 <b>'+r.count+'</b> 件 ＝ ') : '✓ 異常候補は <b>0</b> 件です。')
+      + (r.count ? ('<b style="color:#b71c1c">A 年化け '+r.year+'</b> / B 逆ザヤ '+r.gyaku+' / C 高額 '+r.big+'（重複あり）') : '')
+      + '</div>';
+    if (r.count) {
+      html += '<div style="overflow:auto;max-height:340px"><table style="font-size:12px"><thead><tr>'
+        + '<th>商品コード</th><th>仕入原価</th><th>売価</th><th>商品名</th><th>理由</th></tr></thead><tbody>';
+      r.rows.forEach((x)=>{
+        const yc = x.isYear ? ' style="color:#b71c1c;font-weight:700"' : '';
+        html += '<tr><td>'+esc(x.code)+'</td><td'+yc+'>'+esc(x.cost)+'</td><td>'+esc(x.sell!=null&&x.sell!==''&&!isNaN(x.sell)?x.sell:'')+'</td>'
+          + '<td>'+esc(String(x.name||'').slice(0,30))+'</td><td>'+esc(x.flags)+'</td></tr>';
+      });
+      html += '</tbody></table></div>';
+      if (r.count > r.rows.length) html += '<div class="hint" style="margin-top:4px">（先頭 '+r.rows.length+' 件を表示。全件はCSVで）</div>';
+    }
+    box.innerHTML = html;
+  } catch(e){ msg.style.color='#c0392b'; msg.textContent='失敗: '+e; }
+  finally { if (btn) btn.disabled=false; }
+}
+(function bindCostAudit(){ const b=$('#costAuditBtn'); if (b) b.addEventListener('click', loadCostAudit); })();
 loadBackups();
+loadCostAudit();
 loadHanbaiSource();
 initShogoLockWatch();
 </script>
