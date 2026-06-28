@@ -35,6 +35,7 @@ const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, norm
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { auditDormantRevival } = require('./dormantRevival');
 const { auditRows: costAuditRows, toCsv: costAuditCsv, findDefault: findMasterCsv } = require('./costAudit');
+const { auditRequote, padCode: padRequoteCode } = require('./requoteAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
 const { describeNoiseRow, isNoiseRow } = require('./noiserow');
 const { getImportSkips, importSkipMap, lookupImportSkip, updateImportSkips, removeImportSkip } = require('./importSkip');
@@ -3394,6 +3395,24 @@ const server = http.createServer(async (req, res) => {
       try { const r = buildCdCandidates(); return sendJson(res, 200, { ok: true, count: r.count, dormantWithCode: r.dormantWithCode, items: r.items.slice(0, 300) }); }
       catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), count: 0 }); }
     }
+    // 🔁 再見積もり要：提出済み単価が、最新照合の新原価で逆ザヤ/利幅薄になっていないか。
+    if (req.method === 'GET' && url === '/api/requote-check') {
+      try {
+        // 最新照合から (仕入先|自社CD) -> 新仕入原価 を作る（newCost は applyCostOverrides 反映済み）。
+        const costByKey = new Map();
+        for (const f of listLatestCsv()) {
+          const sup = String(f).split('_照合結果_')[0];
+          let recs; try { recs = getRecs(f); } catch (e) { continue; }
+          for (const rec of recs) {
+            const cd = padRequoteCode(rec.productCode);
+            if (!cd || !Number.isFinite(Number(rec.newCost)) || Number(rec.newCost) <= 0) continue;
+            costByKey.set(sup + '|' + cd, Number(rec.newCost)); // 同一品が複数得意先行に出るが新原価は同一
+          }
+        }
+        const r = auditRequote(readItemStatus(), costByKey, { marginPct: 10 });
+        return sendJson(res, 200, { ok: true, count: r.count, gyaku: r.gyaku, thin: r.thin, items: r.issues.slice(0, 200) });
+      } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), count: 0 }); }
+    }
     // 仕入原価の異常チェック（商品マスタCSVを直下/input に置けばライブ監査）。DB不要・read only。
     //  costAudit.js を再利用：A)原価が年(列ズレ破損) B)逆ザヤ(原価>売価) C)高額。
     if (req.method === 'GET' && url === '/api/cost-audit') {
@@ -4000,6 +4019,7 @@ ${SHOGO_LOCK_HTML}
   <button id="dateFilterClear" type="button" style="margin-left:auto;background:#2f6fb0;color:#fff;border:none;border-radius:7px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer">× 解除して通常表示に戻す</button>
 </div>
 <div id="dupAlert" style="display:none"></div>
+<div id="requoteAlert" style="display:none"></div>
 <div id="linkAlert" style="display:none"></div>
 <div id="cdCand" style="display:none"></div>
 <div id="priceAlert"></div>
@@ -4349,7 +4369,7 @@ async function runShogo(){
       $('#shogoMsg').style.color='#2e7d32'; $('#shogoMsg').textContent='✓ 照合完了（'+(res.files?res.files.length:0)+'件のCSVを作成）';
       await loadFiles(newest);
       loadAllImpact(); // 照合結果が増減した可能性 → 全社損益を取り直す
-      loadDupCheck(); loadLinkCheck(); loadCdCandidates(); // 二重登録・紐付け名ずれ・CD候補を取り直す
+      loadDupCheck(); loadLinkCheck(); loadCdCandidates(); loadRequoteCheck(); // 二重登録・紐付け名ずれ・CD候補・再見積もり要を取り直す
     } else {
       $('#shogoMsg').style.color='#c0392b'; $('#shogoMsg').textContent='照合できません: '+(res.error||'');
     }
@@ -5542,6 +5562,43 @@ async function loadDupCheck(){
       +'修正見積を違う仕入先名で取り込むと起きます（損益・見積・取込CSVが二重に）。正しい仕入先名で取り込み直すか、片方を整理してください。<br>'+sample+(dups.length>6?'<br>　…ほか':'');
   }catch(e){ box.style.display='none'; }
 }
+// 🔁 再見積もり要：提出済み単価が、最新照合の新原価で逆ザヤ/利幅薄になっていないか。
+var requoteItems=[];
+async function loadRequoteCheck(){
+  const box=$('#requoteAlert'); if(!box) return;
+  try{
+    const r=await fetch('/api/requote-check').then(x=>x.json());
+    const items=(r&&r.items)||[]; requoteItems=items;
+    if(!items.length){ box.style.display='none'; box.innerHTML=''; return; }
+    const rows=items.map((i,idx)=>{
+      const tag=i.severity==='gyaku'?'<b style="color:#b71c1c">🔴逆ザヤ</b>':'<b style="color:#b8860b">🟡利幅薄</b>';
+      const oc=(i.oldCost!=null?i.oldCost:'?');
+      return '<div style="padding:2px 0">　・'+tag+' '+esc(i.customer)+'　'+esc(i.supplier)+' '+esc(i.code)
+        +'：提出 <b>'+esc(i.sell)+'円</b>／原価 '+esc(oc)+'→<b>'+esc(i.newCost)+'円</b>（新利益率 <b>'+esc(i.marginPct)+'%</b>）'
+        +' <button class="rqRevert" data-idx="'+idx+'" style="font-size:11px;padding:2px 8px;border:1px solid #b71c1c;color:#b71c1c;background:#fff;border-radius:5px;cursor:pointer;font-weight:700">🔁 対象に戻す</button></div>';
+    }).join('');
+    box.style.display='block';
+    box.innerHTML='🔁 <b>再見積もり要 '+r.count+'件</b>（🔴逆ザヤ '+r.gyaku+' / 🟡利幅薄 '+r.thin+'）：'
+      +'<b>提出済み</b>の単価が、その後のメーカー値上げで <b>原価を下回る/利幅が痩せた</b>品です。'
+      +'「🔁 対象に戻す」で提出を解除→ <b>得意先別ページで再見積もり</b>して出し直してください。<br>'+rows
+      +'<div style="font-size:11px;color:#8a6d1a;margin-top:4px">※ 提出後に原価が上がった品だけを表示（原価据置や単位ズレは出しません）。利益率の閾値は10%。</div>';
+    box.querySelectorAll('.rqRevert').forEach(b=> b.addEventListener('click',()=> requoteRevert(Number(b.getAttribute('data-idx')))));
+  }catch(e){ box.style.display='none'; }
+}
+// 「🔁 対象に戻す」＝提出済みを解除し対象へ戻す（得意先別で再見積もり可能に）。自動では単価を変えない。
+async function requoteRevert(idx){
+  const it=requoteItems[idx]; if(!it) return;
+  if(!confirm('「'+it.customer+'　'+it.supplier+' '+it.code+'」の提出済みを解除し、見積の対象に戻します。\\n（得意先別ページで新原価 '+it.newCost+'円 を反映して再見積もり→出し直してください）\\n\\nよろしいですか？')) return;
+  try{
+    const res=await fetch('/api/item-status',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ customer:it.customer, rowKey:it.rowKey, status:'' })}).then(x=>x.json());
+    if(!res.ok){ alert('解除に失敗: '+(res.error||'')); return; }
+    $('#msg').style.color='#1f6b35';
+    $('#msg').textContent='🔁 提出を解除しました（'+it.customer+' '+it.supplier+' '+it.code+'）。得意先別ページで再見積もりしてください。';
+    await loadRequoteCheck();                                 // 一覧を取り直す（戻した分は消える）
+    if(allView) await loadAll(); else if(!dateFilter) await loadFile(); // メイン表示も更新（提出解除で表に復帰）
+  }catch(e){ alert('解除に失敗: '+e); }
+}
 // 手動紐付けの健全性：表記ずれ・手動より確実な自動候補（CD一致/高い名前一致%）。
 async function loadLinkCheck(){
   const box=$('#linkAlert'); if(!box) return;
@@ -5813,7 +5870,7 @@ window.addEventListener('resize', syncHdrH);
   // 全社損益（全仕入先 calcAll）は表表示の後に遅延＝起動の体感を軽くする。
   setTimeout(()=>{ loadAllImpact(); }, 400);
   // バナー類も表の描画を阻害しないよう遅らせる
-  setTimeout(()=>{ loadDupCheck(); loadLinkCheck(); loadCdCandidates(); }, 600);
+  setTimeout(()=>{ loadDupCheck(); loadLinkCheck(); loadCdCandidates(); loadRequoteCheck(); }, 600);
   initShogoLockWatch();
 })();
 </script>
