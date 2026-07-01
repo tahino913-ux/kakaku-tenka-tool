@@ -322,7 +322,9 @@ function matchSelf(item, hanbai) {
   const best = new Map();
   for (const r of hanbai) {
     if (String(r.productCode == null ? '' : r.productCode).trim() !== code) continue;
-    const key = (r.customerCode || '') + '' + (r.productCode || '');
+    // 区切り文字 （コードに絶対出現しない制御文字）で可変長コードのキー衝突を防ぐ。
+    // 例: 得意先123×商品4567 と 1234×567 が同一キーにならない。
+    const key = (r.customerCode || '') + '\u0001' + (r.productCode || '');
     if (!best.has(key)) best.set(key, { rec: r, score: 1000, cd: true, ns: 100, link: false, self: true, pm: false });
   }
   return [...best.values()];
@@ -459,7 +461,7 @@ function matchOne(item, hanbai, opts = {}) {
       // pm===null（片側でも単価が空）は従来どおり名前のみで判定（後方互換）。
       if (ns < nameFloor) continue;
     }
-    const key = (r.customerCode || '') + '' + (r.productCode || '');
+    const key = (r.customerCode || '') + '\u0001' + (r.productCode || '');
     const cur = best.get(key);
     const score = isLink ? 2000 : (cd ? 1000 : ns);
     if (!cur || score > cur.score) best.set(key, { rec: r, score, cd, ns, link: isLink, pm: pmTag });
@@ -514,7 +516,11 @@ function matchAll(items, hanbai, opts = {}) {
         makerCode: item.makerCode, makerName: item.makerName,
         productCode: r.productCode, productName: r.productName, masterName: r.masterName || '',
         customerCode: r.customerCode, customerName: r.customerName,
-        currentSell: r.currentSell, currentCost: cCost, newCost: nCost,
+        // 出力の現売価は effectiveSell（売上単価履歴の最新が実売より新しければ履歴＝価格改定後の合意単価）を優先。
+        //  ※赤字ガード等の照合判定は matchOne 内で r.currentSell(実売) を使う＝判定は不変。effectiveSell が無い
+        //    ファイル経路(hanbai.js)は従来どおり r.currentSell を使う（後方互換）。
+        currentSell: (r.effectiveSell != null && Number.isFinite(Number(r.effectiveSell))) ? r.effectiveSell : r.currentSell,
+        currentCost: cCost, newCost: nCost,
         costInc, costRate, annualAmount: r.annualAmount, lastDate: r.lastDate || '',
       });
     }

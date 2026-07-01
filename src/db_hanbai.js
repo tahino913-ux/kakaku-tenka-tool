@@ -97,7 +97,16 @@ latest_cost AS (
 ),
 -- 年間金額＝期間内の 売上(51)＋現金売(52) の KG 合計（59区分別・仮は含めない）。
 --  ※実測：51+52=83.2%が現行エクスポートの年間金額に最も合う。
-agg AS ( SELECT TOKSHI, SHO, SUM(CASE WHEN DSHU IN (${DSHU_ACTUAL_SELL}) AND DENDATE >= '${annualStart}' THEN amt ELSE 0 END) AS annual FROM base GROUP BY TOKSHI, SHO )
+agg AS ( SELECT TOKSHI, SHO, SUM(CASE WHEN DSHU IN (${DSHU_ACTUAL_SELL}) AND DENDATE >= '${annualStart}' THEN amt ELSE 0 END) AS annual FROM base GROUP BY TOKSHI, SHO ),
+-- 売上単価履歴(URIRIREKI)の最新「バラ(BARACASEKBN=1)」単価＝大臣が次回売上時に拾う合意単価。
+--  実売(伝票)が古い休眠でも、価格改定後の単価がここに入る。出力用の現売価(effectiveSell)に使う。
+--  ※TANK は実売(URIMEI)と同じ ×10000 格納＝/scale で実値。MAS1=得意先ICODE・MAS2=商品ICODE。
+hist AS (
+  SELECT MAS1, MAS2, TANK/${sc}.0 AS htank, [DATE] AS hdate,
+    ROW_NUMBER() OVER (PARTITION BY MAS1, MAS2 ORDER BY [DATE] DESC, ID DESC) AS rn
+  FROM dbo.URIRIREKI
+  WHERE BARACASEKBN = 1 AND TANK > 0
+)
 SELECT
   RTRIM(tk.CODE) AS tcd, RTRIM(sh.CODE) AS pcd,
   ls.sell AS sell, a.annual AS amt, ISNULL(lc.cost, 0) AS cost,
@@ -106,10 +115,13 @@ SELECT
   RTRIM(ISNULL(tk.NM1,'')) AS cname,
   RTRIM(ISNULL(sh.NM1,'')) AS sname,
   ls.pname AS pname,
-  RTRIM(ISNULL(sh.NM3,'')) AS mname
+  RTRIM(ISNULL(sh.NM3,'')) AS mname,
+  h.htank AS histsell,
+  CONVERT(char(10), h.hdate, 23) AS histdate
 FROM latest_sell ls
 JOIN agg a ON a.TOKSHI = ls.TOKSHI AND a.SHO = ls.SHO
 LEFT JOIN latest_cost lc ON lc.TOKSHI = ls.TOKSHI AND lc.SHO = ls.SHO AND lc.rn = 1
+LEFT JOIN hist h ON h.MAS1 = ls.TOKSHI AND h.MAS2 = ls.SHO AND h.rn = 1
 LEFT JOIN dbo.TOKUI  tk ON tk.ICODE = ls.TOKSHI
 LEFT JOIN dbo.SHOHIN sh ON sh.ICODE = ls.SHO
 LEFT JOIN dbo.SHIIRE si ON si.ICODE = ls.shiicode
@@ -193,16 +205,29 @@ function csvToRecords(csvPath) {
     // 商品名1(NM1)＝商品マスタのクリーンな商品名。表示・名前一致のベース（伝票テキストの運賃/入数ゴミを含まない）。
     const masterName = String(r[ix.sname] == null ? '' : r[ix.sname]).trim();
     const dispName = masterName || pname; // マスタ名が空なら従来どおり伝票名でフォールバック
+    const lastDate = String(r[ix.lastdate] == null ? '' : r[ix.lastdate]).trim();
+    // 現売価は2系統を持つ：
+    //  currentSell  ＝ 実売(伝票)の最新単価。照合エンジン(match.js)の赤字ガード等が使う＝照合判定は従来どおり不変。
+    //  effectiveSell＝ 出力/表示/値上げ計算用。売上単価履歴(URIRIREKI)の最新が実売より新しければ そちらを採用。
+    //    ＝休眠でも「価格改定後の合意単価(大臣が次回売上で拾う値)」を現売価に反映できる。
+    const actualSell = toNum(r[ix.sell]);
+    const histSell = ix.histsell != null ? toNum(r[ix.histsell]) : NaN;
+    const histDate = ix.histdate != null ? String(r[ix.histdate] == null ? '' : r[ix.histdate]).trim() : '';
+    const histNewer = Number.isFinite(histSell) && histSell > 0 && histDate && (!lastDate || histDate > lastDate);
+    const effectiveSell = histNewer ? histSell : actualSell;
     out.push({
       customerCode: tcd,
       customerName: String(r[ix.cname] == null ? '' : r[ix.cname]).trim(),
       productCode: pcd,
       productName: pname,                       // 伝票テキスト（NAME+NAME2..5 連結）＝CD一致の埋込品番探索に使う
       masterName,                               // 商品マスタのクリーン名（表示用）
-      currentSell: toNum(r[ix.sell]),
+      currentSell: actualSell,                  // 実売(伝票)の最新＝照合エンジン用（不変）
+      effectiveSell,                            // 出力用の現売価＝履歴優先（match.js の出力1行だけが使う）
+      histSell: Number.isFinite(histSell) ? histSell : '', // 売上単価履歴の最新バラ単価（透明性のため保持）
+      histDate,                                 // その履歴日付
       annualAmount: toNum(r[ix.amt]),
       origCost: toNum(r[ix.cost]),
-      lastDate: String(r[ix.lastdate] == null ? '' : r[ix.lastdate]).trim(),
+      lastDate,
       norm: normName(dispName),
       // CD一致＝メーカーコードの探索範囲：① 売上明細の伝票テキスト(pname・過去の埋込品番) ＋ ② マスタの商品名3(mname=メーカーコード)。
       //  ＝マスタの商品名3にメーカー品番を登録しておけば、売上明細に品番が無くても CD一致で確実に拾える。

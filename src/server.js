@@ -4475,16 +4475,17 @@ function renderMainRows(readOnly){
     issued.sort(byCustSup); todo.sort(byCustSup);
     const holdN=todo.filter(i=>baseRows[i].itemStatus==='hold').length;
     const manualN=todo.filter(i=>baseRows[i].itemStatus==='manual').length;
-    if(issued.length){
-      frag.appendChild(sectionHeaderRow('✅ 提出済み '+issued.length+'件（見積書を発行済み）', '#eaf6ee', '#1b6b3a'));
-      issued.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, true)));
-    }
+    // 並び順：⬜未提出（要対応）を上、✅提出済みを下へ。
     if(todo.length){
       let todoLbl='⬜ 未提出 '+todo.length+'件（見積書 未発行・要対応）';
       if(holdN) todoLbl+=' — うち検討中 '+holdN+'件';
       if(manualN) todoLbl+=' — うち手動修正 '+manualN+'件';
       frag.appendChild(sectionHeaderRow(todoLbl, '#fff8ee', '#8a5a12'));
       todo.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, true)));
+    }
+    if(issued.length){
+      frag.appendChild(sectionHeaderRow('✅ 提出済み '+issued.length+'件（見積書を発行済み）', '#eaf6ee', '#1b6b3a'));
+      issued.forEach(i=> frag.appendChild(buildMainRow(baseRows[i], i, true)));
     }
   } else {
     sortMatchedIndices(matched);
