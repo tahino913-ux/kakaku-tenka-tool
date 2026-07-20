@@ -503,7 +503,13 @@ let filtered=[];  // 検索後
 let hiddenNoRecent=0; // 「取引のない先を隠す」で隠した件数（一覧上部に表示）
 let selName=null; // 選択中の得意先名
 let ISSUED={};    // 提出（発行）履歴 { 得意先名: {lastIssuedAt,count,quoteNo,itemCount,folder} }
+let QUOTED={};    // 過去に見積書を発行した得意先 { quoteKey(得意先名): 世代数 }（ディスク実在ベース・提出履歴リセットに非依存）
 let CUST_EMAILS={}; // 得意先別 送信先メール { 得意先名: メールアドレス }（見積PDFのOutlook送信用）
+// サーバの sanitizeName と同じ規則で得意先名を正規化し末尾「様」を除く（見積ファイル名との照合キー）
+function quoteKey(name){
+  let s=String(name||'得意先不明').replace(/[\\\\/:*?"<>|]/g,'_').replace(/\\s+/g,' ').replace(/[.\\s]+$/,'').trim()||'得意先不明';
+  return s.replace(/様$/,'');
+}
 let rowRules={};  // 行ごと転嫁ルールの上書き { rowKey: ruleType }（空=全体ルール）
 let rowSell={};   // 行ごと 改定後売価 の手入力 { rowKey: 入力文字列 }
 let rowEff={};    // 行ごと 実施日 の手入力 { rowKey: 入力文字列 }
@@ -1058,21 +1064,23 @@ function updateEffUi(){
   });
 }
 function mdShort(iso){ if(!isIsoDate(iso)) return iso||''; return String(parseInt(iso.slice(5,7),10))+'/'+String(parseInt(iso.slice(8,10),10)); }
-// 得意先の並び替え区分：1=実施日を超過(上)／2=実施日が控えている(中)／3=実施日なし or 提出済(下)。
-//  代表日＝対象アイテム中で最も早い有効な実施日（直近の締切）。提出済み(ISSUED)は下段へ。
+// 得意先の並び替え区分：1=実施日を超過(上)／2=実施日が控えている／3=未提出・実施日なし／4=提出済み(最下段)。
+//  未提出(1〜3)を必ず上に、提出済み(4)を下にまとめる＝「見積提出がまだの企業を上に」。
+//  代表日＝対象アイテム中で最も早い有効な実施日（直近の締切）。
 function custEffInfo(c){
   let earliest='';
   const items=(c&&c.products)||[];
   for(let i=0;i<items.length;i++){ const e=items[i]&&items[i].effectiveDate; if(isIsoDate(e)){ if(!earliest||e<earliest) earliest=e; } }
   const issued=!!(ISSUED&&ISSUED[c.name]);
-  if(issued||!earliest) return { group:3, date:earliest||'', issued };
-  return { group: (earliest < todayIso() ? 1 : 2), date:earliest, issued };
+  if(issued) return { group:4, date:earliest||'', issued };            // 提出済み＝最下段
+  if(!earliest) return { group:3, date:'', issued };                   // 未提出・実施日なし（提出済みより上）
+  return { group: (earliest < todayIso() ? 1 : 2), date:earliest, issued }; // 未提出・実施日あり（超過/控え）
 }
 // 区分→日付昇順（超過は古い順／控えは近い順）→同点は名前順 で並べ替え。
 function sortByEff(list){
   return list.map(c=>({c,e:custEffInfo(c)})).sort((A,B)=>{
     if(A.e.group!==B.e.group) return A.e.group-B.e.group;
-    if(A.e.group!==3 && A.e.date!==B.e.date) return A.e.date<B.e.date?-1:1;
+    if((A.e.group===1||A.e.group===2) && A.e.date!==B.e.date) return A.e.date<B.e.date?-1:1;
     return String(A.c.name).localeCompare(String(B.c.name),'ja');
   }).map(x=>x.c);
 }
@@ -1097,6 +1105,11 @@ async function loadIssueLog(){
   try{ const r=await fetch('/api/issue-log').then(x=>x.json()); ISSUED=(r&&r.log)||{}; }
   catch(e){ ISSUED={}; }
 }
+// 過去に見積書を発行した得意先（ディスク実在ベース）を取得。提出履歴リセット後もフォルダに到達するため。
+async function loadQuotedCustomers(){
+  try{ const r=await fetch('/api/quoted-customers').then(x=>x.json()); QUOTED=(r&&r.counts)||{}; }
+  catch(e){ QUOTED={}; }
+}
 // 得意先別メール送信先を読み込む（見積PDFのOutlook送信用）。失敗しても画面は壊さない。
 async function loadCustomerEmails(){
   try{ const r=await fetch('/api/customer-emails').then(x=>x.json()); CUST_EMAILS=(r&&r.emails)||{}; }
@@ -1115,6 +1128,14 @@ async function openIssued(name){
     const r=await fetch('/api/open-issued',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name})}).then(x=>x.json());
     if(!r.ok){ alert('見積書を開けませんでした：'+(r.error||'')); return; }
     if(r.note) alert(r.note); // ファイルが見つからずフォルダを開いた場合などの注記
+  }catch(e){ alert('通信に失敗しました：'+e); }
+}
+// この得意先の過去見積書を集約したフォルダを開く（散らばった全世代をコピー集約→Explorerで日付順に一覧）
+async function openCustomerFolder(name){
+  try{
+    const r=await fetch('/api/open-customer-folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer:name})}).then(x=>x.json());
+    if(!r.ok){ alert('過去の見積書フォルダを開けませんでした：'+(r.error||'')); return; }
+    if($('#msg')) $('#msg').textContent='📁 「'+name+'」の過去の見積書フォルダを開きました（'+r.total+'世代'+(r.copied?'／新たに'+r.copied+'件を集約':'')+'）';
   }catch(e){ alert('通信に失敗しました：'+e); }
 }
 let ISSUED_LIST_DATA=null; // 提出済一覧モーダル用（/api/issued-quotes-list の結果）
@@ -1327,7 +1348,7 @@ function renderList(){
     const ef = custEffInfo(c);
     if(ef.group!==lastG){
       lastG=ef.group;
-      const lbl = ef.group===1?'⏰ 実施日を超過（至急）':ef.group===2?'📅 実施日が控えている':'— 実施日なし・提出済み';
+      const lbl = ef.group===1?'⏰ 実施日を超過（至急）':ef.group===2?'📅 実施日が控えている':ef.group===3?'— 未提出（実施日なし）':'✅ 提出済み';
       const gcls = ef.group===1?'over':ef.group===2?'soon':'';
       html+='<div class="listgrp '+gcls+'">'+lbl+'</div>';
     }
@@ -1398,12 +1419,20 @@ async function selectCust(name){
     +'<div id="calcbarSlot"></div>';  // ← ここに転嫁ルールバーを差し込む（社名の下・提出済の上）
   // 提出（発行）状況
   const iss=ISSUED[c.name];
+  // 過去の見積書フォルダ ボタン：発行履歴でなく「ディスクに実ファイルが在るか」で出す
+  //  （提出履歴をリセットしても過去分に到達できる）。世代数を添える。
+  const qn=QUOTED[quoteKey(c.name)]||0;
+  const folderBtn = qn ? '<button class="openq" data-name="'+esc(c.name)+'" onclick="openCustomerFolder(this.getAttribute(\\'data-name\\'))" title="この得意先の過去の見積書をすべて集めたフォルダを開きます（日付順）">📁 過去の見積書フォルダ（'+qn+'）</button>' : '';
   if(iss){
     html+='<div class="issuednote">✅ <b>提出済み</b>　最終提出 '+esc(issuedShort(iss.lastIssuedAt))
       +(iss.quoteNo?'（見積No. '+esc(iss.quoteNo)+'）':'')+(iss.itemCount?' '+iss.itemCount+'品':'')+(iss.count>1?'　／　提出 '+iss.count+' 回':'')
       +'<button class="openq" data-name="'+esc(c.name)+'" onclick="openIssued(this.getAttribute(\\'data-name\\'))">📄 提出済の見積書を開く</button>'
+      +folderBtn
       +'<button class="openq" data-name="'+esc(c.name)+'" onclick="mailResendFlow(this.getAttribute(\\'data-name\\'))" title="提出済みの見積書をPDF化してOutlookで開きます（再発行はしません）">📧 メールで再送</button>'
       +'<button class="un" data-name="'+esc(c.name)+'" onclick="unmarkIssued(this.getAttribute(\\'data-name\\'))">提出済みを取消</button></div>';
+  } else if(qn){
+    // 未提出扱いだが過去の見積ファイルは在る（提出履歴リセット後など）＝フォルダには到達できる
+    html+='<div class="notyet">未提出（提出済みマークはありません）　'+folderBtn+'</div>';
   } else {
     html+='<div class="notyet">未提出（この得意先はまだ見積書を発行していません）</div>';
   }
@@ -1770,7 +1799,7 @@ function mailQuoteFlow(name){
         if(res.issued && res.issuedCustomers && res.issuedCustomers.length){
           const now=new Date().toISOString();
           for(const nm of res.issuedCustomers){ const prev=ISSUED[nm]||{}; ISSUED[nm]={lastIssuedAt:now,count:(prev.count||0)+1,quoteNo:res.quoteNo||prev.quoteNo||'',itemCount:res.itemCount||prev.itemCount||0,folder:res.folderName||''}; }
-          loadIssueLog().then(()=>load());
+          Promise.all([loadIssueLog(),loadQuotedCustomers()]).then(()=>load());
         }
         showExportMsg(res.error||res.message||'メール作成に失敗しました',true); return;
       }
@@ -1781,7 +1810,7 @@ function mailQuoteFlow(name){
       }
       const toMsg=res.to?('宛先 '+res.to):'宛先は空（Outlookで入力してください）';
       showExportMsg('📧 Outlookの作成画面を開きました（'+name+'：'+toMsg+'／PDF '+(res.pdf||'')+'）。内容を確認して送信してください。');
-      loadIssueLog().then(()=>load());
+      Promise.all([loadIssueLog(),loadQuotedCustomers()]).then(()=>load());
     }).catch(e=>{ setExpBusy(false); setMailBusy(false); showExportMsg('通信失敗: '+(e&&e.message||e),true); });
 }
 // 提出済みの得意先を「再送」：再発行せず、提出済みxlsxからPDF化→Outlookを開く。
@@ -1818,7 +1847,7 @@ function doIssue(opts){
         for(const nm of res.issuedCustomers){ const prev=ISSUED[nm]||{}; ISSUED[nm]={lastIssuedAt:now,count:(prev.count||0)+1,quoteNo:prev.quoteNo||'',itemCount:prev.itemCount||0,folder:res.folderName||''}; }
         renderList(); if(selName) selectCust(selName);
       }
-      loadIssueLog().then(()=>load()); // 履歴更新＋顧客データ再取得（発行したアイテムを「提出済み」別枠へ移す）
+      Promise.all([loadIssueLog(),loadQuotedCustomers()]).then(()=>load()); // 履歴更新＋顧客データ再取得（発行したアイテムを「提出済み」別枠へ移す）
       showResult(res);
     }).catch(e=>{ setExpBusy(false); showExportMsg('発行に失敗: '+(e&&e.message||e),true); });
 }
@@ -1942,7 +1971,7 @@ $('#cRoundMode').addEventListener('change',markCalcPending);
 });
 (async()=>{
   await initShogoLockWatch();
-  await Promise.all([initControls(), loadIssueLog(), loadCustomerEmails(), loadRequoteMap()]);
+  await Promise.all([initControls(), loadIssueLog(), loadQuotedCustomers(), loadCustomerEmails(), loadRequoteMap()]);
   await loadSummary();
   // メイン表の得意先リンク（/customers?customer=...）で来たら、その得意先を選択して表示。
   try{
