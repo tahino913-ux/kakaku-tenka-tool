@@ -34,6 +34,8 @@ const { priceRowAnomaly } = require('./anomaly');
 const { shouldExcludeByProductLink, isProductLinkActive, auditProductLinks, normalizeLinkCode, EXCLUDE_MARK, DORMANT_MARK, isExcludeLink, linkMarkKind } = require('./productLink');
 const { auditBetterManualLinks, auditSuspectManualLinks } = require('./linkBetterAudit');
 const { auditDormantRevival } = require('./dormantRevival');
+const { auditLinkSwaps } = require('./linkSwapAudit');
+const { planRepoints } = require('./autoRepoint');
 const { auditRows: costAuditRows, toCsv: costAuditCsv, findDefault: findMasterCsv } = require('./costAudit');
 const { auditRequote, padCode: padRequoteCode } = require('./requoteAudit');
 const { buildHanbaiCsv } = require('./hanbai_export');
@@ -46,6 +48,9 @@ const { SHOGO_LOCK_CSS, SHOGO_LOCK_HTML, SHOGO_LOCK_JS } = require('./shogoLockU
 // 照合の同時実行防止（DB読取・input/ 書き込みの競合を防ぐ）
 let _shogoRunning = false;
 function shogoStatusPayload() { return { running: !!_shogoRunning }; }
+// 直近の照合で自動修復した「📌貼り替え忘れ」の記録（通知用）。
+let _lastAutoRepoint = [];
+function lastAutoRepoint() { return _lastAutoRepoint; }
 function runShogoGuarded(args) {
   if (_shogoRunning) {
     const err = new Error('照合が既に実行中です。完了までお待ちください。');
@@ -54,10 +59,41 @@ function runShogoGuarded(args) {
   }
   _shogoRunning = true;
   try {
+    _lastAutoRepoint = applyAutoRepoints(); // 貼り替え忘れ(🔁)を自動で新品へ張替 → その状態で照合＝取込だけで直る
     return runShogo(args);
   } finally {
     _shogoRunning = false;
   }
+}
+// 「コード再利用の貼り替え忘れ」を自動修復：linkSwap で検知した swap のうち、入替先が今のメーカー見積に
+//  実在するものだけ📌を新品へ張り替える（旧供給元📌を解除＋新供給元に📌）。↻照合の直前に呼ぶ。
+//  安全：入替先が無い/曖昧なものは触らない（autoRepoint.planRepoints で判定）。既定ON・settings.autoRepointSwaps:false でOFF。
+//  戻り値＝実際に張り替えた記録（通知用）。失敗は握りつぶして照合は止めない。
+function applyAutoRepoints() {
+  try {
+    const s = getSettings();
+    if (s && s.autoRepointSwaps === false) return []; // 明示OFFなら何もしない（既定ON）
+    const matchRowsBySupplier = {};
+    for (const f of listLatestCsv()) {
+      const sup = String(f).split('_照合結果_')[0];
+      let recs; try { recs = getRecs(f); } catch (e) { continue; }
+      matchRowsBySupplier[sup] = recs;
+    }
+    const swap = auditLinkSwaps(getProductLinks(), matchRowsBySupplier);
+    if (!swap.issues.length) return [];
+    let makerItems = [];
+    try { makerItems = flattenedMergedMakerItems(); } catch (e) { return []; }
+    const plans = planRepoints(swap.issues, makerItems);
+    const done = [];
+    for (const p of plans) {
+      try {
+        saveProductLink(p.oldSupplier, p.code, '');        // 旧供給元の📌を解除
+        saveProductLink(p.newSupplier, p.code, p.newName); // 新供給元の新品へ📌
+        done.push(p);
+      } catch (e) { /* 1件の失敗で全体は止めない */ }
+    }
+    return done;
+  } catch (e) { return []; } // 自動修復の失敗は照合を止めない
 }
 function shogoBusyJson() {
   return { ok: false, busy: true, error: '照合実行中です。完了までお待ちください。' };
@@ -72,6 +108,7 @@ const INPUT_DIR = path.join(ROOT, 'input');
 const OUTPUT_DIR = path.join(ROOT, 'output');
 const MAKER_DIR = path.join(ROOT, 'maker_quotes');
 const ISSUE_LOG_PATH = path.join(OUTPUT_DIR, '発行履歴.json'); // 得意先別 見積書の提出履歴（output/=Drive同期で両PC共有）
+const CUST_QUOTES_DIR = path.join(OUTPUT_DIR, '得意先別見積'); // 得意先ごとに全世代の見積書を集約（Explorerで一覧・検索用）
 const PORT_START = 8765;
 
 // 原子的書き込み：一時ファイル→rename で本体を置換（書込途中のクラッシュ/同期割り込みでJSONが壊れない）。失敗時は throw。
@@ -140,6 +177,58 @@ function buildIssuedQuotesList() {
   const folders = Object.values(folderSet).sort((a, b) => String(b.lastIssuedAt).localeCompare(String(a.lastIssuedAt)));
   const totalItems = items.reduce((s, x) => s + (x.itemCount || 0), 0);
   return { items, count: items.length, folders, totalItems };
+}
+// 指定得意先の過去見積書を「得意先別見積/<得意先名>/」へ集約（コピー・冪等）。
+//  発行のたびに作られるバッチフォルダ(得意先別_見積書_YYYYMMDD_HHMM)に散らばった同得意先の xlsx を
+//  1フォルダに集めることで、Explorer で全世代を日付順に一覧できる。元フォルダは触らない＝既存の
+//  「開く／再送」機能は無傷。ファイル名は発行日時入り（見積_YYYYMMDD_HHMM.xlsx）で衝突・上書きを防ぐ。
+//  戻り値：{ dir, total(集約対象の世代数), copied(今回コピーした数) }
+function syncCustomerQuoteFolder(customer) {
+  const cust = String(customer || '').trim();
+  if (!cust) return { dir: '', total: 0, copied: 0 };
+  const destDir = path.join(CUST_QUOTES_DIR, sanitizeName(cust));
+  let names = [];
+  try { names = fs.readdirSync(OUTPUT_DIR); } catch (_) { return { dir: '', total: 0, copied: 0 }; }
+  let total = 0, copied = 0, made = false;
+  for (const name of names) {
+    if (!/^得意先別_見積書_/.test(name)) continue; // 得意先ページから発行した見積書フォルダのみ
+    const folderPath = path.join(OUTPUT_DIR, name);
+    let st; try { st = fs.statSync(folderPath); } catch (_) { continue; }
+    if (!st.isDirectory()) continue;
+    const src = findQuoteFile(folderPath, cust); // 様あり優先・旧 様なし もフォールバック
+    if (!src) continue;
+    const m = name.match(/_(\d{8}_\d{4})$/);
+    const stamp = m ? m[1] : String(Math.floor(st.mtimeMs || 0));
+    const dest = path.join(destDir, '見積_' + stamp + '.xlsx');
+    total++;
+    try {
+      if (!made) { fs.mkdirSync(destDir, { recursive: true }); made = true; }
+      if (!fs.existsSync(dest)) { fs.copyFileSync(src, dest); copied++; }
+    } catch (_) { /* コピー失敗は握りつぶす（既存の発行は妨げない） */ }
+  }
+  return { dir: made ? destDir : '', total, copied };
+}
+// 「過去に見積書を発行した得意先」の集合を、ディスク上のファイル有無から作る（表示専用）。
+//  提出履歴リセット(発行履歴.json 空)後も「📁 過去の見積書フォルダ」ボタンを出せるよう、
+//  発行履歴に頼らず 得意先別_見積書_* 内の 見積_<得意先>[様].xlsx を数える。
+//  返すキーは sanitizeName 後・末尾「様」を除いた得意先名 → 世代数。クライアントは同じ規則で照合。
+function quotedCustomerCounts() {
+  const set = {};
+  let names = [];
+  try { names = fs.readdirSync(OUTPUT_DIR); } catch (_) { return set; }
+  for (const name of names) {
+    if (!/^得意先別_見積書_/.test(name)) continue;
+    const fp = path.join(OUTPUT_DIR, name);
+    let files = [];
+    try { files = fs.readdirSync(fp); } catch (_) { continue; }
+    for (const f of files) {
+      const m = /^見積_(.+)\.xlsx$/i.exec(f); // 見積_<得意先>.xlsx / 見積_<得意先>様.xlsx
+      if (!m) continue;
+      const key = m[1].replace(/様$/, '');
+      set[key] = (set[key] || 0) + 1;
+    }
+  }
+  return set;
 }
 // 「この商品を他の得意先にいくらで提出したか」を 品目ステータス.json の発行済み(issued)から横断収集。
 //  rowKey = 得意先仕入先商品キー。先頭の得意先を外した suffix(=仕入先商品キー) が一致＝同じ商品。
@@ -1108,7 +1197,10 @@ function buildProductLinkCheck() {
   //  販売実績(hanbai)の最終売上日 と 休眠にした日(markedAt) を突き合わせる。DB不可(閲覧モード)では hanbai が空＝0件で素通り。
   const today = (() => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); })();
   const revival = auditDormantRevival(productLinks, getProductLinkMarkedAt(), hanbai, { today, fallbackDays: 120 });
-  const issues = [...base.issues, ...better.issues, ...suspect.issues, ...revival.issues].sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja')
+  // 📌貼り替え忘れ（コード再利用）：📌が指す旧メーカー品名と 現マスタ品名の品番が別物＝入れ替え後に📌未更新。
+  //  照合結果CSV(matchRowsBySupplier)だけで判定＝閲覧モード(DB不可)でも効く。
+  const swap = auditLinkSwaps(productLinks, matchRowsBySupplier);
+  const issues = [...base.issues, ...better.issues, ...suspect.issues, ...revival.issues, ...swap.issues].sort((a, b) => String(a.supplier).localeCompare(String(b.supplier), 'ja')
     || String(a.code).localeCompare(String(b.code)));
   return {
     issues,
@@ -1120,6 +1212,7 @@ function buildProductLinkCheck() {
     betterNameCount: better.betterNameCount,
     suspectCount: suspect.count,
     revivalCount: revival.count,
+    swapCount: swap.count,
   };
 }
 
@@ -2896,6 +2989,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url === '/api/issued-quotes-list') {
       return sendJson(res, 200, { ok: true, ...buildIssuedQuotesList() });
     }
+    // 過去に見積書を発行した得意先の集合（ディスク実在ベース・提出履歴リセットに影響されない）。
+    //  「📁 過去の見積書フォルダ」ボタンをどの得意先に出すかの判定に使う。
+    if (req.method === 'GET' && url === '/api/quoted-customers') {
+      return sendJson(res, 200, { ok: true, counts: quotedCustomerCounts() });
+    }
     if (req.method === 'GET' && url === '/api/manual-corrections-list') {
       return sendJson(res, 200, { ok: true, ...buildManualCorrectionsList() });
     }
@@ -3159,6 +3257,21 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
       }
     }
+    // 得意先ページから「その得意先の過去見積書を集約したフォルダ」を開く。
+    //  散らばった全世代を 得意先別見積/<得意先名>/ へコピー集約してから Explorer で開く（日付順に全部見える）。
+    if (req.method === 'POST' && url === '/api/open-customer-folder') {
+      const body = await readBody(req);
+      try {
+        const customer = String((body && body.customer) || '').trim();
+        if (!customer) return sendJson(res, 200, { ok: false, error: '得意先が空です' });
+        const r = syncCustomerQuoteFolder(customer);
+        if (!r.dir || !r.total) return sendJson(res, 200, { ok: false, error: 'この得意先の過去見積書が見つかりません（まだ発行していない可能性）' });
+        safeOpenPath(r.dir);
+        return sendJson(res, 200, { ok: true, total: r.total, copied: r.copied });
+      } catch (e) {
+        return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+      }
+    }
     // 販売大臣 単価履歴CSV：件数の事前確認（ダウンロード前にユーザへ提示）
     if (req.method === 'POST' && url === '/api/hanbai-export-check') {
       const body = await readBody(req);
@@ -3255,7 +3368,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const outFiles = runShogoGuarded(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
           invalidateCaches(); // 照合し直したので古いキャッシュを破棄
-          saved.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)) };
+          saved.shogo = { ok: true, files: (outFiles || []).map((f) => path.basename(f)), autoRepointed: lastAutoRepoint() };
           // 二重登録の検知：取り込んだ仕入先と「別の仕入先」に同じ自社商品が出ていないか。
           //  例: 修正見積を違う仕入先名で取り込むと、同じ商品が2仕入先に出て二重になる。
           try {
@@ -3332,7 +3445,7 @@ const server = http.createServer(async (req, res) => {
         if (isViewOnly()) return sendJson(res, 200, { ok: false, error: '🔒 閲覧モード：このPCはDBに接続できないため照合できません。照合はDBのある会社PCで「↻ 照合」を実行してください（結果CSVはDrive同期で届きます）。' });
         const outFiles = runShogoGuarded(['', '']); // 既定: maker_quotes/ 全件 × config.hanbai
         invalidateCaches(); // 照合し直したので古いキャッシュ（自社品検索・照合結果）を破棄
-        return sendJson(res, 200, { ok: true, files: (outFiles || []).map((f) => path.basename(f)) });
+        return sendJson(res, 200, { ok: true, files: (outFiles || []).map((f) => path.basename(f)), autoRepointed: lastAutoRepoint() });
       } catch (e) {
         if (e.code === 'SHOGO_BUSY') return sendJson(res, 200, shogoBusyJson());
         return sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
@@ -3380,11 +3493,21 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url === '/api/link-check') {
       try {
         const r = buildProductLinkCheck();
+        // バナー/見直しパネルで実際に描画する種別を優先して返す。orphan（古い紐付け＝画面には出さない）が
+        //  多いと（今回 344 件）issues の件数枠を食い潰し、貼り替え忘れ/勘違い/復帰などの重要通知が
+        //  切り捨てられていた（＝バナーに出ない潜在バグ）。優先度順に並べ替えてから返す。
+        const prio = { link_swap: 0, suspect: 1, better_cd: 2, better_name: 2, dormant_revival: 3, name_mismatch: 4 };
+        const ordered = r.issues.slice().sort((a, b) => {
+          const pa = prio[a.kind] != null ? prio[a.kind] : 9;
+          const pb = prio[b.kind] != null ? prio[b.kind] : 9;
+          if (pa !== pb) return pa - pb;
+          return String(a.supplier).localeCompare(String(b.supplier), 'ja') || String(a.code).localeCompare(String(b.code));
+        });
         return sendJson(res, 200, {
-          ok: true, issues: r.issues.slice(0, 80), count: r.count,
+          ok: true, issues: ordered.slice(0, 120), count: r.count,
           mismatchCount: r.mismatchCount, orphanCount: r.orphanCount,
           betterCount: r.betterCount || 0, betterCdCount: r.betterCdCount || 0, betterNameCount: r.betterNameCount || 0,
-          revivalCount: r.revivalCount || 0,
+          revivalCount: r.revivalCount || 0, suspectCount: r.suspectCount || 0, swapCount: r.swapCount || 0,
         });
       } catch (e) { return sendJson(res, 200, { ok: false, error: String(e && e.message || e), issues: [], count: 0 }); }
     }
@@ -4060,6 +4183,7 @@ let allMakerNames = [];   // 編集モーダルのドロップダウン候補
 let currentSuppliers = {}; // 仕入先マスタ {コード: {name, ...}} ：発注先名の解決に使用
 let linkUpgradeMap = {};   // 手動紐付けより確実な候補 { 仕入先\\x01自社CD: issue }
 let linkSuspectMap = {};   // 手動紐付けの勘違いの疑い { 仕入先\\x01自社CD: issue }
+let linkSwapMap = {};      // コード再利用の貼り替え忘れ { 仕入先\\x01自社CD: issue }
 let linkIssues = [];       // 紐付け監査の全issue（別枠「要見直し」パネル用）
 let mainSortMode = '';     // 一致品の並び：''=得意先順 / 'matchDesc'=一致度高い順 / 'matchAsc'=低い順
 
@@ -4369,7 +4493,13 @@ async function runShogo(){
     }
     if(res.ok){
       const newest=(res.files&&res.files.length)?res.files[res.files.length-1]:null;
-      $('#shogoMsg').style.color='#2e7d32'; $('#shogoMsg').textContent='✓ 照合完了（'+(res.files?res.files.length:0)+'件のCSVを作成）';
+      let msg='✓ 照合完了（'+(res.files?res.files.length:0)+'件のCSVを作成）';
+      const rp=res.autoRepointed||[];
+      if(rp.length){
+        // 貼り替え忘れ(🔁)を自動で新品へ張り替えた件数と内容を知らせる（静かに変えない＝可逆・要確認）。
+        msg+=' ／ 🔁 コード再利用の貼り替えを自動修復 '+rp.length+'件：'+rp.slice(0,3).map(function(p){return p.code+'→「'+p.newName+'」';}).join('・')+(rp.length>3?' ほか':'');
+      }
+      $('#shogoMsg').style.color='#2e7d32'; $('#shogoMsg').textContent=msg;
       await loadFiles(newest);
       loadAllImpact(); // 照合結果が増減した可能性 → 全社損益を取り直す
       loadDupCheck(); loadLinkCheck(); loadCdCandidates(); loadRequoteCheck(); // 二重登録・紐付け名ずれ・CD候補・再見積もり要を取り直す
@@ -4623,7 +4753,9 @@ function linkCellHtml(r, i){
     const sus = linkSuspectMap[sup+'\x01'+code];
     const susReason = sus ? (sus.reasons||[]).map(function(x){ return x.k==='low_name'?('名前ほぼ別物('+x.v+'%)'):x.k==='size_mismatch'?'サイズ違い':x.k==='color_mismatch'?'色違い':x.k==='price_gap'?('原価約'+x.v+'倍ズレ'):x.k; }).join('・') : '';
     const susMark = sus ? ' <span style="color:#fff;background:#c0392b;font-weight:700;border-radius:3px;padding:0 4px" title="'+esc('勘違いの疑い：自社「'+(sus.selfName||'')+'」と別物かも（'+susReason+'）。✏で見直してください')+'">🚨</span>' : '';
-    return '<span style="color:#1e7e34;font-weight:600">📌 確定</span>'+susMark+upMark+' <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
+    const swp = linkSwapMap[sup+'\x01'+code];
+    const swpMark = swp ? ' <span style="color:#fff;background:#8a4bd6;font-weight:700;border-radius:3px;padding:0 4px" title="'+esc('コード再利用の貼り替え忘れ：📌旧「'+(swp.linked||'')+'」のまま。マスタは新「'+(swp.master||'')+'」。旧原価が出続けます。✏で新品へ貼り替え（別仕入先なら解除）')+'">🔁</span>' : '';
+    return '<span style="color:#1e7e34;font-weight:600">📌 確定</span>'+swpMark+susMark+upMark+' <button class="linkBtn" data-i="'+i+'" style="font-size:11px">✏</button>';
   }
   if (!code) {
     // 休眠（メーカー品が自社品に未マッチ）でも、メーカー商品名があれば「実績のある自社品を選んで紐付け」できる
@@ -4818,6 +4950,10 @@ async function openLinkModal(idx, preselect){
         } else {
           parts.push('⚠ 手動紐付けより一致度の高い候補があります（'+up.betterScore+'%）：「'+esc(up.betterMaker)+'」');
         }
+      }
+      const swp = linkSwapMap[supplier+'\x01'+r.productCode];
+      if (swp) {
+        parts.push('🔁 <b>コード再利用の貼り替え忘れ</b>：この自社CDのマスタは新品「'+esc(swp.master||'')+'」ですが、📌は旧品「'+esc(swp.linked||'')+'」を指したままです（旧原価が出続けます）。新品のメーカー品を選び直してください（別仕入先に替わったなら、ここでは解除し、新仕入先の行で紐付け直します）。');
       }
     }
     const v = sel.value;
@@ -5619,12 +5755,22 @@ async function loadLinkCheck(){
     });
     linkSuspectMap = {};
     issues.filter(i=>i.kind==='suspect').forEach(i=>{ linkSuspectMap[i.supplier+'\x01'+i.code] = i; });
+    linkSwapMap = {};
+    issues.filter(i=>i.kind==='link_swap').forEach(i=>{ linkSwapMap[i.supplier+'\x01'+i.code] = i; });
     const mism=issues.filter(i=>i.kind==='name_mismatch');
     const better=issues.filter(i=>i.kind==='better_cd'||i.kind==='better_name');
     const suspect=issues.filter(i=>i.kind==='suspect');
     const revival=issues.filter(i=>i.kind==='dormant_revival');
-    if(!mism.length && !better.length && !suspect.length && !revival.length){ box.style.display='none'; box.innerHTML=''; return; }
+    const swap=issues.filter(i=>i.kind==='link_swap');
+    if(!mism.length && !better.length && !suspect.length && !revival.length && !swap.length){ box.style.display='none'; box.innerHTML=''; return; }
     let html='';
+    if(swap.length){
+      // 📌貼り替え忘れ（コード再利用）：同じ自社CDで中身を入れ替えたのに 📌が旧品を指したまま＝旧原価が静かに出続ける。
+      const ws=swap.slice(0,8).map(i=>'<div style="padding:2px 0">　・'+esc(i.supplier)+' '+esc(i.code)+'：📌旧「'+esc(i.linked||'')+'」 ↔ <b>マスタ新「'+esc(i.master||'')+'」</b>'+linkRowBtns(i)+'</div>').join('');
+      html+='🔁 <b>コード再利用の貼り替え忘れ '+swap.length+'件</b>：同じ自社CDのまま<b>中身を別商品に入れ替えた</b>のに、📌手動紐付けが<b>旧品を指したまま</b>です。'
+        +'このままだと<b>旧品・旧仕入先の原価が出続けます</b>（新品の原価になりません）。'
+        +'「✏ 直す」で新品のメーカー品へ貼り替え（違う仕入先なら旧📌は「解除」）→ <b>会社PCで「↻ 照合」</b>。<br>'+ws+(swap.length>8?'<br>　…ほか '+(swap.length-8)+' 件':'')+'<br>';
+    }
     if(revival.length){
       const rs=revival.slice(0,8).map(i=>{
         const since=i.since?('／休眠 '+esc(i.since)+' 以降'):'';
@@ -5660,7 +5806,7 @@ async function loadLinkCheck(){
       html+='🔗 <b>手動紐付けの表記ずれ '+mism.length+'件</b>：登録名とメーカー品名が一致していません。'
         +'「✏ 紐付け」で<b>候補リストから選び直す</b>と安全です。<br>'+ms+(mism.length>5?'<br>　…ほか '+(mism.length-5)+' 件':'');
     }
-    const totalN = suspect.length+better.length+mism.length;
+    const totalN = suspect.length+better.length+mism.length+swap.length;
     if(totalN>0){
       html = '<div style="margin-bottom:8px"><button id="linkReviewOpen" style="font-size:12px;font-weight:700;padding:4px 12px;background:#1976d2;color:#fff;border:none;border-radius:5px;cursor:pointer">📋 まとめて見直す（'+totalN+'件）</button>'
         +' <span style="font-size:11px;color:#8a6d1a">各行の「✅切替／解除／✏直す／🔍確認」でもその場で直せます。反映は会社PCで「↻ 照合」。</span></div>' + html;
@@ -5676,7 +5822,7 @@ async function loadLinkCheck(){
     const ro=$('#linkReviewOpen'); if(ro) ro.addEventListener('click', openLinkReviewPanel);
     // 表の 📌 セルに ⚠ を付け直す（すでに描画済みのとき）
     if(baseRows.length && !dateFilter) renderMainRows(!!dateFilter);
-  }catch(e){ box.style.display='none'; linkUpgradeMap={}; linkSuspectMap={}; linkIssues=[]; }
+  }catch(e){ box.style.display='none'; linkUpgradeMap={}; linkSuspectMap={}; linkSwapMap={}; linkIssues=[]; }
 }
 // 紐付け監査の各行に付ける操作ボタン（バナー・別枠パネル共通）。data-* に仕入先/自社CD/推奨候補を持たせる。
 function linkRowBtns(i){
@@ -5689,6 +5835,12 @@ function linkRowBtns(i){
   }
   if(i.kind==='suspect'){
     h+='<button class="linkUnlink" data-sup="'+sup+'" data-code="'+code+'" style="'+bs+';color:#b71c1c;border-color:#ef9a9a;font-weight:700">解除</button>';
+  }
+  if(i.kind==='link_swap'){
+    // 貼り替え忘れ：新品へ「✏ 直す」（別品選択）か、違う仕入先なら旧📌を「解除」。
+    h+='<button class="linkEdit" data-sup="'+sup+'" data-code="'+code+'" data-better="" style="'+bs+';color:#1565c0;border-color:#90caf9;font-weight:700">✏ 直す</button>';
+    h+='<button class="linkUnlink" data-sup="'+sup+'" data-code="'+code+'" style="'+bs+';color:#b71c1c;border-color:#ef9a9a;font-weight:700">解除</button>';
+    return h;
   }
   if(i.kind==='dormant_revival'){
     // 休眠の復帰＝休眠マークを解除（=次の照合で自動マッチに戻る）。違えば放置でOK。
@@ -5790,15 +5942,17 @@ async function switchLinkTo(supplier, code, better){
 function openLinkReviewPanel(){
   closeLinkReview();
   // バナーと同じ3カテゴリだけ（孤立 orphan 等は除外＝古い紐付けでここでは扱わない）。
-  const order={ suspect:0, better_cd:1, better_name:1, name_mismatch:2 };
+  const order={ link_swap:0, suspect:1, better_cd:2, better_name:2, name_mismatch:3 };
   const items=linkIssues.filter(i=>order[i.kind]!=null).slice().sort((a,b)=>order[a.kind]-order[b.kind]);
   if(!items.length) return;
+  const nswp=linkIssues.filter(i=>i.kind==='link_swap').length;
   const nsus=linkIssues.filter(i=>i.kind==='suspect').length;
   const nbet=linkIssues.filter(i=>i.kind==='better_cd'||i.kind==='better_name').length;
   const nmis=linkIssues.filter(i=>i.kind==='name_mismatch').length;
   const rows=items.map(i=>{
     let prob='', rec='';
-    if(i.kind==='better_cd'){ prob='🔔 CD一致の方が確実'; rec=esc(i.betterMaker||''); }
+    if(i.kind==='link_swap'){ prob='🔁 コード再利用の貼り替え忘れ（📌旧「'+esc(i.linked||'')+'」）'; rec='<span style="color:#b71c1c">新品「'+esc(i.master||'')+'」へ貼り替え／別仕入先なら解除</span>'; }
+    else if(i.kind==='better_cd'){ prob='🔔 CD一致の方が確実'; rec=esc(i.betterMaker||''); }
     else if(i.kind==='better_name'){ prob='🔔 名前一致 '+i.betterScore+'% の方が高い'; rec=esc(i.betterMaker||''); }
     else if(i.kind==='suspect'){ prob='🚨 '+esc(reasonLabelText(i.reasons)); rec='<span style="color:#b71c1c">取り違えの疑い → 解除を推奨</span>'; }
     else { prob='🔗 登録名とメーカー名が不一致'; rec=esc(i.hint||(i.makers&&i.makers[0])||'?'); }
@@ -5818,7 +5972,7 @@ function openLinkReviewPanel(){
     '<div id="linkRevBack" style="position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:9000"></div>'+
     '<div id="linkRevDlg" style="position:fixed;top:4%;left:50%;transform:translateX(-50%);background:#fff;border-radius:8px;padding:18px;width:1000px;max-width:96%;max-height:88vh;overflow:auto;z-index:9001;box-shadow:0 10px 40px rgba(0,0,0,.2)">'+
       '<h3 style="margin:0 0 8px">📋 紐付けの 要見直し 一覧</h3>'+
-      '<div style="font-size:12px;color:#6b7785;margin-bottom:10px">🚨 勘違いの疑い '+nsus+' ／ 🔔 より確実 '+nbet+' ／ 🔗 表記ずれ '+nmis+' 件。'+
+      '<div style="font-size:12px;color:#6b7785;margin-bottom:10px">🔁 貼り替え忘れ '+nswp+' ／ 🚨 勘違いの疑い '+nsus+' ／ 🔔 より確実 '+nbet+' ／ 🔗 表記ずれ '+nmis+' 件。'+
         '「✅ この候補に切替」「解除」はその場で保存します（<b>照合結果への反映には 会社PC(DBあり) で「↻ 照合」</b>が必要）。</div>'+
       '<table id="linkRevTbl" style="width:100%;border-collapse:collapse;font-size:12px">'+
         '<thead><tr style="background:#f1f4f8;text-align:left">'+

@@ -174,6 +174,8 @@ function getSettings() {
     //  照合が拾えない事情（身＋蓋セットなど）で正しい原価にならない品を、自社CD単位で固定する。
     //  指定があれば getRecs が照合結果の newCost を この値へ置換（売価はルールで再計算される）。
     costOverrides: (u.costOverrides && typeof u.costOverrides === 'object') ? u.costOverrides : {},
+    // コード再利用の「📌貼り替え忘れ」を↻照合時に自動修復するか（既定ON）。false で無効化。
+    autoRepointSwaps: u.autoRepointSwaps,
   };
 }
 
@@ -219,6 +221,8 @@ function saveSettings(patch) {
     customerEmails: patch.customerEmails !== undefined ? patch.customerEmails : (cur.customerEmails || {}),
     // 自社CD別 原価上書き（UI保存で消えないように保持）。
     costOverrides: patch.costOverrides !== undefined ? patch.costOverrides : (cur.costOverrides || {}),
+    // 貼り替え忘れ自動修復のON/OFF（UI保存で消えないように保持）。undefined=既定ON。
+    autoRepointSwaps: patch.autoRepointSwaps !== undefined ? patch.autoRepointSwaps : cur.autoRepointSwaps,
     _savedAt:       new Date().toISOString(),
   };
   backupCurrentSettings(); // 上書き直前の現行 settings.json を世代退避（失敗しても保存は続行）
