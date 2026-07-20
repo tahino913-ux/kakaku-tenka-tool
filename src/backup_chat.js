@@ -4,7 +4,9 @@
 // 役割：Claudeが応答を終えるたびに、その会話ログ(.jsonl)を
 //   ① 元ログそのままコピー   _chatlogs/<日付>_<session>.jsonl
 //   ② 人が読める整形版        _chatlogs/<日付>_<session>.md
-// として Drive 上の _chatlogs/ に保存する（両PCに同期される）。
+// として、このプロジェクト直下の _chatlogs/ に保存する。
+// ※ 会話の全記録（扱ったデータの中身を含む）が残るため、
+//   _chatlogs/ は他人と共有しないこと（.gitignore でも除外済み）。
 //
 // フックは stdin に JSON を渡す: { session_id, transcript_path, cwd, hook_event_name, ... }
 // 失敗してもClaude本体を止めないよう、エラーは握りつぶして必ず exit 0。
